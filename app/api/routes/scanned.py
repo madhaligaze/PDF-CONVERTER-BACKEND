@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections import OrderedDict
 from io import BytesIO
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
@@ -20,22 +21,42 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["scanned"])
 
-# In-memory scan store (replace with DB persistence when needed)
-_scan_store: dict[str, dict] = {}
+# Bounded in-memory LRU scan store. Each entry holds a full scanned document
+# (tables + cell data), so an unbounded dict would leak RAM and eventually OOM
+# the container. Keep only the most recent scans; older ones are evicted.
+_SCAN_STORE_MAX = 32
+_scan_store: "OrderedDict[str, dict]" = OrderedDict()
+
+
+def _store_scan(scan_id: str, entry: dict) -> None:
+    _scan_store[scan_id] = entry
+    _scan_store.move_to_end(scan_id)
+    while len(_scan_store) > _SCAN_STORE_MAX:
+        _scan_store.popitem(last=False)
+
+
+def _get_scan(scan_id: str) -> dict | None:
+    entry = _scan_store.get(scan_id)
+    if entry is not None:
+        _scan_store.move_to_end(scan_id)
+    return entry
 
 
 @router.post("/transforms/scan", response_model=ScanResponse)
-async def scan_document(file: UploadFile = File(...)) -> ScanResponse:
+def scan_document(file: UploadFile = File(...)) -> ScanResponse:
     """
     Upload a scanned PDF or image.
     Returns scan_id + table preview for display in the UI.
+
+    Sync `def`: the heavy OCR pipeline (rapidocr / onnxruntime) runs in a
+    threadpool so the single-worker event loop stays responsive.
     """
     try:
         from app.services.scanned.structured_builder import build_scanned_document
     except ImportError:
         raise HTTPException(status_code=503, detail="Scanned OCR pipeline not available")
 
-    content = await file.read()
+    content = file.file.read()
     filename = file.filename or "scan.pdf"
 
     document = build_scanned_document(filename, content)
@@ -65,8 +86,8 @@ async def scan_document(file: UploadFile = File(...)) -> ScanResponse:
                 confidence=round(avg_conf, 3),
             ))
 
-    # Persist for downstream endpoints
-    _scan_store[scan_id] = {"document": document, "filename": filename}
+    # Persist for downstream endpoints (bounded LRU — see _store_scan)
+    _store_scan(scan_id, {"document": document, "filename": filename})
 
     rotation_angles = [p.rotation_angle for p in document.pages]
     warnings = list(document.warnings)
@@ -87,9 +108,9 @@ async def scan_document(file: UploadFile = File(...)) -> ScanResponse:
 
 
 @router.get("/transforms/scan/{scan_id}/docx")
-async def download_scan_docx(scan_id: str) -> StreamingResponse:
+def download_scan_docx(scan_id: str) -> StreamingResponse:
     """Download the structured .docx built from a previously uploaded scan."""
-    entry = _scan_store.get(scan_id)
+    entry = _get_scan(scan_id)
     if entry is None:
         raise HTTPException(status_code=404, detail="Скан не найден")
 
@@ -111,29 +132,29 @@ async def download_scan_docx(scan_id: str) -> StreamingResponse:
 
 
 @router.post("/transforms/scan/{scan_id}/to-review")
-async def scan_to_review(scan_id: str):
+def scan_to_review(scan_id: str):
     """
     Push a completed scan into the existing OCR review flow.
-    Returns a full PreviewResponse as if the file had been uploaded normally.
+    Returns the new review_id so the UI can open the OCR review.
     """
-    entry = _scan_store.get(scan_id)
+    entry = _get_scan(scan_id)
     if entry is None:
         raise HTTPException(status_code=404, detail="Скан не найден")
 
     try:
         from app.services.scanned.review_adapter import to_ocr_review_payload
-        from app.services.ocr_review_service import create_ocr_review_session  # type: ignore
+        from app.services.ocr_review_service import save_ocr_review_payload
     except ImportError as exc:
         raise HTTPException(status_code=503, detail=f"OCR review pipeline not available: {exc}")
 
     document = entry["document"]
     payload = to_ocr_review_payload(document)
 
-    # Delegate to existing OCR review session creation
-    review_id = await create_ocr_review_session(payload)
+    # Persist the already-OCR'd payload directly (no second OCR pass).
+    review = save_ocr_review_payload(payload)
 
     return {
-        "review_id": review_id,
+        "review_id": review.review_id,
         "message": "Скан передан в OCR-проверку",
         "source_filename": document.source_filename,
         "tables_found": sum(len(p.tables) for p in document.pages),

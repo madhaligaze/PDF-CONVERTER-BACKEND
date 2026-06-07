@@ -11,8 +11,15 @@ from app.services.ocr_service import OCRProcessingError, build_statement_from_re
 
 def create_ocr_review_session(filename: str, content: bytes) -> OCRReviewPayload:
     payload = extract_ocr_review(filename, content)
+    return save_ocr_review_payload(payload)
+
+
+def save_ocr_review_payload(payload: OCRReviewPayload | dict) -> OCRReviewPayload:
+    """Persist a pre-built OCR review payload (e.g. from the scanned pipeline) and
+    return it with a freshly assigned review_id. Avoids re-running OCR."""
+    review = payload if isinstance(payload, OCRReviewPayload) else OCRReviewPayload.model_validate(payload)
     review_id = uuid.uuid4().hex
-    review = payload.model_copy(update={"review_id": review_id})
+    review = review.model_copy(update={"review_id": review_id})
     with db_session() as session:
         session.add(
             OCRReviewRecord(

@@ -84,10 +84,13 @@ router = APIRouter(prefix="/transforms")
 
 
 @router.post("/preview", response_model=PreviewResponse)
-async def preview_transform(file: UploadFile = File(...)) -> PreviewResponse:
-    content = await file.read()
+def preview_transform(file: UploadFile = File(...)) -> PreviewResponse:
+    # Sync `def` endpoint: Starlette runs it in a threadpool, so the heavy
+    # (and blocking) PDF parsing / Azure OCR below never stalls the event loop
+    # — health checks and the parser/history polls stay responsive.
+    content = file.file.read()
     if not content:
-        raise HTTPException(status_code=400, detail="Р¤Р°Р№Р» РїСѓСЃС‚РѕР№.")
+        raise HTTPException(status_code=400, detail="Файл пустой.")
 
     try:
         statement, parser_matches = parse_statement_with_diagnostics(
@@ -106,7 +109,7 @@ async def preview_transform(file: UploadFile = File(...)) -> PreviewResponse:
 
 
 @router.get("/sessions/{session_id}", response_model=PreviewResponse)
-async def get_session_preview(session_id: str) -> PreviewResponse:
+def get_session_preview(session_id: str) -> PreviewResponse:
     try:
         statement = load_session(session_id)
     except FileNotFoundError as exc:
@@ -130,7 +133,7 @@ async def get_session_preview(session_id: str) -> PreviewResponse:
 
 
 @router.post("/export")
-async def export_transform(request: ExportRequest) -> StreamingResponse:
+def export_transform(request: ExportRequest) -> StreamingResponse:
     try:
         statement = load_session(request.session_id)
         workbook_bytes = export_statement(
@@ -154,7 +157,7 @@ async def export_transform(request: ExportRequest) -> StreamingResponse:
 
 
 @router.post("/export/csv")
-async def export_transform_csv(request: ExportCsvRequest) -> StreamingResponse:
+def export_transform_csv(request: ExportCsvRequest) -> StreamingResponse:
     try:
         statement = load_session(request.session_id)
         csv_bytes = export_statement_csv(statement, request.variant_key)
@@ -172,7 +175,7 @@ async def export_transform_csv(request: ExportCsvRequest) -> StreamingResponse:
 
 
 @router.post("/ocr-reviews/{review_id}/materialize", response_model=PreviewResponse)
-async def materialize_review_to_preview(
+def materialize_review_to_preview(
     review_id: str,
     request: MaterializeOCRReviewRequest,
 ) -> PreviewResponse:
@@ -204,7 +207,7 @@ async def materialize_review_to_preview(
 
 
 @router.patch("/sessions/{session_id}/rows/{row_number}", response_model=PreviewResponse)
-async def patch_session_row(
+def patch_session_row(
     session_id: str,
     row_number: int,
     request: UpdateRowRequest,
@@ -264,12 +267,12 @@ async def get_correction_memory(parser_key: str | None = None) -> list[Correctio
 
 
 @router.get("/history")
-async def get_history():
+def get_history():
     return list_recent_sessions()
 
 
 @router.get("/parsers")
-async def get_parsers():
+def get_parsers():
     return list_supported_parsers()
 
 
@@ -346,7 +349,7 @@ async def get_template_seed(session_id: str, variant_key: str):
 
     base_variant = next((variant for variant in build_variants(statement) if variant.key == variant_key), None)
     if base_variant is None:
-        raise HTTPException(status_code=404, detail="Р‘Р°Р·РѕРІС‹Р№ РІР°СЂРёР°РЅС‚ РЅРµ РЅР°Р№РґРµРЅ.")
+        raise HTTPException(status_code=404, detail="Базовый вариант не найден.")
 
     return {
         "session_id": session_id,
@@ -510,8 +513,8 @@ def _build_ocr_review_preview(filename: str, content: bytes) -> PreviewResponse 
 
 # ── Smart Brain endpoints ──────────────────────────────────────────────────────
 
-@router.post("/transforms/advisor/column", response_model=AdvisorColumnResponse)
-async def advisor_column(request: AdvisorColumnRequest) -> AdvisorColumnResponse:
+@router.post("/advisor/column", response_model=AdvisorColumnResponse)
+def advisor_column(request: AdvisorColumnRequest) -> AdvisorColumnResponse:
     """
     Recommend formulas for a column based on its name and optional sample values.
     Combines lexical analysis + statistical pattern detection.
@@ -520,8 +523,8 @@ async def advisor_column(request: AdvisorColumnRequest) -> AdvisorColumnResponse
     return advise(request)
 
 
-@router.post("/transforms/analyze-diff", response_model=AnalyzeDiffResponse)
-async def analyze_diff(request: AnalyzeDiffRequest) -> AnalyzeDiffResponse:
+@router.post("/analyze-diff", response_model=AnalyzeDiffResponse)
+def analyze_diff(request: AnalyzeDiffRequest) -> AnalyzeDiffResponse:
     """
     Reverse-engineer what changes a user made to a variant.
     Detects formulas, filters, renames from the diff between original and edited rows.
@@ -546,8 +549,8 @@ async def analyze_diff(request: AnalyzeDiffRequest) -> AnalyzeDiffResponse:
     )
 
 
-@router.post("/transforms/re-analyze", response_model=AnalyzeDiffResponse)
-async def re_analyze(request: ReAnalyzeRequest) -> AnalyzeDiffResponse:
+@router.post("/re-analyze", response_model=AnalyzeDiffResponse)
+def re_analyze(request: ReAnalyzeRequest) -> AnalyzeDiffResponse:
     """
     Re-analyze diff with a user-provided Russian hint.
     Routes through Smart NLP engine first; falls back to keyword matching if confidence is low.
@@ -605,8 +608,8 @@ async def re_analyze(request: ReAnalyzeRequest) -> AnalyzeDiffResponse:
         )
 
 
-@router.post("/transforms/smart-refine", response_model=SmartRefineResponse)
-async def smart_refine(request: SmartRefineRequest) -> SmartRefineResponse:
+@router.post("/smart-refine", response_model=SmartRefineResponse)
+def smart_refine(request: SmartRefineRequest) -> SmartRefineResponse:
     """
     Full smart NLP refinement — returns narrative, clarification chips, and confidence.
     """
@@ -654,8 +657,8 @@ async def smart_refine(request: SmartRefineRequest) -> SmartRefineResponse:
     )
 
 
-@router.post("/transforms/clarify", response_model=SmartRefineResponse)
-async def clarify_intent(request: ClarifyRequest) -> SmartRefineResponse:
+@router.post("/clarify", response_model=SmartRefineResponse)
+def clarify_intent(request: ClarifyRequest) -> SmartRefineResponse:
     """
     User picks one of the clarification choices — re-run pipeline with explicit choice.
     """
@@ -706,8 +709,8 @@ async def clarify_intent(request: ClarifyRequest) -> SmartRefineResponse:
     )
 
 
-@router.get("/transforms/consistency/{session_id}/{variant_key:path}", response_model=ConsistencyReport)
-async def check_consistency(session_id: str, variant_key: str) -> ConsistencyReport:
+@router.get("/consistency/{session_id}/{variant_key:path}", response_model=ConsistencyReport)
+def check_consistency(session_id: str, variant_key: str) -> ConsistencyReport:
     """
     Run consistency checks on a variant's rows.
     Detects balance mismatches, duplicates, date gaps, anomalies.
@@ -730,8 +733,8 @@ async def check_consistency(session_id: str, variant_key: str) -> ConsistencyRep
     )
 
 
-@router.post("/transforms/validate-formula")
-async def validate_formula(body: dict) -> dict:
+@router.post("/validate-formula")
+def validate_formula(body: dict) -> dict:
     """Quick formula syntax check. Returns {valid: bool, error: str|null}."""
     from app.services.formula_engine import validate_formula as _validate
     formula = body.get("formula", "")
