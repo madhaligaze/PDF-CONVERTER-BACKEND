@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import logging
 import traceback
 from contextlib import asynccontextmanager
@@ -57,8 +59,23 @@ async def lifespan(_: FastAPI):
     except Exception as exc:
         log.warning("smart_correction_service warmup skipped: %s", exc)
 
+    # Start the Telegram bot in-process (only if TELEGRAM_BOT_TOKEN is set).
+    bot_task: asyncio.Task | None = None
+    try:
+        from app.telegram import bot as telegram_bot
+        if telegram_bot.is_enabled():
+            bot_task = asyncio.create_task(telegram_bot.start_polling())
+    except Exception as exc:
+        log.warning("Telegram bot failed to start: %s", exc)
+
     log.info("Application startup complete")
-    yield
+    try:
+        yield
+    finally:
+        if bot_task is not None:
+            bot_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await bot_task
 
 
 app = FastAPI(
