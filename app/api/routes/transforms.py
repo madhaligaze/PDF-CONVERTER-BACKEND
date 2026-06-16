@@ -17,6 +17,8 @@ from app.schemas.statement import (
     ConsistencyReport,
     CorrectionMemoryEntry,
     CreateOnboardingProjectRequest,
+    ComputeRequest,
+    ComputeResponse,
     CreateTemplateRequest,
     ExportCsvRequest,
     ExportRequest,
@@ -38,13 +40,14 @@ from app.schemas.statement import (
     UpdateRowRequest,
     UpdateTemplateRequest,
     VisionStatus,
+    WebExcelSaveRequest,
 )
 from app.services.document_service import (
     DocumentParseError,
     list_supported_parsers,
     parse_statement_with_diagnostics,
 )
-from app.services.export_service import export_statement, export_statement_csv
+from app.services.export_service import compute_variant, export_statement, export_statement_csv
 from app.services.ocr_mapping_template_service import (
     compare_ocr_mapping_template_versions,
     find_best_ocr_mapping_match,
@@ -154,6 +157,26 @@ def export_transform(request: ExportRequest) -> StreamingResponse:
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.post("/compute", response_model=ComputeResponse)
+def compute_preview(request: ComputeRequest) -> ComputeResponse:
+    """Live recompute of formula columns for the in-browser editor (Web-Excel & demo)."""
+    try:
+        statement = load_session(request.session_id)
+        variant = compute_variant(
+            statement,
+            request.variant_key,
+            excluded_rows=request.excluded_rows or [],
+            custom_columns=request.custom_columns,
+            custom_rows=request.custom_rows,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return ComputeResponse(columns=list(variant.columns), rows=list(variant.rows))
 
 
 @router.post("/export/csv")
@@ -281,6 +304,13 @@ async def get_vision_runtime_status() -> VisionStatus:
     return get_vision_status()
 
 
+@router.get("/fx-rates")
+def get_fx_rates() -> dict:
+    """Live currency rates from NB RK (cached daily), with source + date."""
+    from app.services.fx_rates_service import get_all_rates
+    return get_all_rates()
+
+
 @router.get("/templates")
 async def get_templates(parser_key: str | None = None) -> list[TransformationTemplate]:
     return list_templates(parser_key)
@@ -289,6 +319,56 @@ async def get_templates(parser_key: str | None = None) -> list[TransformationTem
 @router.post("/templates")
 async def post_template(request: CreateTemplateRequest) -> TransformationTemplate:
     return create_template(request)
+
+
+@router.post("/web-excel/save", response_model=TransformationTemplate)
+def save_web_excel_image(request: WebExcelSaveRequest) -> TransformationTemplate:
+    """Infer reusable {field} rules from a Web-Excel grid and save them as a
+    template (with presentation layout) so the same statement is reproduced next time."""
+    from app.services.web_excel_formula_translator import infer_column_rules
+    from app.schemas.statement import TemplateColumnConfig
+
+    try:
+        statement = load_session(request.session_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    base = next(
+        (v for v in build_variants(statement) if v.key == request.base_variant_key),
+        None,
+    )
+    if base is None:
+        raise HTTPException(status_code=404, detail="Базовый вариант не найден.")
+
+    base_keys = {c.key for c in base.columns}
+    # The grid rows already carry the base fields (detail/operation/amount/…), so we
+    # infer from them directly — order-independent (robust to sorting in the grid).
+    source_rows = [dict(r) for r in (request.rows or base.rows)]
+    rules = infer_column_rules(request.columns, request.rows, source_rows, request.a1_formulas)
+
+    columns = [
+        TemplateColumnConfig(
+            key=col["key"],
+            label=col.get("label", col["key"]),
+            kind=col.get("kind", "text"),
+            enabled=True,
+            # Base columns map straight through by key; only user-added columns get
+            # an inferred reusable formula.
+            formula=None if col["key"] in base_keys else rules.get(col["key"]),
+        )
+        for col in request.columns
+    ]
+
+    return create_template(CreateTemplateRequest(
+        parser_key=statement.metadata.parser_key,
+        name=request.name,
+        description="Web-Excel",
+        base_variant_key=request.base_variant_key,
+        columns=columns,
+        is_default=request.is_default,
+        session_id=request.session_id,
+        layout=request.layout,
+    ))
 
 
 @router.patch("/templates/{template_id}")
@@ -395,6 +475,8 @@ def _build_preview_response(
     parser_matches: list[ParserMatch],
     applied_rule: AppliedRuleInfo | None = None,
 ) -> PreviewResponse:
+    from app.services.signature_util import jaccard, signature_from_columns, MATCH_THRESHOLD
+
     quality_summary, row_diagnostics = analyze_statement_quality(statement)
     base_variants = build_variants(statement)
     templates = list_templates(statement.metadata.parser_key)
@@ -404,7 +486,20 @@ def _build_preview_response(
         for template in templates
         if template.base_variant_key in base_lookup
     ]
+
+    # Default selection: an explicitly-default template always wins (manual override);
+    # otherwise auto-match by column-structure signature (Jaccard) above threshold.
     default_template = next((template for template in templates if template.is_default), None)
+    if default_template is None:
+        incoming_sig = {key: signature_from_columns(variant.columns) for key, variant in base_lookup.items()}
+        best_score = MATCH_THRESHOLD
+        for template in templates:
+            if template.base_variant_key not in base_lookup or not template.source_signature:
+                continue
+            score = jaccard(template.source_signature, incoming_sig[template.base_variant_key])
+            if score >= best_score:
+                best_score = score
+                default_template = template
     default_variant_key = f"template::{default_template.template_id}" if default_template else None
 
     return PreviewResponse(

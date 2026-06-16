@@ -9,8 +9,11 @@ from openpyxl.utils import get_column_letter
 
 from app.schemas.statement import ParsedStatement
 from app.services.template_service import get_template
-from app.services.variant_service import apply_template_to_variant, build_variants
-from app.services import formula_engine
+from app.services.variant_service import (
+    apply_template_to_variant,
+    build_variants,
+    recompute_formula_columns,
+)
 
 HEADER_FILL = PatternFill(fill_type="solid", fgColor="1F4E79")
 HEADER_FONT = Font(color="FFFFFF", bold=True)
@@ -69,6 +72,24 @@ def export_statement(
     return stream.getvalue()
 
 
+def compute_variant(
+    statement: ParsedStatement,
+    variant_key: str,
+    *,
+    excluded_rows: list[int] | None = None,
+    custom_columns: list[dict] | None = None,
+    custom_rows: list[dict] | None = None,
+):
+    """Public entry for live preview: resolve a variant and recompute formula columns."""
+    return _resolve_variant(
+        statement,
+        variant_key,
+        excluded_rows=excluded_rows,
+        custom_columns=custom_columns,
+        custom_rows=custom_rows,
+    )
+
+
 def _resolve_variant(
     statement: ParsedStatement,
     variant_key: str,
@@ -93,39 +114,27 @@ def _resolve_variant(
 
     variant = variants[variant_key]
 
-    # Apply custom layout (cell edits, added rows, column renames from inline editor)
+    # Apply custom layout (cell edits, added rows, column renames from inline editor).
     if custom_columns is not None:
-        variant = variant.model_copy(update={
-            "columns": [PreviewColumn(key=c["key"], label=c["label"], kind=c.get("kind", "text")) for c in custom_columns]
-        })
-        # Re-evaluate formula columns using original transaction data
-        formula_cols = [(c["key"], c["formula"]) for c in custom_columns if c.get("formula")]
-        if formula_cols and custom_rows is None:
-            # Build full transaction context rows from the statement
-            tx_rows = [
-                {
-                    "income": float(t.income or 0),
-                    "expense": float(t.expense or 0),
-                    "amount": float(t.amount or 0),
-                    "net": float(t.income or 0) - float(t.expense or 0),
-                    "direction": t.direction or "",
-                    "date": t.date or "",
-                    "detail": t.detail or "",
-                    "operation": t.operation or "",
-                    "comment": t.comment or "",
-                    "currency_op": t.currency_op or "",
-                    "processing_date": t.processing_date or "",
-                    "note": t.note or "",
-                }
-                for t in statement.transactions
+        update: dict = {
+            "columns": [
+                PreviewColumn(key=c["key"], label=c["label"], kind=c.get("kind", "text"))
+                for c in custom_columns
             ]
-            base_rows = [dict(row) for row in variant.rows]
-            for col_key, formula in formula_cols:
-                results = formula_engine.evaluate_column(formula, tx_rows)
-                for i, res in enumerate(results):
-                    if i < len(base_rows) and res.error is None:
-                        base_rows[i][col_key] = res.value
-            variant = variant.model_copy(update={"rows": base_rows})
+        }
+        if custom_rows is not None:
+            # Editor sent the final visible rows (edits + exclusions already applied).
+            update["rows"] = [dict(r) for r in custom_rows]
+        elif excluded_rows:
+            excluded_set = set(excluded_rows)
+            update["rows"] = [
+                r for i, r in enumerate(variant.rows, start=1) if i not in excluded_set
+            ]
+        variant = variant.model_copy(update=update)
+        # Always recompute formula columns server-side from the variant's own rows.
+        # Manual (non-formula) cell edits are preserved; only formula columns change.
+        variant = recompute_formula_columns(variant, custom_columns)
+        return variant
 
     if custom_rows is not None:
         variant = variant.model_copy(update={"rows": custom_rows})

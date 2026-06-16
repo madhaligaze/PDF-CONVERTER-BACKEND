@@ -67,18 +67,18 @@ _RULES: list[_Rule] = [
         confidence=0.90,
         category="formula",
     ),
-    # Currency conversion USD
+    # Currency conversion USD — live rate from NB RK substituted at analyze() time
     _Rule(
         patterns=[r"usd", r"доллар", r"\$"],
-        formula="{amount} / 480",
-        explanation="Конвертация в USD (курс 480 — замените на актуальный)",
+        formula="{amount} / FX_USD",
+        explanation="Конвертация в USD по курсу НБ РК",
         confidence=0.75,
     ),
-    # Currency conversion EUR
+    # Currency conversion EUR — live rate from NB RK substituted at analyze() time
     _Rule(
         patterns=[r"\beur\b", r"евро", r"€"],
-        formula="{amount} / 520",
-        explanation="Конвертация в EUR (курс 520 — замените на актуальный)",
+        formula="{amount} / FX_EUR",
+        explanation="Конвертация в EUR по курсу НБ РК",
         confidence=0.75,
     ),
     # Absolute amount
@@ -154,6 +154,25 @@ def _extract_percent(name: str) -> float | None:
     return None
 
 
+def _resolve_fx_tokens(formula: str, explanation: str) -> tuple[str, str]:
+    """Replace FX_USD / FX_EUR placeholders with the live NB RK rate."""
+    from app.services.fx_rates_service import get_rate
+
+    for code in ("USD", "EUR"):
+        token = f"FX_{code}"
+        if token not in formula:
+            continue
+        rate = get_rate(code)
+        if rate:
+            rate_str = f"{rate:.4f}".rstrip("0").rstrip(".")
+            formula = formula.replace(token, rate_str)
+            explanation = f"{explanation} ({code} ≈ {rate:.2f} ₸, НБ РК)"
+        else:
+            formula = formula.replace(token, "480" if code == "USD" else "520")
+            explanation = f"{explanation} (резервный курс — НБ РК недоступен)"
+    return formula, explanation
+
+
 def analyze(column_name: str) -> list[ColumnRecommendation]:
     """Return recommendations sorted by confidence (descending)."""
     lower = column_name.lower().strip()
@@ -164,6 +183,9 @@ def analyze(column_name: str) -> list[ColumnRecommendation]:
             if re.search(pat, lower):
                 formula = rule.formula
                 explanation = rule.explanation
+
+                if "FX_" in formula:
+                    formula, explanation = _resolve_fx_tokens(formula, explanation)
 
                 # Dynamic percent rule (pattern contains explicit %)
                 if formula == "" and "%" in pat:

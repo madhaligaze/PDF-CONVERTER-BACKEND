@@ -19,6 +19,27 @@ def list_templates(parser_key: str | None = None) -> list[TransformationTemplate
         return [TransformationTemplate.model_validate(item.payload) for item in rows]
 
 
+def _derive_source_signature(request: CreateTemplateRequest) -> list[str]:
+    """Compute the column signature from the originating session's base variant."""
+    if request.source_signature:
+        return list(request.source_signature)
+    if not request.session_id:
+        return []
+    try:
+        from app.services.session_service import load_session
+        from app.services.variant_service import build_variants
+        from app.services.signature_util import signature_from_columns
+
+        statement = load_session(request.session_id)
+        base = next(
+            (v for v in build_variants(statement) if v.key == request.base_variant_key),
+            None,
+        )
+        return signature_from_columns(base.columns) if base else []
+    except Exception:  # noqa: BLE001 — signature is best-effort, never block save
+        return []
+
+
 def create_template(request: CreateTemplateRequest) -> TransformationTemplate:
     with db_session() as session:
         if request.is_default:
@@ -32,6 +53,8 @@ def create_template(request: CreateTemplateRequest) -> TransformationTemplate:
             base_variant_key=request.base_variant_key,
             columns=request.columns,
             is_default=request.is_default,
+            source_signature=_derive_source_signature(request),
+            layout=request.layout,
             created_at=datetime.now(UTC),
             updated_at=datetime.now(UTC),
         )
@@ -63,6 +86,8 @@ def update_template(template_id: str, request: UpdateTemplateRequest) -> Transfo
         template.columns = request.columns or template.columns
         if request.is_default is not None:
             template.is_default = request.is_default
+        if request.layout is not None:
+            template.layout = request.layout
         template.updated_at = datetime.now(UTC)
 
         record.name = template.name

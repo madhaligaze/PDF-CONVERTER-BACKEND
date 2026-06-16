@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
@@ -88,6 +88,18 @@ class CorrectionMemoryRecord(Base):
     corrected_value: Mapped[str] = mapped_column(String(512))
     frequency: Mapped[int] = mapped_column(Integer, default=1)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
+class FxRateRecord(Base):
+    """Daily cache of currency rates (price of 1 unit in KZT) from NB RK."""
+    __tablename__ = "fx_rates"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)  # "USD:2026-06-16"
+    code: Mapped[str] = mapped_column(String(8), index=True)
+    rate_date: Mapped[str] = mapped_column(String(10), index=True)
+    rate: Mapped[float] = mapped_column(Float)
+    source: Mapped[str] = mapped_column(String(64), default="nationalbank.kz")
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 
 class OnboardingProjectRecord(Base):

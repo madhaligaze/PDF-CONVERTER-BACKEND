@@ -80,6 +80,36 @@ def apply_template_to_variant(
     )
 
 
+def recompute_formula_columns(
+    variant: PreviewVariant,
+    custom_columns: list[dict],
+) -> PreviewVariant:
+    """Re-evaluate formula columns over the variant's OWN rows.
+
+    Using the variant rows (not statement.transactions by index) keeps grouped/FX
+    variants aligned, and lets this run even when the editor already supplied
+    custom_rows — formula columns are the source of truth, manual cells are kept.
+    """
+    formula_cols = [
+        (c["key"], c["formula"])
+        for c in custom_columns
+        if c.get("formula") and str(c["formula"]).strip()
+    ]
+    if not formula_cols:
+        return variant
+
+    rows = [dict(row) for row in variant.rows]
+    for col_key, formula in formula_cols:
+        # Evaluate against the running row state so a later formula column can read
+        # an earlier one's computed value. Always set the key (None on error) so the
+        # column is never silently absent from a row.
+        results = formula_engine.evaluate_column(formula, rows)
+        for i, res in enumerate(results):
+            if i < len(rows):
+                rows[i][col_key] = res.value if res.error is None else None
+    return variant.model_copy(update={"rows": rows})
+
+
 def build_template_seed(variant: PreviewVariant) -> list[dict[str, str | bool]]:
     return [
         {

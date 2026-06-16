@@ -130,6 +130,20 @@ class ExportCsvRequest(BaseModel):
     variant_key: str
 
 
+class ComputeRequest(BaseModel):
+    """Live recompute of formula columns for the in-browser editor."""
+    session_id: str
+    variant_key: str
+    custom_columns: list[dict] | None = None
+    custom_rows: list[dict] | None = None
+    excluded_rows: list[int] = []
+
+
+class ComputeResponse(BaseModel):
+    columns: list[PreviewColumn]
+    rows: list[dict]
+
+
 class UpdateRowRequest(BaseModel):
     date: str | None = None
     amount: float | None = None
@@ -295,6 +309,12 @@ class TransformationTemplate(BaseModel):
     base_variant_key: str
     columns: list[TemplateColumnConfig]
     is_default: bool = False
+    # Normalised tokens of the source statement's columns — used to auto-match this
+    # template to a freshly parsed statement with the same column structure.
+    source_signature: list[str] = Field(default_factory=list)
+    # Presentation snapshot for the Web-Excel view (column widths, number formats,
+    # styles, frozen header) so the statement is shown exactly as last edited.
+    layout: dict | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -306,6 +326,11 @@ class CreateTemplateRequest(BaseModel):
     base_variant_key: str
     columns: list[TemplateColumnConfig]
     is_default: bool = False
+    # When provided, the backend derives source_signature from this session's base
+    # variant (more reliable than trusting the client).
+    session_id: str | None = None
+    source_signature: list[str] = Field(default_factory=list)
+    layout: dict | None = None
 
 
 class UpdateTemplateRequest(BaseModel):
@@ -313,6 +338,20 @@ class UpdateTemplateRequest(BaseModel):
     description: str | None = None
     columns: list[TemplateColumnConfig] | None = None
     is_default: bool | None = None
+    layout: dict | None = None
+
+
+class WebExcelSaveRequest(BaseModel):
+    """Save a Web-Excel "образ": infer reusable {field} rules from the grid and
+    persist them (+ presentation layout) as a TransformationTemplate."""
+    session_id: str
+    base_variant_key: str
+    name: str
+    columns: list[dict]                       # ordered [{key, label, kind}]
+    rows: list[dict] = Field(default_factory=list)
+    a1_formulas: dict[str, str] | None = None
+    layout: dict | None = None
+    is_default: bool = True
 
 
 class CorrectionMemoryEntry(BaseModel):

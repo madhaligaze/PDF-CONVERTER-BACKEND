@@ -51,6 +51,19 @@ class Settings(BaseSettings):
     scan_max_pages: int = 50
     scan_min_quality_score: float = 0.25
 
+    # Currency rates — live from National Bank of Kazakhstan (auto-refreshed daily).
+    fx_rates_enabled: bool = True
+    fx_rates_url: str = Field(
+        default="https://nationalbank.kz/rss/rates_all.xml",
+        validation_alias=AliasChoices("FX_RATES_URL"),
+    )
+    fx_rates_timeout_seconds: float = 6.0
+
+    @property
+    def fx_fallback_rates(self) -> dict[str, float]:
+        """Used only when NB RK is unreachable and nothing is cached."""
+        return {"USD": 480.0, "EUR": 520.0, "RUB": 6.0}
+
     # Telegram bot (optional). When token is set, the bot starts in the app lifespan.
     telegram_bot_token: str | None = Field(
         default=None,

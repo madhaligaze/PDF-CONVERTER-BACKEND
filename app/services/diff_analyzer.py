@@ -367,20 +367,52 @@ def apply_hint(hint: str, findings: list[DiffFinding]) -> list[DiffFinding]:
     numbers = re.findall(r"\d+(?:[.,]\d+)?", lower)
     updated = list(findings)
 
+    # Text categorisation hint, e.g. 'FACEBK -> Реклама Facebook'.
+    text_pairs = _parse_text_category_hint(hint)
+    if text_pairs:
+        rules = [(label, "detail", kw) for kw, label in text_pairs]
+        formula = _build_if_chain(rules)
+        target = next(
+            (f for f in updated if f.type in ("formula_detected", "column_added", "cell_changed")),
+            None,
+        )
+        col_key = target.column_key if target else None
+        new_finding = DiffFinding(
+            type="formula_detected",
+            column_key=col_key,
+            detected_formula=formula,
+            confidence=0.85,
+            explanation_ru="По подсказке: " + "; ".join(f"«{kw}» → «{lab}»" for kw, lab in text_pairs),
+            intent="text_category",
+        )
+        if target is not None:
+            updated[updated.index(target)] = new_finding
+        else:
+            updated.append(new_finding)
+        return updated
+
     for keywords, formula_template, explanation_template in _HINT_PATTERNS:
         if any(kw in lower for kw in keywords):
             formula = formula_template
             explanation = explanation_template
 
-            # Substitute first number found into formula
-            if numbers and "{rate}" in (formula or ""):
-                num = numbers[0].replace(",", ".")
+            # Substitute the rate: use the number from the hint, else the live
+            # NB RK rate (USD by default, EUR if the hint mentions euro).
+            if "{rate}" in (formula or ""):
+                if numbers:
+                    num = numbers[0].replace(",", ".")
+                else:
+                    from app.services.fx_rates_service import get_rate
+                    code = "EUR" if ("eur" in lower or "евро" in lower) else "USD"
+                    live = get_rate(code)
+                    num = f"{live:.4f}".rstrip("0").rstrip(".") if live else "480"
                 formula = formula.replace("{rate}", num)
                 explanation = explanation.replace("{rate}", num)
             elif numbers and formula and "*" in formula:
-                # Replace factor with extracted number if it looks like a rate/percent
+                # Replace factor with extracted number. Treat as a percentage only
+                # when the hint actually mentions percent — never blindly /100.
                 num = float(numbers[0].replace(",", "."))
-                if num > 1:
+                if "%" in lower or "процент" in lower:
                     num = num / 100.0
                 formula = re.sub(r"\d+\.\d+", f"{num}", formula)
                 explanation += f" (использован коэффициент {num:.4f})"
@@ -427,6 +459,238 @@ def apply_smart_result(
     return result
 
 
+# ── Text categorisation (e.g. FACEBK → "Реклама Facebook") ─────────────────────
+
+# Non-discriminative banking words that should not become categorisation keys.
+_STOPWORDS: set[str] = {
+    "покупка", "перевод", "оплата", "платеж", "платёж", "пополнение", "снятие",
+    "карту", "карты", "счет", "счёт", "bank", "payment", "purchase", "transfer",
+    "card", "халык", "halyk", "kaspi", "каспи",
+}
+
+# Preferred descriptive fields searched first; the rest are discovered dynamically
+# from the rows themselves (variants use keys like "details_operation").
+_PREFERRED_TEXT_FIELDS = ("detail", "details_operation", "operation", "comment", "note")
+
+
+def _tokenize(text: str) -> list[str]:
+    return [t for t in re.findall(r"[A-Za-zА-Яа-я0-9]{3,}", str(text or "").lower())]
+
+
+def _is_text_value(v: Any) -> bool:
+    return bool(str(v or "").strip()) and _to_float(v) is None
+
+
+def _candidate_text_fields(orig_rows: list[dict], exclude: str | None) -> list[str]:
+    """Text-bearing source keys present in the rows (preferred ones first)."""
+    present: set[str] = set()
+    for r in orig_rows[:30]:
+        for k, v in r.items():
+            if k == exclude or k == "direction":
+                continue
+            if isinstance(v, str) and v.strip() and _to_float(v) is None:
+                present.add(k)
+    ordered = [f for f in _PREFERRED_TEXT_FIELDS if f in present]
+    ordered += [f for f in present if f not in _PREFERRED_TEXT_FIELDS]
+    return ordered
+
+
+def _best_discriminating_token(
+    idxs: list[int],
+    orig_rows: list[dict],
+    fields: list[str],
+) -> tuple[str, str] | None:
+    """Find (field, token) that appears in this label's rows but not elsewhere."""
+    n = len(orig_rows)
+    other = [i for i in range(n) if i not in set(idxs)]
+    best: tuple[float, int, str, str] | None = None  # (score, length, field, token)
+
+    for field in fields:
+        # tokens present in each labelled row (set per row to count row coverage)
+        per_row = [set(_tokenize(orig_rows[i].get(field))) for i in idxs if i < n]
+        if not per_row:
+            continue
+        candidates: set[str] = set().union(*per_row) if per_row else set()
+        for tok in candidates:
+            if tok in _STOPWORDS or tok.isdigit():
+                continue
+            coverage = sum(1 for s in per_row if tok in s) / len(per_row)
+            if coverage < 0.6:
+                continue
+            leak = 0
+            if other:
+                leak = sum(
+                    1 for i in other if i < n and tok in set(_tokenize(orig_rows[i].get(field)))
+                ) / len(other)
+            if leak > 0.15:
+                continue
+            score = coverage - leak
+            cand = (score, len(tok), field, tok)
+            if best is None or cand > best:
+                best = cand
+
+    if best is None:
+        return None
+    return best[2], best[3]
+
+
+def _build_if_chain(rules: list[tuple[str, str, str]]) -> str:
+    """rules = [(label, field, token), …] → nested IF(CONTAINS(...)) formula."""
+    def esc(s: str) -> str:
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+
+    expr = '""'
+    for label, field, token in reversed(rules):
+        expr = f'IF(CONTAINS({field}, "{esc(token)}"), "{esc(label)}", {expr})'
+    return expr
+
+
+def _analyze_text_column(
+    col_key: str,
+    edit_vals: list[Any],
+    orig_rows: list[dict],
+) -> list[DiffFinding]:
+    """Infer a keyword→label rule from a text column the user filled in."""
+    groups: dict[str, list[int]] = {}
+    for i, v in enumerate(edit_vals):
+        if i >= len(orig_rows):
+            break
+        if _is_text_value(v):
+            groups.setdefault(str(v).strip(), []).append(i)
+
+    if not groups:
+        return []
+
+    fields = _candidate_text_fields(orig_rows, exclude=col_key)
+    rules: list[tuple[str, str, str]] = []
+    for label, idxs in groups.items():
+        found = _best_discriminating_token(idxs, orig_rows, fields)
+        if found:
+            field, token = found
+            rules.append((label, field, token))
+
+    if not rules:
+        return []
+
+    formula = _build_if_chain(rules)
+    # Confidence = share of labelled rows correctly covered by their rule.
+    labelled_total = sum(len(idxs) for idxs in groups.values())
+    covered = 0
+    rule_by_label = {lab: (f, t) for lab, f, t in rules}
+    for label, idxs in groups.items():
+        if label not in rule_by_label:
+            continue
+        field, token = rule_by_label[label]
+        covered += sum(
+            1 for i in idxs if i < len(orig_rows) and token in set(_tokenize(orig_rows[i].get(field)))
+        )
+    conf = round(covered / labelled_total, 3) if labelled_total else 0.0
+
+    explanation = "Колонка заполняется по ключевым словам: " + "; ".join(
+        f"«{tok}» → «{lab}»" for lab, _f, tok in rules
+    )
+    return [DiffFinding(
+        type="formula_detected",
+        column_key=col_key,
+        detected_formula=formula,
+        confidence=max(conf, 0.7),
+        explanation_ru=explanation,
+        intent="text_category",
+    )]
+
+
+def _analyze_new_numeric_column(
+    col_key: str,
+    edit_vals: list[Any],
+    orig_rows: list[dict],
+) -> list[DiffFinding]:
+    """A brand-new numeric column ≈ base field × k (no same-column original)."""
+    for base in ("income", "expense", "amount", "net"):
+        ratios: list[float] = []
+        for i, v in enumerate(edit_vals):
+            if i >= len(orig_rows):
+                break
+            ev = _to_float(v)
+            if base == "net":
+                bv = _to_float(orig_rows[i].get("income"))
+                ev2 = _to_float(orig_rows[i].get("expense"))
+                bv = None if bv is None or ev2 is None else bv - ev2
+            else:
+                bv = _to_float(orig_rows[i].get(base))
+            if ev is None or bv is None:
+                continue
+            r = _ratio(ev, bv)
+            if r is not None:
+                ratios.append(r)
+        if len(ratios) < _MIN_ROWS_FOR_PATTERN:
+            continue
+        med_k = statistics.median(ratios)
+        if abs(med_k) < _EPS:
+            continue
+        matching = sum(1 for r in ratios if abs(r - med_k) / max(abs(med_k), _EPS) < 0.05)
+        conf = matching / len(ratios)
+        if conf >= _PATTERN_THRESHOLD:
+            k_str = f"{med_k:.4f}".rstrip("0").rstrip(".")
+            if abs(med_k - 1.0) < 0.001:
+                formula, expl = f"{{{base}}}", f"Колонка «{col_key}» = поле «{base}»"
+            else:
+                formula = f"{{{base}}} * {k_str}"
+                expl = f"Колонка «{col_key}» ≈ «{base}» × {k_str}"
+            return [DiffFinding(
+                type="formula_detected",
+                column_key=col_key,
+                detected_formula=formula,
+                confidence=round(conf, 3),
+                explanation_ru=expl,
+            )]
+    return []
+
+
+def _analyze_new_column(
+    col_key: str,
+    edit_vals: list[Any],
+    orig_rows: list[dict],
+) -> list[DiffFinding]:
+    """Dispatch a newly added column to text or numeric inference."""
+    n_text = sum(1 for v in edit_vals if _is_text_value(v))
+    n_numeric = sum(1 for v in edit_vals if _to_float(v) is not None)
+    findings: list[DiffFinding] = []
+    if n_text >= n_numeric and n_text > 0:
+        findings = _analyze_text_column(col_key, edit_vals, orig_rows)
+    if not findings and n_numeric >= _MIN_ROWS_FOR_PATTERN:
+        findings = _analyze_new_numeric_column(col_key, edit_vals, orig_rows)
+    if not findings and n_text > 0:
+        findings = _analyze_text_column(col_key, edit_vals, orig_rows)
+    return findings
+
+
+def _parse_text_category_hint(hint: str) -> list[tuple[str, str]]:
+    """Extract (keyword, label) pairs from a free-text hint.
+
+    Supports: 'FACEBK -> Реклама', 'есть FACEBK пиши Реклама Facebook',
+    'содержит FACEBK это Реклама'.
+    """
+    pairs: list[tuple[str, str]] = []
+    # explicit arrow / equals form
+    for m in re.finditer(r'["«]?([A-Za-zА-Яа-я0-9*. ]{2,40}?)["»]?\s*(?:->|=>|→|=)\s*["«]?([^"»\n;]{1,60})', hint):
+        kw, label = m.group(1).strip(), m.group(2).strip()
+        if kw and label:
+            pairs.append((kw, label))
+    if pairs:
+        return pairs
+    # natural-language form
+    m = re.search(
+        r'(?:есть|содержит|contains|если)\s+["«]?([A-Za-zА-Яа-я0-9*.]{2,40})["»]?.*?'
+        r'(?:пиши|ставь|пометь|категори\w*|комментарий|это)\s*["«]?([^"»\n;]{1,60})',
+        hint, re.IGNORECASE,
+    )
+    if m:
+        kw, label = m.group(1).strip(), m.group(2).strip()
+        if kw and label:
+            pairs.append((kw, label))
+    return pairs
+
+
 # ── Main entry point ───────────────────────────────────────────────────────────
 
 def analyze_diff(
@@ -444,18 +708,37 @@ def analyze_diff(
     # 2. Row removals
     findings.extend(_analyze_removed_rows(orig_rows, edit_rows))
 
-    # 3. Value changes per column
-    common_keys = [
-        c.get("key") for c in edit_columns
-        if any(oc.get("key") == c.get("key") for oc in orig_columns)
-    ]
+    # 3. Value changes per column (existing columns)
+    orig_key_set = {oc.get("key") for oc in orig_columns}
+    common_keys = [c.get("key") for c in edit_columns if c.get("key") in orig_key_set]
     for col_key in common_keys:
         if not col_key:
             continue
         orig_vals = [r.get(col_key) for r in orig_rows[: len(edit_rows)]]
         edit_vals = [r.get(col_key) for r in edit_rows]
         col_findings = _analyze_column_values(col_key, orig_vals, edit_vals, orig_rows)
+        # Numeric analysis found nothing but the user typed NEW text → categorisation
+        # rule. Only consider cells that actually changed (ignore untouched columns).
+        if not any(f.type == "formula_detected" for f in col_findings):
+            changed_vals = [
+                e if str(e or "").strip() != str(o or "").strip() else ""
+                for o, e in zip(orig_vals, edit_vals)
+            ]
+            if any(_is_text_value(v) for v in changed_vals):
+                text_findings = _analyze_text_column(col_key, changed_vals, orig_rows)
+                if text_findings:
+                    col_findings = text_findings
         findings.extend(col_findings)
+
+    # 3b. Brand-new columns (added in the editor) — infer text/numeric rule.
+    new_keys = [c.get("key") for c in edit_columns if c.get("key") and c.get("key") not in orig_key_set]
+    for col_key in new_keys:
+        edit_vals = [r.get(col_key) for r in edit_rows]
+        new_findings = _analyze_new_column(col_key, edit_vals, orig_rows)
+        if new_findings:
+            # Replace the bare "column_added" finding with the inferred rule.
+            findings = [f for f in findings if not (f.type == "column_added" and f.column_key == col_key)]
+            findings.extend(new_findings)
 
     # 4. Apply user hint if provided
     if user_hint and user_hint.strip():
