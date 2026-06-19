@@ -102,11 +102,14 @@ def _passes_cutoff(created_at: str | None) -> bool:
     return dt.date() >= cutoff.date()
 
 
-def _to_row(autocall: dict) -> list[str]:
+def _to_row(autocall: dict) -> list:
+    # Amount must be a real number so Google Sheets can SUM it; the comma/space
+    # "1 200,66" look comes from the column's number format, not a text value.
+    cost = _parse_cost(autocall.get("final_cost"))
     return [
         _format_date(autocall.get("created_at")),
         _extract_project_letter(autocall.get("name")),
-        _format_amount(autocall.get("final_cost")),
+        cost if cost is not None else _format_amount(autocall.get("final_cost")),
     ]
 
 
@@ -212,9 +215,11 @@ def _open_worksheet():
 
 
 _HEADER_ROW = ["Дата", "Проект", "Обзвоны Сумма"]
+# Number format that renders 1200.66 as "1 200,66" while keeping it a real number.
+_AMOUNT_FORMAT = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}
 
 
-def _append_rows_to_sheet(rows: list[list[str]]) -> None:
+def _append_rows_to_sheet(rows: list[list]) -> None:
     if not rows:
         return
     worksheet = _open_worksheet()
@@ -226,6 +231,11 @@ def _append_rows_to_sheet(rows: list[list[str]]) -> None:
         if is_empty:
             worksheet.append_rows([_HEADER_ROW], value_input_option="USER_ENTERED")
         worksheet.append_rows(rows, value_input_option="USER_ENTERED")
+        # Ensure the amount column stays a summable number with the finance format.
+        try:
+            worksheet.format("C2:C", _AMOUNT_FORMAT)
+        except Exception:  # noqa: BLE001 — formatting is cosmetic, never fail the sync
+            pass
     except Exception as exc:  # noqa: BLE001
         raise AutocallError(f"Не удалось записать строки в Google Sheets: {exc}") from exc
 
