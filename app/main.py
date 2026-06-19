@@ -50,6 +50,26 @@ def _run_migrations() -> None:
             raise
 
 
+async def _autocall_sync_loop() -> None:
+    """Background daily sync of AutoCall.kz campaigns into Google Sheets.
+
+    A single failure (network, Google, etc.) is logged and never crashes the app —
+    we just wait for the next interval and retry.
+    """
+    from app.services import autocall_service
+
+    interval = max(0.25, settings.autocall_auto_sync_interval_hours) * 3600
+    while True:
+        try:
+            result = await autocall_service.sync_autocalls()
+            log.info("autocall auto-sync: %s", result)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — best-effort daily job
+            log.warning("autocall auto-sync failed: %s", exc)
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     # Warm up Smart NLP Correction Engine (fails silently if models unavailable)
@@ -68,14 +88,20 @@ async def lifespan(_: FastAPI):
     except Exception as exc:
         log.warning("Telegram bot failed to start: %s", exc)
 
+    # Start the daily AutoCall.kz → Google Sheets sync (only when enabled + configured).
+    autocall_task: asyncio.Task | None = None
+    if settings.autocall_auto_sync_enabled and settings.autocall_configured:
+        autocall_task = asyncio.create_task(_autocall_sync_loop())
+
     log.info("Application startup complete")
     try:
         yield
     finally:
-        if bot_task is not None:
-            bot_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await bot_task
+        for task in (bot_task, autocall_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
 
 app = FastAPI(

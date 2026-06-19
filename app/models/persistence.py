@@ -102,6 +102,22 @@ class FxRateRecord(Base):
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 
+class AutocallSyncRecord(Base):
+    """Tracks which autocall.kz campaigns were already pushed to Google Sheets.
+
+    Dedup key = autocall id. Together with the cutoff date (settings.autocall_sync_since)
+    this prevents re-appending rows the finance team already entered by hand.
+    """
+    __tablename__ = "autocall_syncs"
+
+    autocall_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at_src: Mapped[str | None] = mapped_column(String(32), nullable=True)  # created_at from API
+    final_cost: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    status: Mapped[str] = mapped_column(String(16), default="success")
+
+
 class OnboardingProjectRecord(Base):
     __tablename__ = "onboarding_projects"
 

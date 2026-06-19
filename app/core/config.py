@@ -64,6 +64,56 @@ class Settings(BaseSettings):
         """Used only when NB RK is unreachable and nothing is cached."""
         return {"USD": 480.0, "EUR": 520.0, "RUB": 6.0}
 
+    # AutoCall.kz → Google Sheets integration
+    autocall_enabled: bool = False
+    autocall_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AUTOCALL_API_KEY"),
+    )
+    autocall_api_url: str = Field(
+        default="https://autocall.kz",
+        validation_alias=AliasChoices("AUTOCALL_API_URL"),
+    )
+    # Cutoff date (YYYY-MM-DD): only autocalls created on/after this go to the sheet.
+    # Prevents duplicating the ~1671 rows of history the finance team entered by hand.
+    autocall_sync_since: str = Field(
+        default="2026-06-18",
+        validation_alias=AliasChoices("AUTOCALL_SYNC_SINCE"),
+    )
+    autocall_auto_sync_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("AUTOCALL_AUTO_SYNC_ENABLED"),
+    )
+    autocall_auto_sync_interval_hours: float = Field(
+        default=24.0,
+        validation_alias=AliasChoices("AUTOCALL_AUTO_SYNC_INTERVAL_HOURS"),
+    )
+    autocall_http_timeout_seconds: float = 30.0
+
+    google_sheets_spreadsheet_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("GOOGLE_SHEETS_SPREADSHEET_ID"),
+    )
+    # Empty = first worksheet.
+    google_sheets_worksheet_name: str = Field(
+        default="",
+        validation_alias=AliasChoices("GOOGLE_SHEETS_WORKSHEET_NAME"),
+    )
+    # Either a path to the service-account JSON file, or the JSON content itself
+    # (Railway-friendly: paste the whole JSON as the value).
+    google_service_account_json: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("GOOGLE_SERVICE_ACCOUNT_JSON"),
+    )
+
+    @property
+    def autocall_configured(self) -> bool:
+        return bool(self.autocall_enabled and self.autocall_api_key)
+
+    @property
+    def google_sheets_configured(self) -> bool:
+        return bool(self.google_sheets_spreadsheet_id and self.google_service_account_json)
+
     # Telegram bot (optional). When token is set, the bot starts in the app lifespan.
     telegram_bot_token: str | None = Field(
         default=None,
@@ -87,6 +137,11 @@ class Settings(BaseSettings):
         "azure_document_intelligence_endpoint",
         "azure_document_intelligence_key",
         "smart_nlp_model_path",
+        "autocall_api_key",
+        "autocall_api_url",
+        "autocall_sync_since",
+        "google_sheets_spreadsheet_id",
+        "google_sheets_worksheet_name",
         "telegram_bot_token",
         "telegram_allowed_users",
         mode="before",
