@@ -12,7 +12,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 
 from app.core.config import settings
-from app.services import autocall_service
+from app.services import autocall_payments_service, autocall_service
 from app.services.autocall_service import AutocallError
 
 log = logging.getLogger(__name__)
@@ -48,6 +48,42 @@ async def sync() -> dict:
         )
     try:
         return await autocall_service.sync_autocalls()
+    except AutocallError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+# ── Balance top-ups ("Пополнения") ───────────────────────────────────────────────
+# Defined as sync `def` so Starlette runs the blocking httpx/gspread calls in a
+# threadpool instead of blocking the event loop.
+
+@router.get("/topups/metrics")
+def topups_metrics() -> dict:
+    if not settings.autocall_session_configured:
+        raise HTTPException(
+            status_code=400,
+            detail="Не заданы логин/пароль кабинета: AUTOCALL_LOGIN и AUTOCALL_PASSWORD",
+        )
+    try:
+        return autocall_payments_service.get_metrics()
+    except AutocallError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/topups/sync")
+def topups_sync() -> dict:
+    if not settings.autocall_session_configured:
+        raise HTTPException(
+            status_code=400,
+            detail="Не заданы логин/пароль кабинета: AUTOCALL_LOGIN и AUTOCALL_PASSWORD",
+        )
+    if not settings.google_sheets_configured:
+        raise HTTPException(
+            status_code=400,
+            detail="Google Sheets не настроен: задайте GOOGLE_SHEETS_SPREADSHEET_ID и "
+            "GOOGLE_SERVICE_ACCOUNT_JSON",
+        )
+    try:
+        return autocall_payments_service.sync_topups()
     except AutocallError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 

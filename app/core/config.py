@@ -90,6 +90,22 @@ class Settings(BaseSettings):
     )
     autocall_http_timeout_seconds: float = 30.0
 
+    # Web-session credentials (phone + password) for the cabinet. Needed for the
+    # balance top-ups ("Пополнения") which live behind the session, not the API token.
+    autocall_login: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AUTOCALL_LOGIN"),
+    )
+    autocall_password: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AUTOCALL_PASSWORD"),
+    )
+    # Worksheet that receives balance top-ups.
+    google_sheets_topups_worksheet_name: str = Field(
+        default="Пополнения",
+        validation_alias=AliasChoices("GOOGLE_SHEETS_TOPUPS_WORKSHEET_NAME"),
+    )
+
     google_sheets_spreadsheet_id: str | None = Field(
         default=None,
         validation_alias=AliasChoices("GOOGLE_SHEETS_SPREADSHEET_ID"),
@@ -113,6 +129,10 @@ class Settings(BaseSettings):
     @property
     def google_sheets_configured(self) -> bool:
         return bool(self.google_sheets_spreadsheet_id and self.google_service_account_json)
+
+    @property
+    def autocall_session_configured(self) -> bool:
+        return bool(self.autocall_login and self.autocall_password)
 
     # Telegram bot (optional). When token is set, the bot starts in the app lifespan.
     telegram_bot_token: str | None = Field(

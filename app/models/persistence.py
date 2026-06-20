@@ -118,6 +118,20 @@ class AutocallSyncRecord(Base):
     status: Mapped[str] = mapped_column(String(16), default="success")
 
 
+class AutocallTopupSyncRecord(Base):
+    """Tracks balance top-ups already pushed to the «Пополнения» worksheet.
+
+    Top-up rows have no id, so the dedup key is a hash of (timestamp, amount, desc).
+    """
+    __tablename__ = "autocall_topup_syncs"
+
+    topup_key: Mapped[str] = mapped_column(String(32), primary_key=True)
+    date_time: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    amount: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    description: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
 class OnboardingProjectRecord(Base):
     __tablename__ = "onboarding_projects"
 

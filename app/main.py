@@ -56,7 +56,7 @@ async def _autocall_sync_loop() -> None:
     A single failure (network, Google, etc.) is logged and never crashes the app —
     we just wait for the next interval and retry.
     """
-    from app.services import autocall_service
+    from app.services import autocall_payments_service, autocall_service
 
     interval = max(0.25, settings.autocall_auto_sync_interval_hours) * 3600
     while True:
@@ -67,6 +67,15 @@ async def _autocall_sync_loop() -> None:
             raise
         except Exception as exc:  # noqa: BLE001 — best-effort daily job
             log.warning("autocall auto-sync failed: %s", exc)
+        # Balance top-ups (blocking httpx/gspread) — run off the event loop.
+        if settings.autocall_session_configured:
+            try:
+                result = await asyncio.to_thread(autocall_payments_service.sync_topups)
+                log.info("autocall topups auto-sync: %s", result)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning("autocall topups auto-sync failed: %s", exc)
         await asyncio.sleep(interval)
 
 

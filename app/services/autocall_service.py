@@ -182,8 +182,8 @@ async def _fetch_autocalls(stop_at_cutoff: bool = True) -> tuple[list[dict], int
 
 # ── Google Sheets ────────────────────────────────────────────────────────────────
 
-def _open_worksheet():
-    """Authorize via service account and return the target worksheet."""
+def open_spreadsheet():
+    """Authorize via service account and return the gspread Spreadsheet."""
     if not settings.google_sheets_configured:
         raise AutocallError(
             "Google Sheets не настроен: задайте GOOGLE_SHEETS_SPREADSHEET_ID и "
@@ -207,10 +207,31 @@ def _open_worksheet():
 
     try:
         client = gspread.authorize(creds)
-        spreadsheet = client.open_by_key(settings.google_sheets_spreadsheet_id)
-        name = settings.google_sheets_worksheet_name.strip()
-        return spreadsheet.worksheet(name) if name else spreadsheet.sheet1
+        return client.open_by_key(settings.google_sheets_spreadsheet_id)
     except Exception as exc:  # noqa: BLE001 — gspread raises many types; wrap for the caller
+        raise AutocallError(f"Не удалось открыть таблицу Google Sheets: {exc}") from exc
+
+
+def get_or_create_worksheet(spreadsheet, name: str, cols: int = 3):
+    """Return the named worksheet, creating it if missing. Empty name = first sheet."""
+    name = (name or "").strip()
+    if not name:
+        return spreadsheet.sheet1
+    try:
+        return spreadsheet.worksheet(name)
+    except Exception:  # noqa: BLE001 — gspread raises WorksheetNotFound; create it
+        return spreadsheet.add_worksheet(title=name, rows=1000, cols=cols)
+
+
+def _open_worksheet():
+    """The autocalls worksheet (first sheet or GOOGLE_SHEETS_WORKSHEET_NAME)."""
+    try:
+        return get_or_create_worksheet(
+            open_spreadsheet(), settings.google_sheets_worksheet_name
+        )
+    except AutocallError:
+        raise
+    except Exception as exc:  # noqa: BLE001
         raise AutocallError(f"Не удалось открыть таблицу Google Sheets: {exc}") from exc
 
 
