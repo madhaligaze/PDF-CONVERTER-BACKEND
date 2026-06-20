@@ -83,7 +83,7 @@ def topups_sync() -> dict:
             "GOOGLE_SERVICE_ACCOUNT_JSON",
         )
     try:
-        return autocall_payments_service.sync_topups()
+        return autocall_payments_service.sync_ledger()
     except AutocallError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 

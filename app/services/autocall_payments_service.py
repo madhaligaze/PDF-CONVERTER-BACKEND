@@ -1,16 +1,21 @@
-"""AutoCall.kz balance top-ups → Google Sheets ("Пополнения" worksheet).
+"""AutoCall.kz balance ledger → Google Sheets («Пополнения» worksheet).
 
-Top-ups live behind the web session (the API token only exposes /autocalls), so we
-log into the cabinet with phone+password, scrape the /payment ledger, keep only the
-"Пополнение …" rows (actual balance top-ups, not call charges or refunds) and append
-them to a dedicated worksheet:
+The cabinet's balance movements live behind the web session (the API token only
+exposes /autocalls), so we log in with phone+password, scrape the /payment ledger
+and append every operation to a single sheet, split into typed columns:
 
-    Дата и время | Сумма | Описание
+    Дата и время | Пополнение | Возврат | Расход | Описание
 
-This lets the finance team audit every real top-up against who claims to have paid —
-catching cases where someone says they topped up but took cash instead.
+Each row is one transaction; the amount lands in exactly one of the three money
+columns (as a real, summable number) so each column totals independently:
+  • Пополнение — top-ups ("Пополнение через систему …")
+  • Возврат    — any other credit (refunds for calls/SMS, registration bonus)
+  • Расход     — every debit (SMS sends, freezes for campaigns, spam penalties)
 
-Dedup: top-up rows have no id, so we key on a hash of (timestamp, amount, description).
+Primary purpose: audit — compare real top-ups against who claims to have paid,
+catching people who say they topped up but took cash instead.
+
+Dedup: rows have no id, so we key on a hash of (timestamp, amount, description).
 Timestamps are second-precise, so collisions are effectively impossible.
 """
 from __future__ import annotations
@@ -20,31 +25,32 @@ import logging
 import re
 
 import httpx
+from sqlalchemy import select
 
 from app.core.config import settings
 from app.core.database import db_session
 from app.models.persistence import AutocallTopupSyncRecord
 from app.services.autocall_service import (
-    AutocallError,
     _AMOUNT_FORMAT,
+    AutocallError,
     _parse_cost,
     get_or_create_worksheet,
     open_spreadsheet,
 )
-from sqlalchemy import select
 
 log = logging.getLogger(__name__)
 
 _LOGIN_URL = "https://autocall.kz/login"
 _PAYMENT_URL = "https://autocall.kz/payment"
-_TOPUP_MARKER = "Пополн"  # matches "Пополнение через систему …"
+_TOPUP_MARKER = "Пополн"  # "Пополнение через систему …"
 _TOKEN_RE = re.compile(r'name="_token"[^>]*value="([^"]+)"')
 _ROW_RE = re.compile(r'<tr[^>]*class="([^"]*)"[^>]*>(.*?)</tr>', re.S)
 _TD_RE = re.compile(r"<td[^>]*>(.*?)</td>", re.S)
 _TAG_RE = re.compile(r"<[^>]+>")
 _PAGE_RE = re.compile(r"payment\?page=(\d+)")
 
-_HEADER_ROW = ["Дата и время", "Сумма", "Описание"]
+_HEADER_ROW = ["Дата и время", "Пополнение", "Возврат", "Расход", "Описание"]
+_APPEND_CHUNK = 2000  # rows per Sheets append call (first sync is ~8k rows)
 
 
 # ── Scrape ───────────────────────────────────────────────────────────────────────
@@ -74,38 +80,48 @@ def _login(client: httpx.Client) -> None:
         raise AutocallError("Не удалось войти в кабинет (проверьте логин/пароль)")
 
 
-def _fetch_topups() -> list[dict]:
-    """Log in, walk every page of /payment, return the top-up rows (newest first)."""
-    topups: list[dict] = []
+def _fetch_ledger() -> list[dict]:
+    """Log in, walk every page of /payment, return all operations (newest first)."""
+    rows: list[dict] = []
     with httpx.Client(
         timeout=settings.autocall_http_timeout_seconds, follow_redirects=True
     ) as client:
         _login(client)
         first = client.get(f"{_PAYMENT_URL}?page=1")
         last_page = max((int(p) for p in _PAGE_RE.findall(first.text)), default=1)
-        pages = [(1, first)] + [
-            (pg, None) for pg in range(2, last_page + 1)
-        ]
-        for pg, resp in pages:
-            html = resp.text if resp is not None else client.get(f"{_PAYMENT_URL}?page={pg}").text
+        for pg in range(1, last_page + 1):
+            html = first.text if pg == 1 else client.get(f"{_PAYMENT_URL}?page={pg}").text
             for _cls, body in _ROW_RE.findall(html):
                 cells = [_clean(td) for td in _TD_RE.findall(body)]
                 if len(cells) < 3:
                     continue
-                date_time, amount, desc = cells[0], cells[1], cells[2]
-                if _TOPUP_MARKER in desc:
-                    topups.append({"date_time": date_time, "amount": amount, "desc": desc})
-    return topups
+                rows.append({"date_time": cells[0], "amount": cells[1], "desc": cells[2]})
+    return rows
 
 
-def _topup_key(row: dict) -> str:
+def _classify(amount: float | None, desc: str) -> str:
+    """Return one of 'topup' | 'refund' | 'expense'."""
+    if _TOPUP_MARKER in desc:
+        return "topup"
+    if amount is not None and amount < 0:
+        return "expense"
+    return "refund"  # any other credit (call/SMS refunds, registration bonus)
+
+
+def _entry_key(row: dict) -> str:
     raw = f"{row['date_time']}|{row['amount']}|{row['desc']}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:32]
 
 
 def _to_row(row: dict) -> list:
+    """Build a sheet row with the amount in its typed column (positive, summable)."""
     cost = _parse_cost(row["amount"])
-    return [row["date_time"], cost if cost is not None else row["amount"], row["desc"]]
+    kind = _classify(cost, row["desc"])
+    value = abs(cost) if cost is not None else row["amount"]
+    topup = value if kind == "topup" else ""
+    refund = value if kind == "refund" else ""
+    expense = value if kind == "expense" else ""
+    return [row["date_time"], topup, refund, expense, row["desc"]]
 
 
 # ── Dedup persistence ────────────────────────────────────────────────────────────
@@ -135,35 +151,38 @@ def _append_rows(rows: list[list]) -> None:
     if not rows:
         return
     worksheet = get_or_create_worksheet(
-        open_spreadsheet(), settings.google_sheets_topups_worksheet_name
+        open_spreadsheet(), settings.google_sheets_topups_worksheet_name, cols=5
     )
     try:
-        existing = worksheet.get_values("A1:C1")
+        existing = worksheet.get_values("A1:E1")
         is_empty = not any(cell.strip() for row in existing for cell in row)
         if is_empty:
             worksheet.append_rows([_HEADER_ROW], value_input_option="USER_ENTERED")
-        worksheet.append_rows(rows, value_input_option="USER_ENTERED")
+        for start in range(0, len(rows), _APPEND_CHUNK):
+            worksheet.append_rows(
+                rows[start : start + _APPEND_CHUNK], value_input_option="USER_ENTERED"
+            )
         try:
-            worksheet.format("B2:B", _AMOUNT_FORMAT)  # keep the amount summable
+            worksheet.format("B2:D", _AMOUNT_FORMAT)  # keep the money columns summable
         except Exception:  # noqa: BLE001 — formatting is cosmetic
             pass
     except Exception as exc:  # noqa: BLE001
-        raise AutocallError(f"Не удалось записать пополнения в Google Sheets: {exc}") from exc
+        raise AutocallError(f"Не удалось записать операции в Google Sheets: {exc}") from exc
 
 
 # ── Public API ───────────────────────────────────────────────────────────────────
 
-def sync_topups() -> dict:
-    """Fetch new top-ups and append them to the «Пополнения» worksheet.
+def sync_ledger() -> dict:
+    """Fetch new balance operations and append them to the «Пополнения» worksheet.
 
     Returns {added, skipped, total_seen, last_date}.
     """
-    topups = _fetch_topups()
+    entries = _fetch_ledger()
     synced = _get_synced_keys()
 
     fresh: list[tuple[str, dict]] = []
-    for row in topups:
-        key = _topup_key(row)
+    for row in entries:
+        key = _entry_key(row)
         if key not in synced:
             fresh.append((key, row))
     # Oldest first so the sheet reads chronologically downward.
@@ -174,27 +193,36 @@ def sync_topups() -> dict:
         _record_synced(key, row)
 
     last_date = fresh[-1][1]["date_time"] if fresh else None
-    log.info("autocall topups sync: added=%s total=%s", len(fresh), len(topups))
+    log.info("autocall ledger sync: added=%s total=%s", len(fresh), len(entries))
     return {
         "added": len(fresh),
-        "skipped": len(topups) - len(fresh),
-        "total_seen": len(topups),
+        "skipped": len(entries) - len(fresh),
+        "total_seen": len(entries),
         "last_date": last_date,
     }
 
 
 def get_metrics() -> dict:
     """Read-only summary for the UI (no writes)."""
-    topups = _fetch_topups()
+    entries = _fetch_ledger()
     synced = _get_synced_keys()
-    pending = [r for r in topups if _topup_key(r) not in synced]
-    total = sum((_parse_cost(r["amount"]) or 0.0) for r in topups)
-    latest = topups[0] if topups else None
+    pending = sum(1 for r in entries if _entry_key(r) not in synced)
+
+    totals = {"topup": 0.0, "refund": 0.0, "expense": 0.0}
+    for r in entries:
+        cost = _parse_cost(r["amount"])
+        if cost is None:
+            continue
+        totals[_classify(cost, r["desc"])] += abs(cost)
+
+    latest = entries[0] if entries else None
     return {
-        "total_topups": len(topups),
-        "pending_count": len(pending),
+        "total_entries": len(entries),
+        "pending_count": pending,
         "synced_count": len(synced),
-        "total_amount": _format_amount(total),
+        "total_topups": _format_amount(totals["topup"]),
+        "total_refunds": _format_amount(totals["refund"]),
+        "total_expenses": _format_amount(totals["expense"]),
         "latest": (
             {
                 "date_time": latest["date_time"],

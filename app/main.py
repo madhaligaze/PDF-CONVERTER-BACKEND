@@ -70,8 +70,8 @@ async def _autocall_sync_loop() -> None:
         # Balance top-ups (blocking httpx/gspread) — run off the event loop.
         if settings.autocall_session_configured:
             try:
-                result = await asyncio.to_thread(autocall_payments_service.sync_topups)
-                log.info("autocall topups auto-sync: %s", result)
+                result = await asyncio.to_thread(autocall_payments_service.sync_ledger)
+                log.info("autocall ledger auto-sync: %s", result)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
