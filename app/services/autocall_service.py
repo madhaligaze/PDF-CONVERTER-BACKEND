@@ -240,10 +240,9 @@ _HEADER_ROW = ["Дата", "Проект", "Обзвоны Сумма"]
 _AMOUNT_FORMAT = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}
 
 
-def _append_rows_to_sheet(rows: list[list]) -> None:
+def _append_rows_to_sheet(worksheet, rows: list[list]) -> None:
     if not rows:
         return
-    worksheet = _open_worksheet()
     try:
         # Write the header once if the target sheet is still empty.
         # gspread returns [[]] / [['']] for blank cells, so check actual content.
@@ -259,6 +258,35 @@ def _append_rows_to_sheet(rows: list[list]) -> None:
             pass
     except Exception as exc:  # noqa: BLE001
         raise AutocallError(f"Не удалось записать строки в Google Sheets: {exc}") from exc
+
+
+def _is_settled(autocall: dict) -> bool:
+    """True only when final_cost is populated (>0).
+
+    AutoCall freezes max_cost during a campaign and refunds the unused part on
+    completion; the real final_cost is billed with a delay, so a freshly finished
+    campaign can report final_cost=0 for a while. Writing that 0 would lock in a
+    wrong row (dedup never updates it), so we skip until it settles.
+    """
+    cost = _parse_cost(autocall.get("final_cost"))
+    return cost is not None and cost > 0
+
+
+def _autocall_key(date_str: str, project: str, amount: float | None) -> str:
+    amt = f"{amount:.2f}" if amount is not None else ""
+    return f"{date_str}|{project}|{amt}"
+
+
+def _read_autocall_sheet_keys(worksheet) -> set[str]:
+    """Keys already present in the «Фактическая стоимость» sheet — dedup source of truth."""
+    keys: set[str] = set()
+    for row in worksheet.get_all_values()[1:]:  # skip header
+        cells = list(row) + [""] * (3 - len(row))
+        date_str, project, amount = cells[0], cells[1], cells[2]
+        if not date_str.strip():
+            continue
+        keys.add(_autocall_key(date_str, project, _parse_cost(amount)))
+    return keys
 
 
 # ── Dedup persistence ────────────────────────────────────────────────────────────
@@ -293,16 +321,27 @@ async def sync_autocalls() -> dict:
     Returns {added, skipped, total_seen, last_date}.
     """
     autocalls, total = await _fetch_autocalls(stop_at_cutoff=True)
-    synced_ids = _get_synced_ids()
+    worksheet = _open_worksheet()
+    # Dedup against the sheet itself (DB-independent): deleting a row re-syncs it.
+    seen = _read_autocall_sheet_keys(worksheet)
 
-    fresh = [
-        a for a in autocalls
-        if str(a.get("id")) not in synced_ids and _passes_cutoff(a.get("created_at"))
-    ]
+    fresh = []
+    for a in autocalls:
+        if not _passes_cutoff(a.get("created_at")) or not _is_settled(a):
+            continue
+        key = _autocall_key(
+            _format_date(a.get("created_at")),
+            _extract_project_letter(a.get("name")),
+            _parse_cost(a.get("final_cost")),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        fresh.append(a)
     fresh.sort(key=lambda a: _parse_created_at(a.get("created_at")) or datetime.min)
 
     rows = [_to_row(a) for a in fresh]
-    _append_rows_to_sheet(rows)
+    _append_rows_to_sheet(worksheet, rows)
 
     for autocall in fresh:
         _record_synced(autocall)
@@ -321,10 +360,20 @@ async def get_metrics() -> dict:
     """Read-only summary for the UI modal (no writes)."""
     # Only fetches pages back to the cutoff; `total` is the full campaign count.
     autocalls, total = await _fetch_autocalls(stop_at_cutoff=True)
-    synced_ids = _get_synced_ids()
+    seen = _read_autocall_sheet_keys(_open_worksheet())
 
     eligible = [a for a in autocalls if _passes_cutoff(a.get("created_at"))]
-    pending = [a for a in eligible if str(a.get("id")) not in synced_ids]
+    # Pending = settled (final_cost>0) and not yet in the sheet. Unsettled (0) ones
+    # are intentionally held back until their cost is billed.
+    pending = [
+        a for a in eligible
+        if _is_settled(a)
+        and _autocall_key(
+            _format_date(a.get("created_at")),
+            _extract_project_letter(a.get("name")),
+            _parse_cost(a.get("final_cost")),
+        ) not in seen
+    ]
 
     total_cost = sum((_parse_cost(a.get("final_cost")) or 0.0) for a in eligible)
 
@@ -346,7 +395,7 @@ async def get_metrics() -> dict:
         "total_autocalls": total,
         "eligible_count": len(eligible),
         "pending_count": len(pending),
-        "synced_count": len(synced_ids),
+        "synced_count": len(seen),
         "total_cost": _format_amount(total_cost),
         "cutoff_date": settings.autocall_sync_since,
         "latest": latest_info,
