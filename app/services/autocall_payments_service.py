@@ -108,9 +108,34 @@ def _classify(amount: float | None, desc: str) -> str:
     return "refund"  # any other credit (call/SMS refunds, registration bonus)
 
 
+def _key(date_time: str, amount: float | None, desc: str) -> str:
+    """Stable dedup key, reconstructable from both a scraped row and a sheet row."""
+    amt = f"{abs(amount):.2f}" if amount is not None else ""
+    return hashlib.sha1(f"{date_time}|{amt}|{desc}".encode()).hexdigest()[:32]
+
+
 def _entry_key(row: dict) -> str:
-    raw = f"{row['date_time']}|{row['amount']}|{row['desc']}"
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:32]
+    return _key(row["date_time"], _parse_cost(row["amount"]), row["desc"])
+
+
+def _sheet_row_key(sheet_row: list) -> str | None:
+    """Reconstruct the dedup key from a written sheet row [dt, topup, refund, expense, desc]."""
+    cells = list(sheet_row) + [""] * (5 - len(sheet_row))
+    date_time, desc = cells[0], cells[4]
+    if not date_time.strip():
+        return None
+    amount = next((_parse_cost(c) for c in cells[1:4] if c.strip()), None)
+    return _key(date_time, amount, desc)
+
+
+def _read_sheet_keys(worksheet) -> set[str]:
+    """Keys already present in the sheet — the source of truth for dedup."""
+    keys: set[str] = set()
+    for row in worksheet.get_all_values()[1:]:  # skip header
+        key = _sheet_row_key(row)
+        if key:
+            keys.add(key)
+    return keys
 
 
 def _to_row(row: dict) -> list:
@@ -147,12 +172,9 @@ def _record_synced(key: str, row: dict) -> None:
 
 # ── Google Sheets ────────────────────────────────────────────────────────────────
 
-def _append_rows(rows: list[list]) -> None:
+def _append_rows(worksheet, rows: list[list]) -> None:
     if not rows:
         return
-    worksheet = get_or_create_worksheet(
-        open_spreadsheet(), settings.google_sheets_topups_worksheet_name, cols=5
-    )
     try:
         existing = worksheet.get_values("A1:E1")
         is_empty = not any(cell.strip() for row in existing for cell in row)
@@ -175,20 +197,27 @@ def _append_rows(rows: list[list]) -> None:
 def sync_ledger() -> dict:
     """Fetch new balance operations and append them to the «Пополнения» worksheet.
 
+    Dedup is against the sheet itself (plus the DB as a fast-path), so re-runs never
+    duplicate — even if the backend DB was reset between deploys.
+
     Returns {added, skipped, total_seen, last_date}.
     """
     entries = _fetch_ledger()
-    synced = _get_synced_keys()
+    worksheet = get_or_create_worksheet(
+        open_spreadsheet(), settings.google_sheets_topups_worksheet_name, cols=5
+    )
+    seen = _read_sheet_keys(worksheet) | _get_synced_keys()
 
     fresh: list[tuple[str, dict]] = []
     for row in entries:
         key = _entry_key(row)
-        if key not in synced:
+        if key not in seen:
             fresh.append((key, row))
+            seen.add(key)  # guard against duplicates within this same batch
     # Oldest first so the sheet reads chronologically downward.
     fresh.reverse()
 
-    _append_rows([_to_row(row) for _key, row in fresh])
+    _append_rows(worksheet, [_to_row(row) for _key, row in fresh])
     for key, row in fresh:
         _record_synced(key, row)
 
