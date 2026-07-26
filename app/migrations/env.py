@@ -9,12 +9,16 @@ from app.core.config import settings
 from app.core.database import Base
 import app.models.persistence  # noqa: F401 — ensures all models are registered
 
+from app.bbc.db import BbcBase  # BBC Dashboard (removable module)
+import app.bbc.models  # noqa: F401 — BBC Dashboard (removable module)
+
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-target_metadata = Base.metadata
+# Two metadata objects: the converter's tables in `public` and BBC's in `bbc`.
+target_metadata = [Base.metadata, BbcBase.metadata]
 
 
 def get_url() -> str:

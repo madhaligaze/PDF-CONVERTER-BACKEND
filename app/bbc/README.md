@@ -1,0 +1,90 @@
+# BBC Dashboard — backend module
+
+Управленческий отчёт по сводной таблице BBC Consulting в Google Sheets.
+Модуль **полностью изолирован**: код в `backend/app/bbc/`, данные — в отдельной
+Postgres-схеме `bbc`.
+
+## Файлы
+
+| Файл | Назначение |
+| --- | --- |
+| `config.py` | Свои настройки (`BbcSettings`, префикс `BBC_`). Читает `.env` из корня репозитория и из `backend/`, поэтому работает при любом рабочем каталоге. |
+| `db.py` | `BbcBase` со схемой `bbc` поверх общего движка из `app/core/database.py`. На SQLite схема снимается через `schema_translate_map`. |
+| `models.py` | Таблицы: `users`, `user_sessions`, `access_links`, `audit_log`, `sheet_snapshots`, `sync_runs`. |
+| `auth.py` | argon2-пароли, серверные сессии, смена логина/пароля, bootstrap первого админа. |
+| `links.py` | Реферальные ссылки по отделам: создание, разрешение, срок, отзыв. |
+| `scope.py` | **Ядро безопасности.** Разбор поля «Отдел» и правило видимости строки. |
+| `deps.py` | FastAPI-зависимости: ссылка → сессия → `denied`. |
+| `sheets.py` | gspread + Drive API: чтение источников, `modifiedTime` для live. |
+| `normalize.py` | Парсеры грязи: NBSP-числа, `#N/A`, два формата дат, дубли справочников. |
+| `periods.py` | Два цикла начисления (§4): границы, pro-rata, аллокация. |
+| `dataset.py` | Сырая сетка → типизированные строки + измерения + полнота. |
+| `recognition.py` | 9 режимов признания выручки, предвычисленных построчно. |
+| `validators.py` | 15 правил поиска аномалий для блока «Предупреждения». |
+| `live.py` | Снапшот в памяти, `revision`, фоновое обновление, история в БД. |
+| `service.py` | Оркестрация. **Каждая функция принимает `Scope` и применяет его до агрегации.** |
+| `schemas.py` | Pydantic-контракты (зеркало `src/components/bbc-dashboard/types.ts`). |
+| `routes.py` | `APIRouter(prefix="/bbc")`. |
+
+## Эндпоинты
+
+| Метод | Путь | Доступ |
+| --- | --- | --- |
+| POST | `/bbc/auth/login` · `/bbc/auth/logout` | публично |
+| GET | `/bbc/me` | публично (никогда не 401) |
+| POST | `/bbc/account/credentials` | админ |
+| GET/POST/DELETE | `/bbc/links[/{id}]` | админ |
+| GET | `/bbc/dataset` | сессия или ссылка |
+| GET | `/bbc/revision` | сессия или ссылка |
+| GET | `/bbc/warnings` | админ |
+| GET | `/bbc/status` | публично |
+| GET | `/bbc/sheets` · `/bbc/snapshot` | админ |
+| POST | `/bbc/update` | отключён: источники только на чтение |
+
+## Безопасность
+
+Разграничение — **по отделу**, и только по нему: отдел и юрлицо ортогональны
+(ОБО размазан по BBC/BBCA/BBCS/BBC Astana, а юрлицо BBC поделено между четырьмя
+отделами), поэтому фильтр по фирме отдел не изолирует.
+
+Три правила, которые нельзя нарушать:
+
+1. **Дефолт «запрещено».** Отсутствие области даёт пустую выдачу, а не полную.
+2. **Фильтрация до сериализации.** Чужие строки не уходят в браузер вообще.
+3. **Агрегаты внутри области.** Иначе «итого» выдаёт чужие цифры при скрытых
+   строках — самая частая утечка в дашбордах.
+
+Проверено на живых данных: НО видит 120 строк, ОБО 242, ЮО 98, HR 43, ФО 1,
+админ 524, `denied` — ноль. Строки без отдела (29) видны только админу.
+
+## Переменные окружения
+
+```
+BBC_DASHBOARD_ENABLED=true
+BBC_SPREADSHEET_ID=<id между /d/ и /edit>
+BBC_WORKSHEET_NAME=Сводка все ЮР лица
+BBC_JOURNAL_SPREADSHEET_ID=
+BBC_SALES_SPREADSHEET_ID=
+BBC_OMIP_SPREADSHEET_ID=
+BBC_SERVICE_ACCOUNT_JSON=bbc-sheets.json   # путь (относительный — от корня репо) ИЛИ сам JSON
+BBC_POLL_INTERVAL_SECONDS=15               # фоновый live-цикл; 0 = выключить
+BBC_SESSION_TTL_HOURS=12
+BBC_PUBLIC_BASE_URL=                       # база для реферальных ссылок
+BBC_BOOTSTRAP_ADMIN=                       # читается один раз, пока bbc.users пуста
+BBC_BOOTSTRAP_PASSWORD=
+```
+
+Скоупы Google: `spreadsheets.readonly` (чтение), `drive.metadata.readonly`
+(`modifiedTime` для live), `drive.file` (только созданные приложением файлы —
+под будущую выгрузку МСФО; исходные таблицы недоступны для записи).
+
+## Как удалить фичу целиком
+
+1. Удалить каталог `backend/app/bbc/`.
+2. Удалить строки с пометкой `BBC Dashboard (removable module)` в
+   `backend/app/api/router.py`, `backend/app/main.py`, `backend/app/migrations/env.py`.
+3. `alembic downgrade 0003` (сносит схему `bbc` целиком) и удалить
+   `backend/app/migrations/versions/0004_bbc_schema.py`.
+4. Фронтенд: см. `src/components/bbc-dashboard/README.md`.
+
+Модуль не пишет в чужие таблицы и не импортируется никаким другим кодом.

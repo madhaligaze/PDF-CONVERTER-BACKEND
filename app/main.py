@@ -14,6 +14,21 @@ from app.core.database import get_resolved_database_url, init_database
 log = logging.getLogger(__name__)
 
 
+def _init_bbc() -> None:
+    """Create the `bbc` schema/tables. BBC Dashboard (removable module).
+
+    Best-effort: the dashboard failing to initialise must never stop the rest of
+    the API from booting.
+    """
+    try:
+        from app.bbc.db import init_bbc_database
+
+        init_bbc_database()
+        log.info("BBC schema initialized")
+    except Exception as exc:  # noqa: BLE001 — optional feature, never fatal
+        log.warning("BBC schema init failed (%s: %s)", type(exc).__name__, exc)
+
+
 def _run_migrations() -> None:
     """Apply pending Alembic migrations, fall back to create_all for SQLite."""
     log.info("Starting migrations...")
@@ -24,6 +39,7 @@ def _run_migrations() -> None:
     if db_url.startswith("sqlite"):
         log.info("SQLite detected, skipping alembic and running create_all")
         init_database()
+        _init_bbc()
         log.info("Database initialized with SQLite")
         return
 
@@ -43,6 +59,7 @@ def _run_migrations() -> None:
         try:
             log.info("Attempting create_all fallback...")
             init_database()
+            _init_bbc()
             log.info("create_all fallback succeeded")
         except Exception as exc2:
             log.error("create_all fallback also failed: %s: %s", type(exc2).__name__, exc2)
@@ -79,6 +96,34 @@ async def _autocall_sync_loop() -> None:
         await asyncio.sleep(interval)
 
 
+async def _bbc_refresh_loop() -> None:
+    """Background live refresh of the BBC dashboard. Removable module.
+
+    The backend — not the browsers — polls Google, so the request count stays
+    constant no matter how many tabs are open. Each pass first checks Drive's
+    `modifiedTime` and only re-reads the sheet when it actually moved.
+    """
+    from app.bbc import live
+    from app.bbc.config import bbc_settings
+
+    interval = max(5.0, bbc_settings.poll_interval_seconds)
+    # Warm the snapshot once so the first request is served from memory.
+    try:
+        await asyncio.to_thread(live.refresh, force=True)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("BBC: initial refresh failed: %s", exc)
+
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            # gspread/httpx are blocking — keep them off the event loop.
+            await asyncio.to_thread(live.refresh)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — best-effort poll, never fatal
+            log.warning("BBC: live refresh failed: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     # Warm up Smart NLP Correction Engine (fails silently if models unavailable)
@@ -102,11 +147,21 @@ async def lifespan(_: FastAPI):
     if settings.autocall_auto_sync_enabled and settings.autocall_configured:
         autocall_task = asyncio.create_task(_autocall_sync_loop())
 
+    # Start the BBC Dashboard live refresh (removable module).
+    bbc_task: asyncio.Task | None = None
+    try:
+        from app.bbc.config import bbc_settings
+
+        if bbc_settings.configured and bbc_settings.poll_interval_seconds > 0:
+            bbc_task = asyncio.create_task(_bbc_refresh_loop())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("BBC live refresh failed to start: %s", exc)
+
     log.info("Application startup complete")
     try:
         yield
     finally:
-        for task in (bot_task, autocall_task):
+        for task in (bot_task, autocall_task, bbc_task):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
