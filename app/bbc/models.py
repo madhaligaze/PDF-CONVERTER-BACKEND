@@ -90,6 +90,11 @@ class BbcAccessLink(BbcBase):
     # {"departments": ["НО"], "blocks": ["receivables", "analytics", "calendar"]}
     scope: Mapped[dict] = mapped_column(JSON)
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    # The address itself, so the account page can show it again after a reload.
+    # Deliberate trade-off (see migration 0005): resolution still goes through
+    # `token_hash`, but a working link now sits in the database in the clear, so
+    # database access equals access to the departments' data.
+    token: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     created_by: Mapped[int | None] = mapped_column(
         ForeignKey(f"{BBC_SCHEMA}.users.id", ondelete="SET NULL"), nullable=True

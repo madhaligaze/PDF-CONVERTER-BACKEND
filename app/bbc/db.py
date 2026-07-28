@@ -66,7 +66,33 @@ def init_bbc_database() -> None:
             connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{BBC_SCHEMA}"'))
 
     BbcBase.metadata.create_all(bind=bbc_engine())
+    if engine.dialect.name == "sqlite":
+        _add_missing_sqlite_columns()
     _initialized = True
+
+
+def _add_missing_sqlite_columns() -> None:
+    """Bring an existing SQLite file up to the current model.
+
+    `create_all` only creates missing *tables* — a column added to a model never
+    reaches a database file that already exists. On Postgres alembic handles
+    that; the SQLite path (dev machine and the test suite) had no equivalent, so
+    the first added column silently broke every insert into that table. This
+    closes the gap for the one case it applies to, in the same spirit as the
+    create_all fallback itself.
+    """
+    engine = bbc_engine()
+    with engine.begin() as connection:
+        for table, column, ddl in (
+            ("access_links", "token", "VARCHAR(64)"),
+        ):
+            rows = connection.execute(text(f"PRAGMA table_info({table})")).fetchall()
+            if not rows:  # table not there at all — create_all owns that case
+                continue
+            if any(row[1] == column for row in rows):
+                continue
+            connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+            log.info("BBC/sqlite: added missing column %s.%s", table, column)
 
 
 def get_bbc_session_factory() -> sessionmaker[Session]:

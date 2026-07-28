@@ -1,8 +1,13 @@
 """Lifecycle of the department referral links.
 
 Covers the security promises made in the plan: a token maps to a server-side
-scope, revocation is immediate, expiry is honoured, links without a duration stay
-permanent, and nothing about the raw token survives in the database.
+scope, revocation is immediate, expiry is honoured, and links without a duration
+stay permanent.
+
+The address is now stored next to the link so the account page can show it again
+after a reload — a deliberate trade-off recorded in migration 0005. What must
+still hold: `token_hash` remains the lookup key, and a link that is revoked or
+expired stops handing out its address.
 """
 from __future__ import annotations
 
@@ -14,7 +19,14 @@ from sqlalchemy import select
 from app.bbc import links as links_module
 from app.bbc.auth import hash_token
 from app.bbc.db import bbc_session
-from app.bbc.links import LinkError, create_link, list_links, resolve_link, revoke_link
+from app.bbc.links import (
+    LinkError,
+    create_link,
+    list_links,
+    resolve_link,
+    revoke_link,
+    set_link_expiry,
+)
 from app.bbc.models import BbcAccessLink
 from app.bbc.scope import Scope
 
@@ -71,14 +83,19 @@ def test_non_positive_duration_is_rejected() -> None:
         create_link("НО", expires_in_hours=0)
 
 
-def test_raw_token_is_never_stored() -> None:
-    token = _token_of(create_link("HR"))
+def test_stored_token_reproduces_the_url() -> None:
+    """Хранимый адрес — тот же самый, а не похожий: иначе кабинет отдаст нерабочий."""
+    view = create_link("HR")
+    token = _token_of(view)
 
     with bbc_session() as session:
         record = session.scalar(select(BbcAccessLink))
         assert record is not None
-        assert token not in record.token_hash
+        assert record.token == token
+        # Хэш остаётся ключом поиска — по нему и только по нему решается доступ.
         assert record.token_hash == hash_token(token)
+
+    assert list_links()[0].url == view.url
 
 
 # ── Expiry ───────────────────────────────────────────────────────────────────────
@@ -194,9 +211,87 @@ def test_usage_is_counted() -> None:
     assert listed.last_used_at is not None
 
 
-def test_listing_never_exposes_a_url() -> None:
-    create_link("НО")
-    assert all(item.url is None for item in list_links())
+def test_listing_returns_url_for_active_links() -> None:
+    created = create_link("НО")
+    assert list_links()[0].url == created.url
+
+
+def test_listing_hides_the_url_of_a_revoked_link() -> None:
+    """Мёртвый адрес в поле «скопировать» — приглашение отправить нерабочую ссылку."""
+    created = create_link("НО")
+    revoke_link(created.id)
+
+    listed = list_links()[0]
+    assert listed.is_active is False
+    assert listed.url is None
+
+
+def test_listing_hides_the_url_of_an_expired_link() -> None:
+    created = create_link("НО", expires_in_hours=1)
+    with bbc_session() as session:
+        record = session.get(BbcAccessLink, created.id)
+        assert record is not None
+        record.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+
+    listed = list_links()[0]
+    assert listed.is_active is False
+    assert listed.url is None
+
+
+# ── Смена срока у выданной ссылки ────────────────────────────────────────────────
+
+
+def test_expiry_can_be_set_on_a_live_link_without_changing_its_address() -> None:
+    created = create_link("ЮО")
+
+    updated = set_link_expiry(created.id, expires_in_minutes=15)
+
+    assert updated is not None
+    assert updated.expires_at is not None
+    # Смысл всей операции: у получателя на руках остаётся тот же адрес.
+    assert updated.url == created.url
+    assert resolve_link(_token_of(created)) is not None
+
+
+def test_expiry_can_be_cleared_again() -> None:
+    created = create_link("ЮО", expires_in_hours=1)
+
+    updated = set_link_expiry(created.id, expires_in_minutes=None)
+
+    assert updated is not None
+    assert updated.expires_at is None
+    assert updated.is_active
+
+
+def test_link_stops_resolving_once_the_new_deadline_passes() -> None:
+    created = create_link("ЮО")
+    token = _token_of(created)
+    set_link_expiry(created.id, expires_in_minutes=1)
+
+    with bbc_session() as session:
+        record = session.get(BbcAccessLink, created.id)
+        assert record is not None
+        record.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+
+    assert resolve_link(token) is None
+
+
+def test_non_positive_new_expiry_is_rejected() -> None:
+    created = create_link("ЮО")
+    with pytest.raises(LinkError):
+        set_link_expiry(created.id, expires_in_minutes=0)
+
+
+def test_setting_expiry_on_a_missing_link_reports_none() -> None:
+    assert set_link_expiry("nope", expires_in_minutes=5) is None
+
+
+def test_revoked_link_cannot_be_given_a_new_deadline() -> None:
+    created = create_link("ЮО")
+    revoke_link(created.id)
+
+    with pytest.raises(LinkError):
+        set_link_expiry(created.id, expires_in_minutes=5)
 
 
 def test_url_is_built_from_the_configured_base(monkeypatch) -> None:

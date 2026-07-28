@@ -216,11 +216,62 @@ def test_unknown_department_is_rejected(admin_client: TestClient) -> None:
     assert response.status_code == 400
 
 
-def test_listing_links_never_returns_a_url(admin_client: TestClient) -> None:
-    _issue_link(admin_client, "НО")
+def test_listing_links_returns_the_address_again(admin_client: TestClient) -> None:
+    """Адрес переживает перезагрузку кабинета — иначе выданную ссылку не показать."""
+    created = _issue_link(admin_client, "НО")
 
     listed = admin_client.get(f"{BASE}/links").json()
-    assert listed and all(item["url"] is None for item in listed)
+    assert listed and listed[0]["url"] == created["url"]
+
+
+def test_listing_hides_the_address_of_a_revoked_link(admin_client: TestClient) -> None:
+    link = _issue_link(admin_client, "НО")
+    admin_client.delete(f"{BASE}/links/{link['id']}")
+
+    listed = admin_client.get(f"{BASE}/links").json()
+    assert listed and listed[0]["url"] is None
+
+
+def test_expiry_can_be_changed_after_the_link_was_handed_out(admin_client: TestClient) -> None:
+    link = _issue_link(admin_client, "ЮО")
+    assert link["expires_at"] is None
+
+    response = admin_client.patch(f"{BASE}/links/{link['id']}", json={"expires_in_minutes": 15})
+
+    assert response.status_code == 200
+    updated = response.json()
+    assert updated["expires_at"] is not None
+    # Тот же адрес: у получателя на руках ссылка не должна протухнуть от того,
+    # что администратор передумал насчёт срока.
+    assert updated["url"] == link["url"]
+    assert admin_client.get(f"{BASE}/me", params={"k": _token_of(link)}).json()[
+        "link_expires_at"
+    ] == updated["expires_at"]
+
+
+def test_expiry_can_be_removed_again(admin_client: TestClient) -> None:
+    link = _issue_link(admin_client, "ЮО", expires_in_hours=2)
+
+    response = admin_client.patch(f"{BASE}/links/{link['id']}", json={"expires_in_minutes": None})
+
+    assert response.status_code == 200
+    assert response.json()["expires_at"] is None
+
+
+def test_changing_expiry_of_a_missing_link_is_404(admin_client: TestClient) -> None:
+    assert (
+        admin_client.patch(f"{BASE}/links/nope", json={"expires_in_minutes": 5}).status_code == 404
+    )
+
+
+def test_non_positive_expiry_is_rejected(admin_client: TestClient) -> None:
+    link = _issue_link(admin_client, "ЮО")
+    assert (
+        admin_client.patch(
+            f"{BASE}/links/{link['id']}", json={"expires_in_minutes": 0}
+        ).status_code
+        == 400
+    )
 
 
 def test_revoking_a_missing_link_is_404(admin_client: TestClient) -> None:

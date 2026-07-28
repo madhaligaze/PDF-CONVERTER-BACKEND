@@ -76,6 +76,11 @@ class Snapshot:
 _lock = threading.Lock()
 _snapshot = Snapshot()
 
+# Held for the duration of a read, so only one goes to Google at a time.
+_read_lock = threading.Lock()
+# Outcome of the read that is currently finishing — handed to whoever waited.
+_last_outcome = False
+
 
 def get_snapshot() -> Snapshot:
     with _lock:
@@ -148,7 +153,29 @@ def refresh(*, force: bool = False) -> bool:
 
     `force=True` skips the cheap `modifiedTime` probe and always re-reads — used by
     the manual refresh button and by the very first load.
+
+    One read at a time. The manual «Обновить» button and the background loop can
+    fire together, and several browsers can press it at once; without this gate
+    each of them would pull the same 524-row sheet separately and eat the 60/min
+    quota for nothing. A caller that arrives mid-read waits for the one in flight
+    and takes its answer — by the time the lock frees, the read it needed has
+    already happened, so repeating it would add a request and no information.
     """
+    global _last_outcome
+
+    if not _read_lock.acquire(blocking=False):
+        with _read_lock:
+            return _last_outcome
+
+    try:
+        _last_outcome = _read_sources(force=force)
+        return _last_outcome
+    finally:
+        _read_lock.release()
+
+
+def _read_sources(*, force: bool) -> bool:
+    """The read itself. Never call directly — `refresh()` owns the lock."""
     started = datetime.now(UTC)
     changed: list[str] = []
     error: str | None = None

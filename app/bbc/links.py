@@ -5,8 +5,13 @@ server**, so the recipient cannot widen it — editing the URL changes nothing,
 because the URL carries only an opaque token.
 
 Lifetime follows the account page: creating a link without a duration makes it
-permanent («публичная»), the clock control sets `expires_at`, and the cross
-revokes it immediately.
+permanent («публичная»), the clock control sets `expires_at` — at any time, not
+only at creation — and the cross revokes it immediately.
+
+The address is stored next to the link (`token`) so the page can show it again
+after a reload; `token_hash` stays the lookup key. That is a deliberate
+trade-off, spelled out in migration 0005: a working link is now readable by
+anyone who can read the database.
 """
 from __future__ import annotations
 
@@ -68,9 +73,18 @@ def build_url(token: str, base_url: str | None = None) -> str:
     return f"{base}/bbc-dashboard?k={token}"
 
 
-def _to_view(record: BbcAccessLink, now: datetime, url: str | None = None) -> LinkView:
+def _to_view(
+    record: BbcAccessLink,
+    now: datetime,
+    url: str | None = None,
+    base_url: str | None = None,
+) -> LinkView:
     scope = record.scope if isinstance(record.scope, dict) else {}
     active = record.revoked_at is None and not _is_expired(record.expires_at, now)
+    # Мёртвой ссылке адрес не отдаём: отозванная или истёкшая ссылка в поле
+    # «скопировать» — это приглашение отправить нерабочий адрес.
+    if url is None and record.token and active:
+        url = build_url(record.token, base_url)
     return LinkView(
         id=record.id,
         label=record.label,
@@ -97,10 +111,7 @@ def create_link(
     created_by: int | None = None,
     base_url: str | None = None,
 ) -> LinkView:
-    """Issue a link for one department. Returns the view **with** the raw URL.
-
-    The raw token is shown exactly once, here — afterwards only its hash is kept.
-    """
+    """Issue a link for one department. Returns the view **with** the URL."""
     code = canonical_department(department)
     if code is None:
         raise LinkError(f"Неизвестный отдел: {department!r}. Доступны: {', '.join(DEPARTMENTS)}")
@@ -118,6 +129,7 @@ def create_link(
             label=code,
             scope=scope.to_dict(),
             token_hash=hash_token(token),
+            token=token,
             created_by=created_by,
             expires_at=expires_at,
         )
@@ -130,13 +142,46 @@ def create_link(
 
 
 def list_links(base_url: str | None = None) -> list[LinkView]:
-    """All links, newest first. URLs are absent — the token cannot be recovered."""
+    """All links, newest first. Active ones carry their address."""
     now = datetime.now(UTC)
     with bbc_session() as session:
         records = session.scalars(
             select(BbcAccessLink).order_by(BbcAccessLink.created_at.desc())
         ).all()
-        return [_to_view(record, now) for record in records]
+        return [_to_view(record, now, base_url=base_url) for record in records]
+
+
+def set_link_expiry(
+    link_id: str,
+    *,
+    expires_in_minutes: float | None,
+    base_url: str | None = None,
+) -> LinkView | None:
+    """Give a live link a deadline, or take it away. Returns None if unknown.
+
+    The address does not change: the point of this call is that a link already
+    handed out can be made temporary without invalidating what the recipient
+    already has. `None` makes it permanent again.
+    """
+    if expires_in_minutes is not None and expires_in_minutes <= 0:
+        raise LinkError("Срок действия должен быть больше нуля")
+
+    now = datetime.now(UTC)
+    with bbc_session() as session:
+        record = session.get(BbcAccessLink, link_id)
+        if record is None:
+            return None
+        if record.revoked_at is not None:
+            raise LinkError("Ссылка отозвана — задайте срок при выдаче новой")
+
+        record.expires_at = (
+            now + timedelta(minutes=expires_in_minutes) if expires_in_minutes else None
+        )
+        session.flush()
+        view = _to_view(record, now, base_url=base_url)
+
+    log.info("BBC: link %s expiry set to %s", link_id, view.expires_at or "never")
+    return view
 
 
 def revoke_link(link_id: str) -> bool:
@@ -147,6 +192,9 @@ def revoke_link(link_id: str) -> bool:
             return False
         if record.revoked_at is None:
             record.revoked_at = datetime.now(UTC)
+        # Отозванный адрес больше нигде не показывается, и хранить его незачем:
+        # проверка доступа всё равно идёт по хэшу, который остаётся на месте.
+        record.token = None
         return True
 
 
@@ -178,12 +226,26 @@ def resolve_link(token: str | None) -> Scope | None:
         return Scope.from_dict(record.scope)
 
 
+def describe_token(token: str | None) -> LinkView | None:
+    """The link behind a token, for telling its holder when access ends."""
+    if not token:
+        return None
+    now = datetime.now(UTC)
+    with bbc_session() as session:
+        record = session.scalar(
+            select(BbcAccessLink).where(BbcAccessLink.token_hash == hash_token(token))
+        )
+        return None if record is None else _to_view(record, now)
+
+
 __all__ = [
     "LinkError",
     "LinkView",
     "build_url",
     "create_link",
+    "describe_token",
     "list_links",
     "resolve_link",
     "revoke_link",
+    "set_link_expiry",
 ]

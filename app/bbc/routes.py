@@ -7,6 +7,7 @@ Access
     POST   /bbc/account/credentials — change login/password (admin)
     GET    /bbc/links               — list referral links (admin)
     POST   /bbc/links               — issue a link for one department (admin)
+    PATCH  /bbc/links/{link_id}     — change how long a link lives (admin)
     DELETE /bbc/links/{link_id}     — revoke a link (admin)
 
 Data
@@ -26,12 +27,20 @@ from app.bbc import links as links_module
 from app.bbc import service
 from app.bbc.auth import AuthError, AuthedUser
 from app.bbc.config import bbc_settings
-from app.bbc.deps import SESSION_COOKIE, current_scope, require_admin, require_block, require_scope
+from app.bbc.deps import (
+    LINK_HEADER,
+    SESSION_COOKIE,
+    current_scope,
+    require_admin,
+    require_block,
+    require_scope,
+)
 from app.bbc.links import LinkError
 from app.bbc.schemas import (
     BbcCredentialsRequest,
     BbcLink,
     BbcLinkCreateRequest,
+    BbcLinkExpiryRequest,
     BbcLoginRequest,
     BbcMe,
     BbcOk,
@@ -124,9 +133,13 @@ async def me(request: Request, scope: Scope = Depends(current_scope)) -> BbcMe:
         return _me_for_user(user)
     if not scope.sees_nothing:
         # Arrived through a referral link: no account, just a scoped view.
+        # Токен приходит либо заголовком, либо ?k= — как и в current_scope.
+        token = request.headers.get(LINK_HEADER) or request.query_params.get("k")
+        link = links_module.describe_token(token)
         return BbcMe(
             authenticated=True,
             link_label=scope.label or None,
+            link_expires_at=link.expires_at if link else None,
             departments=list(scope.departments),
             blocks=list(scope.blocks),
         )
@@ -157,8 +170,11 @@ async def change_credentials(
 
 
 @router.get("/links", response_model=list[BbcLink])
-async def list_links(_: AuthedUser = Depends(require_admin)) -> list[BbcLink]:
-    return [BbcLink(**vars(item)) for item in links_module.list_links()]
+async def list_links(request: Request, _: AuthedUser = Depends(require_admin)) -> list[BbcLink]:
+    # База обязательна: адрес отсюда копируют и отправляют человеку, а
+    # относительный «/bbc-dashboard?k=…» вне этой вкладки никуда не ведёт.
+    base_url = bbc_settings.public_base_url or str(request.base_url).rstrip("/")
+    return [BbcLink(**vars(item)) for item in links_module.list_links(base_url)]
 
 
 @router.post("/links", response_model=BbcLink)
@@ -176,6 +192,32 @@ async def create_link(
         )
     except LinkError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return BbcLink(**vars(view))
+
+
+@router.patch("/links/{link_id}", response_model=BbcLink)
+async def set_link_expiry(
+    link_id: str,
+    payload: BbcLinkExpiryRequest,
+    request: Request,
+    _: AuthedUser = Depends(require_admin),
+) -> BbcLink:
+    """Make a live link temporary — or permanent again — without reissuing it.
+
+    Reissuing would hand back a different address, so everyone who already has
+    the old one would silently lose access. The point of this call is that the
+    address survives the change.
+    """
+    try:
+        view = links_module.set_link_expiry(
+            link_id,
+            expires_in_minutes=payload.expires_in_minutes,
+            base_url=bbc_settings.public_base_url or str(request.base_url).rstrip("/"),
+        )
+    except LinkError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if view is None:
+        raise HTTPException(status_code=404, detail="Ссылка не найдена")
     return BbcLink(**vars(view))
 
 

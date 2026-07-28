@@ -78,6 +78,8 @@ class BbcMe(BaseModel):
     role: str | None = None
     # Present when the caller arrived through a referral link.
     link_label: str | None = None
+    # When that link stops working, so the holder is not cut off mid-sentence.
+    link_expires_at: str | None = None
     departments: list[str] = Field(default_factory=list)
     blocks: list[str] = Field(default_factory=list)
     is_admin: bool = False
@@ -89,6 +91,17 @@ class BbcLinkCreateRequest(BaseModel):
     department: str = Field(description="ОБО / НО / ЮО / HR / ФО")
     # None = permanent ("публичная") link; a value makes it temporary.
     expires_in_hours: float | None = None
+
+
+class BbcLinkExpiryRequest(BaseModel):
+    """Change the deadline of a link that is already out there.
+
+    Minutes rather than hours: the account page offers «15 минут», and expressing
+    that as 0.25 hours is a rounding error waiting to happen.
+    """
+
+    # None makes the link permanent again.
+    expires_in_minutes: float | None = None
 
 
 class BbcLink(BaseModel):
