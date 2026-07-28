@@ -57,6 +57,55 @@ def test_password_hash_is_not_the_password() -> None:
     assert not verify_password(digest, "wrong")
 
 
+# ── Регистр логина ───────────────────────────────────────────────────────────────
+
+
+def test_login_ignores_username_case(admin: BbcUser) -> None:
+    """«Admin» и «admin» — один и тот же человек, отказывать ему не за что."""
+    assert resolve_session(login("Admin", PASSWORD)) is not None
+    assert resolve_session(login("ADMIN", PASSWORD)) is not None
+
+
+def test_login_ignores_surrounding_spaces(admin: BbcUser) -> None:
+    assert resolve_session(login("  admin  ", PASSWORD)) is not None
+
+
+def test_case_insensitive_login_keeps_the_stored_spelling(admin: BbcUser) -> None:
+    """Регистр логина в базе не переписывается тем, как его набрали при входе."""
+    session_user = resolve_session(login("ADMIN", PASSWORD))
+    assert session_user is not None
+    assert session_user.username == "admin"
+
+
+def test_password_stays_case_sensitive(admin: BbcUser) -> None:
+    with pytest.raises(AuthError):
+        login("admin", PASSWORD.upper())
+
+
+def test_username_cannot_be_taken_in_another_case(admin: BbcUser) -> None:
+    """Раз «Admin» пускает к «admin», то и занять их разными людьми нельзя."""
+    with bbc_session() as session:
+        session.add(
+            BbcUser(username="buhgalter", password_hash=hash_password(PASSWORD), role="admin")
+        )
+        session.flush()
+        other_id = session.scalar(select(BbcUser.id).where(BbcUser.username == "buhgalter"))
+
+    with pytest.raises(AuthError):
+        change_credentials(other_id, current_password=PASSWORD, new_username="ADMIN")
+
+
+def test_own_username_case_can_be_changed(admin: BbcUser) -> None:
+    """Поменять себе регистр собственного логина — не «логин занят»."""
+    change_credentials(admin.id, current_password=PASSWORD, new_username="Admin")
+
+    with bbc_session() as session:
+        stored = session.get(BbcUser, admin.id)
+        assert stored is not None
+        assert stored.username == "Admin"
+    assert resolve_session(login("admin", PASSWORD)) is not None
+
+
 def test_hashing_is_salted() -> None:
     assert hash_password(PASSWORD) != hash_password(PASSWORD)
 

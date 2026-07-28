@@ -8,6 +8,8 @@ Design notes:
 * The first admin is seeded from `BBC_BOOTSTRAP_ADMIN` / `BBC_BOOTSTRAP_PASSWORD`
   and only while `bbc.users` is empty; afterwards those variables are ignored
   and the credentials are changed from the account page.
+* Логин нечувствителен к регистру и обрамляющим пробелам — см. `_find_user`.
+  Пароль, разумеется, чувствителен.
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.bbc.config import bbc_settings
 from app.bbc.db import bbc_session
@@ -87,6 +90,34 @@ def _validate_password(password: str) -> str:
     return password
 
 
+def _find_user(session: Session, username: str) -> BbcUser | None:
+    """Найти пользователя по логину, не придираясь к регистру.
+
+    Логин — это имя человека, а не пароль: «Admin» и «admin» это один и тот же
+    человек, и отказ со словами «неверный логин или пароль» на верных данных
+    ничего не защищает, а только злит. Регистр пароля, разумеется, остаётся
+    значимым.
+
+    Сначала точное совпадение (индекс, обычный случай), и только потом перебор.
+    Перебор здесь дешёвый: в `bbc.users` живёт пара администраторов. Так же и
+    надёжнее, чем `lower()` в SQL: в SQLite он умеет только ASCII, и логин
+    кириллицей вёл бы себя на тестах иначе, чем на проде.
+    """
+    value = (username or "").strip()
+    if not value:
+        return None
+
+    exact = session.scalar(select(BbcUser).where(BbcUser.username == value))
+    if exact is not None:
+        return exact
+
+    target = value.casefold()
+    for candidate in session.scalars(select(BbcUser)):
+        if candidate.username.casefold() == target:
+            return candidate
+    return None
+
+
 # ── Bootstrap ────────────────────────────────────────────────────────────────────
 
 
@@ -121,7 +152,7 @@ def has_any_user() -> bool:
 def login(username: str, password: str, *, ip: str | None = None, user_agent: str | None = None) -> str:
     """Verify credentials and open a session. Returns the raw cookie token."""
     with bbc_session() as session:
-        user = session.scalar(select(BbcUser).where(BbcUser.username == (username or "").strip()))
+        user = _find_user(session, username)
         # Verify even when the user is missing, so a wrong login and a wrong
         # password take the same time and cannot be told apart.
         if user is None:
@@ -210,11 +241,14 @@ def change_credentials(
 
         if new_username:
             username = _validate_username(new_username)
-            if username != user.username:
-                taken = session.scalar(select(BbcUser).where(BbcUser.username == username))
+            # Сравниваем без учёта регистра: раз «Admin» и «admin» пускают к
+            # одному и тому же человеку, то и занять их разными людьми нельзя.
+            # Себе же поменять только регистр — можно, это то же самое имя.
+            if username.casefold() != user.username.casefold():
+                taken = _find_user(session, username)
                 if taken is not None:
                     raise AuthError("Такой логин уже занят")
-                user.username = username
+            user.username = username
 
         if new_password:
             user.password_hash = hash_password(_validate_password(new_password))
