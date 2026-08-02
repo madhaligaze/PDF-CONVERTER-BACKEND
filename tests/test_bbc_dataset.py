@@ -11,6 +11,8 @@ from __future__ import annotations
 import pytest
 
 from app.bbc.dataset import (
+    EXPECTED_SPREADSHEET_ID,
+    EXPECTED_WORKSHEET,
     Col,
     LayoutError,
     parse_contract_row,
@@ -37,7 +39,10 @@ def header() -> list[str]:
 
 
 def sheet_row(**cells) -> list[str]:
+    """Строка листа. «Вид Услуги» по умолчанию заполнен: пустой означает
+    «договор не вступил в силу», и тест на долг молча считал бы ноль."""
     row = [""] * WIDTH
+    row[Col.SERVICE_KIND] = "Абон.П."
     for name, value in cells.items():
         row[getattr(Col, name.upper())] = value
     return row
@@ -48,6 +53,19 @@ def sheet_row(**cells) -> list[str]:
 
 def test_matching_header_passes() -> None:
     verify_layout(header())
+
+
+def test_the_expected_book_is_recorded_in_the_code() -> None:
+    """`.env` в репозиторий не попадает, поэтому нужная книга записана в коде.
+
+    Без этого следующий, кто откроет `Col`, не узнает, под какую раскладку
+    прибиты позиции, — и сверить их будет не с чем.
+    """
+    assert EXPECTED_SPREADSHEET_ID == "1xEp_QEirE49gREHrSvXwcYJRO1ZTVVzGF4Web43tDvI"
+    assert EXPECTED_WORKSHEET == "Сводка все ЮР лица"
+    assert EXPECTED_SPREADSHEET_ID in str(
+        pytest.raises(LayoutError, verify_layout, [""] * WIDTH).value
+    )
 
 
 def test_a_column_inserted_at_the_front_is_caught() -> None:
@@ -112,6 +130,7 @@ def contract(*periods: tuple[str, int, str, str]) -> list:
             sheet_row(
                 client="ИП Тест",
                 contract_no="№1",
+                service_kind="Абон.П.",
                 period_label=label,
                 month=str(month),
                 saldo_start=saldo,
@@ -170,6 +189,47 @@ def test_a_contract_without_an_opening_saldo_carries_nothing() -> None:
     rows = parse(contract(("ИЮНЬ 2026", 6, "", "400 000")))
     assert rows[0].carry_in is None
     assert sum(r.total_debt for r in rows) == 400_000
+
+
+# ── Договор не вступил в силу ───────────────────────────────────────────────
+
+
+def test_a_contract_not_in_force_is_not_debt() -> None:
+    """«Вид Услуги» = «нет»: договор зафиксирован, но платить по нему не за что.
+
+    Не наша трактовка: ни одна такая строка не попала во вкладки «(для Рук)»,
+    по которым живут отделы, — бизнес уже не считает их долгом.
+    """
+    row = parse_contract_row(2, sheet_row(service_kind="нет", debit_credit="4 060 000"))
+    assert row.in_force is False
+    assert row.total_debt == 0
+    assert row.parked_debt == 4_060_000
+
+
+def test_an_empty_service_kind_is_also_not_in_force() -> None:
+    row = parse_contract_row(2, sheet_row(service_kind="", debit_credit="100 000"))
+    assert row.in_force is False
+    assert row.total_debt == 0
+
+
+def test_a_normal_service_kind_is_in_force() -> None:
+    for kind in ("Абон.П.", "Разовый", "Аренда", "По квартальный ???"):
+        row = parse_contract_row(2, sheet_row(service_kind=kind, debit_credit="85 000"))
+        assert row.in_force is True, kind
+        assert row.total_debt == 85_000, kind
+        assert row.parked_debt == 0, kind
+
+
+def test_a_parked_contract_does_not_carry_its_opening_saldo_into_debt() -> None:
+    rows = parse(
+        contract(
+            ("Старые (до Мая/Июня 2026)", 0, "-1 000 000", "350 000"),
+        )
+    )
+    for row in rows:
+        row.in_force = False
+    assert sum(r.total_debt for r in rows) == 0
+    assert sum(r.parked_debt for r in rows) == 1_350_000
 
 
 def test_carry_in_is_counted_once_per_contract_not_per_client() -> None:

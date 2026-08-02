@@ -59,9 +59,16 @@ Postgres-схеме `bbc`.
 
 ## Переменные окружения
 
+`BBC_SPREADSHEET_ID` — не просто настройка. Позиции колонок в `dataset.py::Col`
+прибиты числами к раскладке этой конкретной книги, поэтому чужая книга даст не
+ошибку, а тихо неверные деньги: суммы останутся суммами, даты датами. От этого
+защищает `verify_layout`, который сверяет заголовок и падает с объяснением.
+Тот же id продублирован в `dataset.py::EXPECTED_SPREADSHEET_ID` — `.env` в
+репозиторий не попадает, и иначе узнать нужную книгу было бы неоткуда.
+
 ```
 BBC_DASHBOARD_ENABLED=true
-BBC_SPREADSHEET_ID=<id между /d/ и /edit>
+BBC_SPREADSHEET_ID=1xEp_QEirE49gREHrSvXwcYJRO1ZTVVzGF4Web43tDvI   # «Копия Общая сводка BBC»
 BBC_WORKSHEET_NAME=Сводка все ЮР лица
 BBC_JOURNAL_SPREADSHEET_ID=
 BBC_SALES_SPREADSHEET_ID=

@@ -34,8 +34,22 @@ from app.bbc.scope import parse_departments
 log = logging.getLogger(__name__)
 
 
+#: Книга, под которую написаны позиции ниже. Записана здесь, а не только в
+#: BBC_SPREADSHEET_ID: `.env` не в репозитории, и без этой строки узнать, какой
+#: раскладке соответствует `Col`, было бы неоткуда. Прежняя книга
+#: (1JMnvGusGMhGgfrZAa2hYF31o5wjPY7INL3o7K1CTC9s) сдвинута на колонку влево и
+#: этому парсеру не подходит — `verify_layout` её не пропустит.
+EXPECTED_SPREADSHEET_ID = "1xEp_QEirE49gREHrSvXwcYJRO1ZTVVzGF4Web43tDvI"
+EXPECTED_WORKSHEET = "Сводка все ЮР лица"
+
+
 class Col:
-    """Zero-based column positions in «Сводка все ЮР лица»."""
+    """Zero-based column positions in «Сводка все ЮР лица».
+
+    Прибиты к книге `EXPECTED_SPREADSHEET_ID`: заголовки листа содержат
+    переносы строк и повторяющиеся разделители «.», из-за чего поиск по имени
+    ненадёжен. Меняете книгу — сверьте раскладку и обновите обе константы.
+    """
 
     MONTH = 2  # Мес (6/7/8)
     PERIOD_LABEL = 3  # Техн. 1 — «ИЮНЬ 2026» или «Старые (до Мая/Июня 2026)»
@@ -98,6 +112,12 @@ RENT = "Аренда"
 # Период ещё не наступил: книга сама решает, когда долг становится долгом.
 NOT_DUE = "ЕЩЕ РАНО"
 
+# «Вид Услуги» = «нет» — договор зафиксирован в реестре, но в силу не вступил:
+# услуга не определена, и станет «Разовая» или «Абон.П.», когда появится
+# ясность. Долгом такая строка не является. Это не догадка: ни одна такая
+# строка не попала во вкладки «(для Рук)», по которым живут отделы.
+NOT_IN_FORCE = {"НЕТ", ""}
+
 
 @dataclass
 class Payment:
@@ -152,13 +172,29 @@ class ContractRow:
     debt_broken: bool = False
     #: Долг, накопленный до учётных периодов. Только у строки «Старые…».
     carry_in: float | None = None
+    #: Договор вступил в силу. У «Вид Услуги» = «нет» — ещё нет, и его сумма
+    #: не долг, а зафиксированная в реестре договорённость.
+    in_force: bool = True
 
     # Filled in by recognition.annotate(); mode key → allocation entries.
     recognition: dict[str, Any] = field(default_factory=dict)
 
     @property
     def total_debt(self) -> float:
-        """Долг строки вместе с входящим остатком."""
+        """Долг строки вместе с входящим остатком.
+
+        Договор не в силе — долга нет: сумма по нему зафиксирована, но платить
+        по ней пока не за что. См. `parked_debt`, где она никуда не девается.
+        """
+        if not self.in_force:
+            return 0.0
+        return (self.debt or 0.0) + (self.carry_in or 0.0)
+
+    @property
+    def parked_debt(self) -> float:
+        """Сумма подвешенного договора. Не долг, но и не ноль — её видно отдельно."""
+        if self.in_force:
+            return 0.0
         return (self.debt or 0.0) + (self.carry_in or 0.0)
 
     @property
@@ -205,6 +241,7 @@ def _parse_debt(raw: str) -> tuple[float | None, bool, bool]:
 
 def parse_contract_row(index: int, row: Sequence[str]) -> ContractRow:
     firm_code = canonical_firm(_cell(row, Col.FIRM))
+    service_raw = _cell(row, Col.SERVICE_KIND)
     period_label = _cell(row, Col.PERIOD_LABEL)
     debt, debt_pending, debt_broken = _parse_debt(_cell(row, Col.DEBIT_CREDIT))
     saldo_start = parse_money(_cell(row, Col.SALDO_START))
@@ -229,7 +266,8 @@ def parse_contract_row(index: int, row: Sequence[str]) -> ContractRow:
         firm_name=firm_label(firm_code),
         departments=parse_departments(_cell(row, Col.DEPARTMENT)),
         employee=_cell(row, Col.EMPLOYEE),
-        service_kind=canonical_service_kind(_cell(row, Col.SERVICE_KIND)),
+        service_kind=canonical_service_kind(service_raw),
+        in_force=service_raw.strip().upper() not in NOT_IN_FORCE,
         status=canonical_status(_cell(row, Col.STATUS)),
         contract_amount=parse_money(_cell(row, Col.CONTRACT_AMOUNT)),
         paid_amount=parse_money(_cell(row, Col.PAID_AMOUNT)),
@@ -301,11 +339,11 @@ def verify_layout(header: Sequence[str]) -> None:
             mismatched.append(f"[{position}] ждали «{expected}», нашли «{actual}»")
     if mismatched:
         raise LayoutError(
-            "Раскладка листа «Сводка все ЮР лица» не совпала с парсером. "
+            f"Раскладка листа «{EXPECTED_WORKSHEET}» не совпала с парсером. "
             "Самая частая причина — BBC_SPREADSHEET_ID указывает на старую книгу: "
-            "парсер написан под «Копия Общая сводка BBC» "
-            "(1xEp_QEirE49gREHrSvXwcYJRO1ZTVVzGF4Web43tDvI), где все колонки "
-            "сдвинуты на одну вправо. Не совпало: " + "; ".join(mismatched)
+            f"парсер написан под «Копия Общая сводка BBC» ({EXPECTED_SPREADSHEET_ID}), "
+            "где все колонки сдвинуты на одну вправо. "
+            "Не совпало: " + "; ".join(mismatched)
         )
 
 
@@ -374,6 +412,7 @@ def coverage(rows: list[ContractRow]) -> dict[str, Any]:
         "with_debt": share(lambda r: r.debt is not None),
         "debt_pending_rows": sum(1 for r in rows if r.debt_pending),
         "debt_broken_rows": sum(1 for r in rows if r.debt_broken),
+        "not_in_force_rows": sum(1 for r in rows if not r.in_force),
     }
 
 
