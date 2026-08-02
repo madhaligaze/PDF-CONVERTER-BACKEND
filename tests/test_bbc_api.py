@@ -334,6 +334,7 @@ def fake_rows(monkeypatch):
         return ContractRow(
             index=index,
             month=6,
+            period_label="ИЮНЬ 2026",
             client=f"Клиент {index}",
             contract_no=f"№{index}",
             subject="Сопровождение",

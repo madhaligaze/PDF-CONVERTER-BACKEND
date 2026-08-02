@@ -22,6 +22,7 @@ def make_row(**overrides) -> ContractRow:
     base = dict(
         index=2,
         month=6,
+        period_label="ИЮНЬ 2026",
         client="ТОО Тест",
         contract_no="№1",
         subject="Сопровождение",

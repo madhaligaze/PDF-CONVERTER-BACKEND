@@ -306,7 +306,21 @@ def _no_employee(rows: list[ContractRow]) -> Finding | None:
     )
 
 
+def _broken_debt(rows: list[ContractRow]) -> Finding | None:
+    affected = [row for row in rows if row.debt_broken]
+    return _finding(
+        "broken_debt",
+        CRITICAL,
+        "Долг не посчитан: ошибка формулы",
+        "В колонке «Дебет / Кредит» стоит ошибка, поэтому долг этих строк не попал "
+        "в дебиторку. Итог по клиенту занижен ровно на них.",
+        "Починить формулу в книге — до этого цифру по клиенту нельзя считать полной.",
+        affected,
+    )
+
+
 RULES: tuple[Callable[[list[ContractRow]], Finding | None], ...] = (
+    _broken_debt,
     _no_period_start,
     _inverted_period,
     _orphan_row,
