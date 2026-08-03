@@ -185,11 +185,13 @@ def get_sales(scope: Scope, worksheet: str | None = None) -> dict[str, Any]:
     поэтому блок доступен только тем, чья область его разрешает (админ).
     """
     tab = worksheet or _latest_report_tab()
-    report_grid = sheets.read_values(tab, bbc_settings.omip_spreadsheet_id)
+    report_grid = sheets.read_cached(tab, bbc_settings.omip_spreadsheet_id)
     report = sales_module.parse_sales_report(report_grid, tab)
 
     try:
-        registry = sales_module.parse_sales_registry(sheets.read_source(sheets.SOURCE_SALES))
+        registry = sales_module.parse_sales_registry(
+            sheets.read_source_cached(sheets.SOURCE_SALES)
+        )
     except BbcError as exc:  # реестр может быть недоступен — блок всё равно полезен
         log.warning("BBC: sales registry unavailable: %s", exc)
         registry = []
@@ -205,7 +207,7 @@ def _report_tabs() -> list[str]:
     """Листы «Отчет …» в таблице ОМиП, свежие первыми."""
     titles = [
         item["title"]
-        for item in sheets.list_worksheets(bbc_settings.omip_spreadsheet_id)
+        for item in sheets.list_worksheets_cached(bbc_settings.omip_spreadsheet_id)
         if item["title"].lower().startswith("отчет")
     ]
     return titles
@@ -222,7 +224,7 @@ def get_journal(scope: Scope, group: str = "counterparty", measure: str = "outfl
     Строки журнала несут фирму, но не отдел, поэтому по отделам они не режутся —
     блок доступен только тем, чья область его разрешает (админ).
     """
-    rows = journal_module.parse_journal(sheets.read_source(sheets.SOURCE_JOURNAL))
+    rows = journal_module.parse_journal(sheets.read_source_cached(sheets.SOURCE_JOURNAL))
     return {
         "rows": [row.to_dict() for row in rows],
         "coverage": journal_module.coverage(rows),
@@ -259,6 +261,12 @@ def get_revision() -> dict[str, Any]:
 
 
 def invalidate_cache() -> None:
+    """Кнопка «Обновить»: человек просит свежее — отдаём свежее.
+
+    Сбрасывается и кэш второстепенных источников: иначе «Обновить» перечитывало
+    бы мастер-таблицу, а журнал и продажи молча оставались бы прежними.
+    """
+    sheets.invalidate_read_cache()
     live.refresh(force=True)
 
 

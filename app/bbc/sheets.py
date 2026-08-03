@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 from functools import lru_cache
 from typing import Any
 
@@ -35,6 +37,28 @@ SOURCE_OMIP = "omip"
 
 class BbcError(Exception):
     """Configuration / network / Google failure carrying a user-facing message."""
+
+
+def humanize(exc: Exception) -> str:
+    """Отказ Google → фраза, которую можно показать человеку.
+
+    Сырой текст API («APIError: [429]: Quota exceeded for quota metric 'Read
+    requests' and limit 'Read requests per minute per user' of service
+    sheets.googleapis.com for consumer 'project_number:992129259158'») попадал
+    в баннер как есть. Человеку за экраном он не говорит ни что случилось, ни
+    что делать, ни пройдёт ли само.
+    """
+    text = str(exc)
+    if "429" in text or "Quota exceeded" in text or "RATE_LIMIT" in text:
+        return (
+            "Google временно ограничил чтение таблицы — слишком много обращений подряд. "
+            "Это проходит само за минуту"
+        )
+    if "403" in text and "PERMISSION" in text.upper():
+        return "У сервисного аккаунта нет доступа к таблице — проверьте, что она ему открыта"
+    if "404" in text:
+        return "Таблица не найдена — проверьте её id в настройках"
+    return text
 
 
 def _load_credentials() -> Credentials:
@@ -118,6 +142,87 @@ def read_source(source: str) -> list[list[str]]:
     return read_values(worksheet or None, spreadsheet_id)
 
 
+# ── Кэш второстепенных источников ────────────────────────────────────────────────
+#
+# Мастер-таблицу читает один фоновый цикл (live.py), и запросов там ровно четыре
+# в минуту независимо от числа открытых вкладок. А «Журнал операций» и «Отдел
+# продаж» ходили в Google НА КАЖДЫЙ запрос, мимо всей этой конструкции: одно
+# открытие «Продаж» — два обращения к API. Три человека, щёлкающих по вкладкам,
+# выбирали квоту в 60 чтений в минуту за полминуты, и дашборд отвечал 429 всем,
+# включая дебиторку.
+#
+# Настройка `BBC_CACHE_TTL_SECONDS` для этого и заведена — но нигде не читалась.
+# Теперь читается здесь.
+#
+# Кэшируются только второстепенные источники. Мастер сюда не попадает намеренно:
+# цикл живого обновления обязан делать настоящее чтение, иначе он перестанет
+# замечать правки в таблице — ради чего и существует.
+
+_cache: dict[tuple[str, str], tuple[float, list[list[str]]]] = {}
+_cache_lock = threading.Lock()
+
+
+def read_cached(name: str | None, spreadsheet_id: str | None) -> list[list[str]]:
+    """Чтение с коротким кэшем в памяти. Для всего, кроме мастер-таблицы."""
+    ttl = max(0.0, bbc_settings.cache_ttl_seconds)
+    key = (spreadsheet_id or "", name or "")
+    now = time.monotonic()
+
+    if ttl > 0:
+        with _cache_lock:
+            hit = _cache.get(key)
+            if hit is not None and now - hit[0] < ttl:
+                return hit[1]
+
+    values = read_values(name, spreadsheet_id)
+
+    if ttl > 0:
+        with _cache_lock:
+            _cache[key] = (now, values)
+    return values
+
+
+def read_source_cached(source: str) -> list[list[str]]:
+    spreadsheet_id, worksheet = source_ref(source)
+    return read_cached(worksheet or None, spreadsheet_id)
+
+
+_tabs_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+
+
+def list_worksheets_cached(spreadsheet_id: str | None = None) -> list[dict[str, Any]]:
+    """Список листов с тем же кэшем.
+
+    «Отдел продаж» спрашивал его на каждый запрос, только чтобы выбрать самый
+    свежий лист «Отчет …». Вместе с самим отчётом и реестром выходило три
+    обращения к Google на одно открытие вкладки. Состав листов меняется раз в
+    месяц — держать его свежим посекундно не за чем.
+    """
+    ttl = max(0.0, bbc_settings.cache_ttl_seconds)
+    key = spreadsheet_id or ""
+    now = time.monotonic()
+
+    if ttl > 0:
+        with _cache_lock:
+            hit = _tabs_cache.get(key)
+            if hit is not None and now - hit[0] < ttl:
+                return hit[1]
+
+    tabs = list_worksheets(spreadsheet_id)
+
+    if ttl > 0:
+        with _cache_lock:
+            _tabs_cache[key] = (now, tabs)
+    return tabs
+
+
+def invalidate_read_cache() -> None:
+    """Сбросить кэш — по кнопке «Обновить», когда человек просит свежее."""
+    with _cache_lock:
+        _cache.clear()
+        _tabs_cache.clear()
+
+
 def write_cells(
     updates: list[dict[str, Any]],
     name: str | None = None,
@@ -146,10 +251,14 @@ __all__ = [
     "SOURCE_OMIP",
     "SOURCE_SALES",
     "BbcError",
+    "humanize",
     "list_worksheets",
     "open_spreadsheet",
     "open_worksheet",
+    "invalidate_read_cache",
+    "read_cached",
     "read_source",
+    "read_source_cached",
     "read_values",
     "source_ref",
     "write_cells",

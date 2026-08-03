@@ -223,12 +223,14 @@ def _read_sources(*, force: bool) -> bool:
         return True
 
     except BbcError as exc:
-        error = str(exc)
+        # Человеческая формулировка, а не сырой текст Google API: этот текст
+        # уезжает прямо в баннер над дашбордом.
+        error = sheets.humanize(exc)
         _mark_error(sheets.SOURCE_MASTER, error)
         log.warning("BBC: refresh failed: %s", error)
         return False
     except Exception as exc:  # noqa: BLE001 — the loop must survive anything
-        error = f"{type(exc).__name__}: {exc}"
+        error = sheets.humanize(exc)
         _mark_error(sheets.SOURCE_MASTER, error)
         log.exception("BBC: unexpected refresh failure")
         return False

@@ -107,6 +107,11 @@ async def _bbc_refresh_loop() -> None:
     from app.bbc.config import bbc_settings
 
     interval = max(5.0, bbc_settings.poll_interval_seconds)
+    # Потолок отступа: пять минут. Дальше растягивать нечего — квота Google
+    # считается поминутно и к этому моменту давно восстановилась.
+    max_backoff = 300.0
+    delay = interval
+
     # Warm the snapshot once so the first request is served from memory.
     try:
         await asyncio.to_thread(live.refresh, force=True)
@@ -114,14 +119,25 @@ async def _bbc_refresh_loop() -> None:
         log.warning("BBC: initial refresh failed: %s", exc)
 
     while True:
-        await asyncio.sleep(interval)
+        await asyncio.sleep(delay)
         try:
             # gspread/httpx are blocking — keep them off the event loop.
             await asyncio.to_thread(live.refresh)
+            delay = interval
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — best-effort poll, never fatal
-            log.warning("BBC: live refresh failed: %s", exc)
+            # Отступ при отказе, и в первую очередь при 429.
+            #
+            # Раньше цикл продолжал ходить каждые 15 секунд, что бы Google ни
+            # отвечал. На исчерпанной квоте это значило, что цикл сам же её и
+            # держал исчерпанной: минута не успевала «остыть», потому что в неё
+            # снова прилетали четыре запроса. Выход из состояния зависел от
+            # того, перестанут ли люди пользоваться дашбордом.
+            delay = min(max_backoff, max(delay, interval) * 2)
+            log.warning(
+                "BBC: live refresh failed (%s), следующая попытка через %.0f с", exc, delay
+            )
 
 
 @asynccontextmanager
