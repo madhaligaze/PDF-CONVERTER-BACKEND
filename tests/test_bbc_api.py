@@ -162,7 +162,10 @@ def test_issued_link_reports_its_department_scope(admin_client: TestClient) -> N
     assert payload["departments"] == ["НО"]
     assert payload["is_admin"] is False
     assert payload["link_label"] == "НО"
-    assert set(payload["blocks"]) == {"receivables", "analytics", "calendar"}
+    # Журнал касаний входит в ссылку: начальник отдела обязан видеть, кто и до
+    # кого по его долгам уже достучался. Писать оттуда он не сможет — запись
+    # требует учётки, а у ссылки нет автора.
+    assert set(payload["blocks"]) == {"receivables", "touches", "analytics", "calendar"}
 
 
 def test_link_token_also_works_as_a_query_parameter(admin_client: TestClient) -> None:

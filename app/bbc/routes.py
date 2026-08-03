@@ -19,12 +19,16 @@ Data
 from __future__ import annotations
 
 import logging
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile
 
 from app.bbc import auth as auth_module
+from app.bbc import employees as employees_module
 from app.bbc import links as links_module
 from app.bbc import service
+from app.bbc import storage
+from app.bbc import touches as touches_module
 from app.bbc.auth import AuthError, AuthedUser
 from app.bbc.config import bbc_settings
 from app.bbc.deps import (
@@ -34,23 +38,32 @@ from app.bbc.deps import (
     require_admin,
     require_block,
     require_scope,
+    require_user,
+    scope_for_user,
 )
 from app.bbc.links import LinkError
 from app.bbc.schemas import (
     BbcCredentialsRequest,
+    BbcEmployee,
+    BbcEmployeeCreated,
+    BbcEmployeeRequest,
     BbcLink,
     BbcLinkCreateRequest,
     BbcLinkExpiryRequest,
     BbcLoginRequest,
     BbcMe,
     BbcOk,
+    BbcSetPasswordRequest,
     BbcSheetInfo,
     BbcSnapshot,
     BbcStatus,
+    BbcTouch,
+    BbcTouchOptions,
+    BbcTouchRequest,
     BbcUpdateRequest,
     BbcUpdateResult,
 )
-from app.bbc.scope import Scope
+from app.bbc.scope import BLOCKS, DATA_SCOPES, DEPARTMENTS, Scope
 from app.bbc.sheets import BbcError
 
 log = logging.getLogger(__name__)
@@ -77,14 +90,20 @@ def _client_ip(request: Request) -> str | None:
 def _me_for_user(user: AuthedUser | None) -> BbcMe:
     if user is None:
         return BbcMe(needs_setup=not auth_module.has_any_user())
-    scope = Scope.admin() if user.role == "admin" else Scope.for_departments([])
+    scope = scope_for_user(user)
     return BbcMe(
         authenticated=True,
         username=user.username,
         role=user.role,
+        full_name=user.full_name,
         departments=list(scope.departments),
         blocks=list(scope.blocks),
         is_admin=scope.is_admin,
+        data_scope=scope.data_scope,
+        # Оболочка по этому признаку показывает экран смены пароля вместо
+        # дашборда. Область видимости у такой учётки всё равно пустая, так что
+        # это подсказка интерфейсу, а не граница доступа.
+        must_change_password=user.must_change_password,
     )
 
 
@@ -127,14 +146,15 @@ async def auth_logout(request: Request, response: Response) -> BbcOk:
 async def me(request: Request, scope: Scope = Depends(current_scope)) -> BbcMe:
     """Never 401s — the shell uses this to choose between login and dashboard."""
     auth_module.ensure_bootstrap_admin()
-    user = auth_module.resolve_session(request.cookies.get(SESSION_COOKIE))
 
-    if scope.is_admin and user is not None:
-        return _me_for_user(user)
-    if not scope.sees_nothing:
-        # Arrived through a referral link: no account, just a scoped view.
-        # Токен приходит либо заголовком, либо ?k= — как и в current_scope.
-        token = request.headers.get(LINK_HEADER) or request.query_params.get("k")
+    # Порядок тот же, что в `deps.current_scope`, и это обязательно: ссылка
+    # старше cookie. Иначе админ, открывший чужую ссылку, увидел бы себя вместо
+    # неё — и не смог бы проверить, что именно по ней видно.
+    # Токен приходит либо заголовком, либо ?k=.
+    token = request.headers.get(LINK_HEADER) or request.query_params.get("k")
+    if token:
+        if scope.sees_nothing:
+            return BbcMe(needs_setup=not auth_module.has_any_user())
         link = links_module.describe_token(token)
         return BbcMe(
             authenticated=True,
@@ -143,6 +163,13 @@ async def me(request: Request, scope: Scope = Depends(current_scope)) -> BbcMe:
             departments=list(scope.departments),
             blocks=list(scope.blocks),
         )
+
+    # Учётка отвечает за себя всегда — в том числе когда области видимости ещё
+    # нет: сотрудник с невыданным паролем должен увидеть экран смены пароля, а
+    # не форму входа, в которую он только что вошёл.
+    user = auth_module.resolve_session(request.cookies.get(SESSION_COOKIE))
+    if user is not None:
+        return _me_for_user(user)
     return BbcMe(needs_setup=not auth_module.has_any_user())
 
 
@@ -226,6 +253,336 @@ async def revoke_link(link_id: str, _: AuthedUser = Depends(require_admin)) -> B
     if not links_module.revoke_link(link_id):
         raise HTTPException(status_code=404, detail="Ссылка не найдена")
     return BbcOk(detail="Доступ по ссылке отозван")
+
+
+# ── Сотрудники ───────────────────────────────────────────────────────────────────
+
+
+@router.get("/employees")
+async def employees_list(_: AuthedUser = Depends(require_admin)) -> dict:
+    return {
+        "employees": employees_module.list_employees(),
+        "presets": list(employees_module.ROLE_PRESETS),
+        "departments": list(DEPARTMENTS),
+        "blocks": list(BLOCKS),
+        "data_scopes": list(DATA_SCOPES),
+    }
+
+
+@router.get("/employees/aliases")
+async def employee_aliases(_: AuthedUser = Depends(require_admin)) -> dict:
+    """Написания из колонки «Сотрудник» — чтобы привязать учётку к её клиентам.
+
+    Список, а не свободный ввод: в таблице встречаются «Дана», «Дана Ж.» и
+    «Жумабекова Д.», и угадать их с клавиатуры нельзя — можно только отметить.
+    """
+    _require_configured()
+    try:
+        return {"names": service.employee_names()}
+    except BbcError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/employees", response_model=BbcEmployeeCreated, status_code=201)
+async def employees_create(
+    payload: BbcEmployeeRequest,
+    actor: AuthedUser = Depends(require_admin),
+) -> BbcEmployeeCreated:
+    try:
+        form = employees_module.parse_employee_input(
+            full_name=payload.full_name,
+            departments=payload.departments,
+            blocks=payload.blocks,
+            data_scope=payload.data_scope,
+            employee_aliases=payload.employee_aliases,
+        )
+        employee, password = employees_module.create_employee(
+            actor, username=payload.username or "", form=form
+        )
+    except AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return BbcEmployeeCreated(employee=BbcEmployee(**employee), temp_password=password)
+
+
+@router.patch("/employees/{user_id}", response_model=BbcEmployee)
+async def employees_update(
+    user_id: int,
+    payload: BbcEmployeeRequest,
+    actor: AuthedUser = Depends(require_admin),
+) -> BbcEmployee:
+    try:
+        form = employees_module.parse_employee_input(
+            full_name=payload.full_name,
+            departments=payload.departments,
+            blocks=payload.blocks,
+            data_scope=payload.data_scope,
+            employee_aliases=payload.employee_aliases,
+        )
+        return BbcEmployee(**employees_module.update_employee(actor, user_id, form))
+    except AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/employees/{user_id}/reset-password", response_model=BbcEmployeeCreated)
+async def employees_reset_password(
+    user_id: int,
+    actor: AuthedUser = Depends(require_admin),
+) -> BbcEmployeeCreated:
+    try:
+        employee, password = employees_module.reset_password(actor, user_id)
+    except AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return BbcEmployeeCreated(employee=BbcEmployee(**employee), temp_password=password)
+
+
+@router.post("/employees/{user_id}/dismiss", response_model=BbcEmployee)
+async def employees_dismiss(
+    user_id: int,
+    actor: AuthedUser = Depends(require_admin),
+) -> BbcEmployee:
+    try:
+        return BbcEmployee(**employees_module.dismiss_employee(actor, user_id))
+    except AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/employees/{user_id}/restore", response_model=BbcEmployeeCreated)
+async def employees_restore(
+    user_id: int,
+    actor: AuthedUser = Depends(require_admin),
+) -> BbcEmployeeCreated:
+    try:
+        employee, password = employees_module.restore_employee(actor, user_id)
+    except AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return BbcEmployeeCreated(employee=BbcEmployee(**employee), temp_password=password)
+
+
+@router.delete("/employees/{user_id}", response_model=BbcOk)
+async def employees_delete(
+    user_id: int,
+    actor: AuthedUser = Depends(require_admin),
+) -> BbcOk:
+    try:
+        employees_module.delete_employee(actor, user_id)
+    except AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return BbcOk(detail="Сотрудник удалён")
+
+
+@router.post("/auth/set-password", response_model=BbcOk)
+async def set_password(
+    payload: BbcSetPasswordRequest,
+    response: Response,
+    user: AuthedUser = Depends(require_user),
+) -> BbcOk:
+    """Смена собственного пароля, в том числе принудительная при первом входе.
+
+    `require_user`, а не `require_scope`: у сотрудника с невыданным паролем
+    области видимости нет по определению, и через проверку области он бы сюда
+    не прошёл — то есть не смог бы сменить пароль, из-за которого её и нет.
+    """
+    try:
+        employees_module.set_own_password(
+            user.id,
+            current_password=payload.current_password,
+            new_password=payload.new_password,
+        )
+    except AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return BbcOk(detail="Пароль изменён, войдите заново")
+
+
+# ── Касания ──────────────────────────────────────────────────────────────────────
+
+
+@router.get("/touches/options", response_model=BbcTouchOptions)
+async def touch_options(_: Scope = Depends(require_block("touches"))) -> BbcTouchOptions:
+    return BbcTouchOptions(
+        contact_roles=list(touches_module.CONTACT_ROLES),
+        channels=list(touches_module.CHANNELS),
+        max_file_bytes=storage.MAX_FILE_BYTES,
+        max_files=storage.MAX_FILES_PER_TOUCH,
+    )
+
+
+@router.get("/touches", response_model=list[BbcTouch])
+async def touches_list(
+    client: str | None = Query(default=None),
+    author_id: int | None = Query(default=None),
+    contact_role: str | None = Query(default=None),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
+    scope: Scope = Depends(require_block("touches")),
+) -> list[BbcTouch]:
+    """Журнал в границах области видимости.
+
+    Видно все касания по своим клиентам — включая чужие. Дана обязана знать,
+    что директор туда уже писал, иначе журнал не выполняет ту работу, ради
+    которой заведён.
+    """
+    _require_configured()
+    try:
+        allowed = service.visible_client_keys(scope)
+    except BbcError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return [
+        BbcTouch(**item)
+        for item in touches_module.list_touches(
+            allowed,
+            client=client,
+            author_id=author_id,
+            contact_role=contact_role,
+            date_from=date_from,
+            date_to=date_to,
+        )
+    ]
+
+
+@router.get("/touches/counts")
+async def touches_counts(scope: Scope = Depends(require_block("touches"))) -> dict:
+    """Карта «клиент → сколько касаний» для значков в реестре дебиторки."""
+    _require_configured()
+    try:
+        allowed = service.visible_client_keys(scope)
+    except BbcError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"counts": touches_module.count_by_client(allowed)}
+
+
+@router.post("/touches", response_model=BbcTouch, status_code=201)
+async def touches_create(
+    payload: BbcTouchRequest,
+    user: AuthedUser = Depends(require_user),
+    scope: Scope = Depends(require_block("touches")),
+) -> BbcTouch:
+    _require_configured()
+    try:
+        form = touches_module.parse_touch_input(
+            client=payload.client,
+            contacted_at=payload.contacted_at,
+            contact_role=payload.contact_role,
+            contact_name=payload.contact_name,
+            channel=payload.channel,
+            summary=payload.summary,
+        )
+        _assert_client_visible(scope, form["client_key"])
+        return BbcTouch(**touches_module.create_touch(user, form))
+    except touches_module.TouchError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.patch("/touches/{touch_id}", response_model=BbcTouch)
+async def touches_update(
+    touch_id: int,
+    payload: BbcTouchRequest,
+    user: AuthedUser = Depends(require_user),
+    scope: Scope = Depends(require_block("touches")),
+) -> BbcTouch:
+    _require_configured()
+    try:
+        form = touches_module.parse_touch_input(
+            client=payload.client,
+            contacted_at=payload.contacted_at,
+            contact_role=payload.contact_role,
+            contact_name=payload.contact_name,
+            channel=payload.channel,
+            summary=payload.summary,
+        )
+        _assert_client_visible(scope, form["client_key"])
+        return BbcTouch(**touches_module.update_touch(user, touch_id, form))
+    except touches_module.TouchError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.delete("/touches/{touch_id}", response_model=BbcOk)
+async def touches_delete(
+    touch_id: int,
+    user: AuthedUser = Depends(require_user),
+    _: Scope = Depends(require_block("touches")),
+) -> BbcOk:
+    try:
+        touches_module.delete_touch(user, touch_id)
+    except touches_module.TouchError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return BbcOk(detail="Касание убрано из журнала")
+
+
+@router.post("/touches/{touch_id}/files", status_code=201)
+async def touches_attach(
+    touch_id: int,
+    file: UploadFile = File(...),
+    user: AuthedUser = Depends(require_user),
+    _: Scope = Depends(require_block("touches")),
+) -> dict:
+    blob = await file.read()
+    try:
+        return touches_module.attach_file(
+            user, touch_id, blob, file.filename or "", file.content_type
+        )
+    except storage.StorageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except touches_module.TouchError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/files/{file_id}")
+async def touch_file(
+    file_id: int,
+    scope: Scope = Depends(require_block("touches")),
+) -> Response:
+    """Отдача файла своим эндпоинтом, а не ссылкой на бакет.
+
+    Скрин переписки о долге не должен открываться по угаданному или
+    пересланному адресу — только тому, кому виден сам клиент.
+    """
+    _require_configured()
+    try:
+        allowed = service.visible_client_keys(scope)
+        blob, content_type, filename = touches_module.read_file(file_id, allowed)
+    except BbcError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except (touches_module.TouchError, storage.StorageError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    quoted = quote(filename)
+    return Response(
+        content=blob,
+        media_type=content_type,
+        headers={
+            # inline: скрин открывается в соседней вкладке, а не падает в
+            # «Загрузки». Имя — в RFC 5987, иначе кириллица приезжает мусором.
+            "Content-Disposition": f"inline; filename*=UTF-8''{quoted}",
+            "Cache-Control": "private, max-age=300",
+        },
+    )
+
+
+@router.delete("/files/{file_id}", response_model=BbcOk)
+async def touch_file_delete(
+    file_id: int,
+    user: AuthedUser = Depends(require_user),
+    _: Scope = Depends(require_block("touches")),
+) -> BbcOk:
+    try:
+        touches_module.delete_file(user, file_id)
+    except touches_module.TouchError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return BbcOk(detail="Файл удалён")
+
+
+def _assert_client_visible(scope: Scope, key: str) -> None:
+    """Писать можно только по клиенту, которого видно.
+
+    Иначе сотрудник с областью «только свои» завёл бы касание по чужому
+    должнику — и сам же его больше не увидел бы.
+    """
+    allowed = service.visible_client_keys(scope)
+    if allowed is not None and key not in allowed:
+        raise touches_module.TouchError("Этот клиент вам не виден")
 
 
 # ── Data ─────────────────────────────────────────────────────────────────────────

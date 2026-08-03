@@ -32,7 +32,13 @@ from app.models.persistence import AutocallSyncRecord
 log = logging.getLogger(__name__)
 
 _GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-_PROJECT_RE = re.compile(r"[БбДд]")
+# The cabinet's campaign names are typed on whatever keyboard layout was active:
+# "18.06 Д2" and "02.08 D2" mean the same project. Latin B/D are visually identical
+# to Cyrillic Б/Д, so a Cyrillic-only class silently left the Проект column empty
+# for every Latin-typed name — 155 of the 176 rows written so far.
+_PROJECT_RE = re.compile(r"[БбBbДдDd]")
+# Fold the Latin lookalikes onto the Cyrillic letters the sheet already uses.
+_PROJECT_FOLD = {"b": "б", "d": "д"}
 _THOUSANDS_SEP = " "  # regular space; flip to " " if the sheet needs nbsp
 
 
@@ -43,11 +49,17 @@ class AutocallError(Exception):
 # ── Transform helpers ────────────────────────────────────────────────────────────
 
 def _extract_project_letter(name: str | None) -> str:
-    """First Б/Д in the campaign name, lowercased. Empty if none (e.g. '17.06 Д2' -> 'д')."""
+    """First Б/Д in the campaign name as a lowercase Cyrillic letter, '' if none.
+
+    Accepts the Latin lookalikes too, so '17.06 Д2' and '02.08 D2' both give 'д'.
+    """
     if not name:
         return ""
     match = _PROJECT_RE.search(name)
-    return match.group(0).lower() if match else ""
+    if not match:
+        return ""
+    letter = match.group(0).lower()
+    return _PROJECT_FOLD.get(letter, letter)
 
 
 def _parse_created_at(created_at: str | None) -> datetime | None:
@@ -277,6 +289,20 @@ def _autocall_key(date_str: str, project: str, amount: float | None) -> str:
     return f"{date_str}|{project}|{amt}"
 
 
+def _already_in_sheet(seen: set[str], date_str: str, project: str, amount: float | None) -> bool:
+    """Is this campaign already a row in the sheet?
+
+    Rows written before the Latin-B/D fix carry an empty Проект cell, so their key
+    is `date||amount` while the same campaign now keys as `date|б|amount`. Matching
+    the blank variant too keeps those legacy rows from being appended a second time
+    even if the backfill missed one. Date+amount stays unique in practice: the only
+    same-day/same-amount clashes are the 0,00 campaigns, which `_is_settled` drops.
+    """
+    if _autocall_key(date_str, project, amount) in seen:
+        return True
+    return bool(project) and _autocall_key(date_str, "", amount) in seen
+
+
 def _read_autocall_sheet_keys(worksheet) -> set[str]:
     """Keys already present in the «Фактическая стоимость» sheet — dedup source of truth."""
     keys: set[str] = set()
@@ -329,14 +355,12 @@ async def sync_autocalls() -> dict:
     for a in autocalls:
         if not _passes_cutoff(a.get("created_at")) or not _is_settled(a):
             continue
-        key = _autocall_key(
-            _format_date(a.get("created_at")),
-            _extract_project_letter(a.get("name")),
-            _parse_cost(a.get("final_cost")),
-        )
-        if key in seen:
+        date_str = _format_date(a.get("created_at"))
+        project = _extract_project_letter(a.get("name"))
+        amount = _parse_cost(a.get("final_cost"))
+        if _already_in_sheet(seen, date_str, project, amount):
             continue
-        seen.add(key)
+        seen.add(_autocall_key(date_str, project, amount))
         fresh.append(a)
     fresh.sort(key=lambda a: _parse_created_at(a.get("created_at")) or datetime.min)
 
@@ -368,11 +392,12 @@ async def get_metrics() -> dict:
     pending = [
         a for a in eligible
         if _is_settled(a)
-        and _autocall_key(
+        and not _already_in_sheet(
+            seen,
             _format_date(a.get("created_at")),
             _extract_project_letter(a.get("name")),
             _parse_cost(a.get("final_cost")),
-        ) not in seen
+        )
     ]
 
     total_cost = sum((_parse_cost(a.get("final_cost")) or 0.0) for a in eligible)

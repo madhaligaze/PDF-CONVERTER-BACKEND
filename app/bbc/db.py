@@ -80,11 +80,23 @@ def _add_missing_sqlite_columns() -> None:
     the first added column silently broke every insert into that table. This
     closes the gap for the one case it applies to, in the same spirit as the
     create_all fallback itself.
+
+    **Каждая новая колонка на существующей таблице должна попасть сюда** — и
+    отдельно в ревизию alembic для Postgres. Забыть про этот список значит
+    сломать тесты на уже существующем `backend/data/pdf_converter.db`, причём
+    молча: create_all пройдёт, а INSERT упадёт на «no such column».
     """
     engine = bbc_engine()
     with engine.begin() as connection:
         for table, column, ddl in (
             ("access_links", "token", "VARCHAR(64)"),
+            ("users", "full_name", "VARCHAR(120) DEFAULT ''"),
+            ("users", "status", "VARCHAR(16) DEFAULT 'active'"),
+            ("users", "must_change_password", "BOOLEAN DEFAULT 0"),
+            ("users", "departments", "JSON"),
+            ("users", "blocks", "JSON"),
+            ("users", "data_scope", "VARCHAR(16) DEFAULT 'own'"),
+            ("users", "employee_aliases", "JSON"),
         ):
             rows = connection.execute(text(f"PRAGMA table_info({table})")).fetchall()
             if not rows:  # table not there at all — create_all owns that case

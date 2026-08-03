@@ -38,8 +38,31 @@ def current_scope(
 
     user = current_user(request)
     if user is not None:
-        return Scope.admin() if user.role == "admin" else Scope.for_departments([])
+        return scope_for_user(user)
     return Scope.denied()
+
+
+def scope_for_user(user: AuthedUser) -> Scope:
+    """Область видимости учётки. Единственное место, где роль становится правами.
+
+    Пароль, выданный админом и ещё не сменённый, не открывает ничего: пока
+    `must_change_password`, любой запрос за данными получает пустую область.
+    Пустить сюда — значит согласиться, что человек ходит по дашборду с паролем,
+    который лежит в переписке в WhatsApp. Сменить его при этом можно: эндпоинт
+    смены пароля область видимости не спрашивает.
+    """
+    if user.must_change_password:
+        return Scope.denied()
+    if user.is_admin:
+        return Scope.admin()
+    return Scope.for_employee(
+        user_id=user.id,
+        departments=user.departments,
+        blocks=user.blocks,
+        data_scope=user.data_scope,
+        employee_aliases=user.employee_aliases,
+        label=user.display_name,
+    )
 
 
 def require_scope(scope: Scope = Depends(current_scope)) -> Scope:
@@ -50,12 +73,26 @@ def require_scope(scope: Scope = Depends(current_scope)) -> Scope:
 
 
 def require_admin(request: Request) -> AuthedUser:
-    """Admin-only endpoints: account page, link management."""
+    """Admin-only endpoints: account page, link and employee management."""
     user = current_user(request)
     if user is None:
         raise HTTPException(status_code=401, detail="Требуется вход")
-    if user.role != "admin":
+    if not user.is_admin:
         raise HTTPException(status_code=403, detail="Недостаточно прав")
+    return user
+
+
+def require_user(request: Request) -> AuthedUser:
+    """Любой вошедший — админ или сотрудник.
+
+    В отличие от `require_scope` не смотрит на область видимости: нужен там, где
+    важен сам факт «кто спрашивает», а не «что ему видно». Прежде всего — смена
+    пароля: сотрудник с `must_change_password` области видимости не имеет ровно
+    до тех пор, пока не сменит пароль, и через `require_scope` не прошёл бы.
+    """
+    user = current_user(request)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Требуется вход")
     return user
 
 
@@ -78,4 +115,6 @@ __all__ = [
     "require_admin",
     "require_block",
     "require_scope",
+    "require_user",
+    "scope_for_user",
 ]

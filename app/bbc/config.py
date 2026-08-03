@@ -122,6 +122,56 @@ class BbcSettings(BaseSettings):
         validation_alias=AliasChoices("BBC_BOOTSTRAP_PASSWORD"),
     )
 
+    # ── Хранилище приложенных файлов ────────────────────────────────────────
+    # `s3` — Cloudflare R2 (или любой S3-совместимый), `postgres` — байты в БД.
+    # Файловая система контейнера не используется никогда: на Railway она
+    # стирается при каждом деплое, и приложенный скрин исчезал бы вместе с ней.
+    file_storage: str = Field(
+        default="",
+        validation_alias=AliasChoices("BBC_FILE_STORAGE"),
+    )
+    s3_endpoint: str = Field(
+        default="",
+        validation_alias=AliasChoices("BBC_S3_ENDPOINT"),
+    )
+    s3_bucket: str = Field(
+        default="",
+        validation_alias=AliasChoices("BBC_S3_BUCKET"),
+    )
+    s3_access_key_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("BBC_S3_ACCESS_KEY_ID"),
+    )
+    s3_secret_access_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("BBC_S3_SECRET_ACCESS_KEY"),
+    )
+    # У R2 региона нет, подпись требует «auto». Для настоящего AWS — реальный.
+    s3_region: str = Field(
+        default="auto",
+        validation_alias=AliasChoices("BBC_S3_REGION"),
+    )
+
+    @property
+    def s3_configured(self) -> bool:
+        return bool(self.s3_bucket and self.s3_access_key_id and self.s3_secret_access_key)
+
+    @property
+    def storage_backend(self) -> str:
+        """Какое хранилище использовать на самом деле.
+
+        Явная настройка сильнее, но `s3` без ключей падает обратно в Postgres:
+        забытая переменная на Railway должна ронять качество хранения, а не
+        приём файлов. Пустая настройка выбирает сама — так фичу можно выкатить
+        до того, как заведён бакет.
+        """
+        choice = (self.file_storage or "").strip().lower()
+        if choice == "postgres":
+            return "postgres"
+        if choice == "s3":
+            return "s3" if self.s3_configured else "postgres"
+        return "s3" if self.s3_configured else "postgres"
+
     @property
     def credentials_path(self) -> Path | None:
         """Resolved path to the service-account file, or None when inlined/absent.

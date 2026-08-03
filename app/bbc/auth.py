@@ -42,11 +42,46 @@ class AuthError(Exception):
 
 @dataclass(frozen=True)
 class AuthedUser:
-    """Detached snapshot of the signed-in user (no live ORM object escapes)."""
+    """Detached snapshot of the signed-in user (no live ORM object escapes).
+
+    Несёт и права сотрудника: `deps.current_scope` строит из них область
+    видимости на каждый запрос, не заглядывая в базу второй раз.
+    """
 
     id: int
     username: str
     role: str
+    full_name: str = ""
+    status: str = "active"
+    must_change_password: bool = False
+    departments: tuple[str, ...] = ()
+    blocks: tuple[str, ...] = ()
+    data_scope: str = "all"
+    employee_aliases: tuple[str, ...] = ()
+
+    @property
+    def is_admin(self) -> bool:
+        return self.role == "admin"
+
+    @property
+    def display_name(self) -> str:
+        return self.full_name.strip() or self.username
+
+
+def _snapshot(user: BbcUser) -> AuthedUser:
+    """ORM-строка → неизменяемый снимок. Списки из JSON могут быть None."""
+    return AuthedUser(
+        id=user.id,
+        username=user.username,
+        role=user.role,
+        full_name=user.full_name or "",
+        status=user.status or "active",
+        must_change_password=bool(user.must_change_password),
+        departments=tuple(user.departments or ()),
+        blocks=tuple(user.blocks or ()),
+        data_scope=user.data_scope or "own",
+        employee_aliases=tuple(user.employee_aliases or ()),
+    )
 
 
 # ── Hashing ──────────────────────────────────────────────────────────────────────
@@ -195,7 +230,7 @@ def resolve_session(token: str | None) -> AuthedUser | None:
         user = session.get(BbcUser, record.user_id)
         if user is None or not user.is_active:
             return None
-        return AuthedUser(id=user.id, username=user.username, role=user.role)
+        return _snapshot(user)
 
 
 def logout(token: str | None) -> None:

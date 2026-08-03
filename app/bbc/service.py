@@ -18,6 +18,7 @@ from app.bbc import live
 from app.bbc import msfo as msfo_module
 from app.bbc import sales as sales_module
 from app.bbc import sheets
+from app.bbc import touches as touches_module
 from app.bbc.config import bbc_settings
 from app.bbc.dataset import ContractRow, collect_dimensions, coverage
 from app.bbc.recognition import DEFAULT_MODE, MODES, PRESETS, describe_mode
@@ -74,6 +75,37 @@ def _visible_rows(scope: Scope) -> list[ContractRow]:
     if scope.sees_nothing:
         return []
     return filter_rows(live.ensure_loaded().rows, scope)
+
+
+def visible_client_keys(scope: Scope) -> set[str] | None:
+    """Клиенты, доступные вызывающему. None у админа — ему доступны все.
+
+    Это определение «своего клиента» для журнала касаний: если строка клиента
+    доехала до пользователя, то и касания по нему доехать должны. Второй,
+    независимой проверки прав в журнале нет — она бы неизбежно разошлась с этой.
+    """
+    if scope.is_admin:
+        return None
+    return {
+        key
+        for key in (touches_module.client_key(row.client) for row in _visible_rows(scope))
+        if key
+    }
+
+
+def employee_names() -> list[str]:
+    """Написания из колонки «Сотрудник» — для привязки учётки к её клиентам.
+
+    Читается из полного снимка, а не из области видимости: список нужен админу
+    на экране создания сотрудника, и урезать его там нечем.
+    """
+    seen: dict[str, str] = {}
+    for row in live.ensure_loaded().rows:
+        name = (row.employee or "").strip()
+        if not name:
+            continue
+        seen.setdefault(name.casefold(), name)
+    return sorted(seen.values(), key=str.casefold)
 
 
 def get_dataset(scope: Scope, *, refresh: bool = False) -> dict[str, Any]:
