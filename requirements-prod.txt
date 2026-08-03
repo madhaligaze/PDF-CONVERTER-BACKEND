@@ -3,6 +3,11 @@ alembic>=1.18.4
 # BBC Dashboard (removable module): хеширование паролей для входа в дашборд.
 argon2-cffi>=23.1.0
 azure-ai-documentintelligence>=1.0.2
+# BBC Dashboard (removable module): S3-совместимое хранилище (Cloudflare R2) под
+# файлы, приложенные к касаниям. Продовый образ ставится ИЗ ЭТОГО файла, а не из
+# pyproject.toml — новую зависимость надо дописывать в оба, иначе на проде её
+# просто не будет.
+boto3>=1.40.0
 fastapi>=0.135.3
 google-auth>=2.26.0
 gspread>=6.1.0

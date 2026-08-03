@@ -106,13 +106,26 @@ def validate(blob: bytes, filename: str, declared_type: str | None) -> tuple[str
 # ── S3 ───────────────────────────────────────────────────────────────────────────
 
 
+class StorageUnavailable(StorageError):
+    """Хранилище недоступно из-за настройки, а не из-за самого файла.
+
+    Отдельный класс, потому что эти два случая лечатся по-разному и путать их
+    дорого: «файл не подошёл» правит человек, «бакет не отвечает» правит
+    администратор. Один общий текст «не удалось сохранить» однажды уже стоил
+    часа поисков — продовый образ ставится из requirements-prod.txt, boto3 туда
+    не дописали, и отказ выглядел как сбой сети.
+    """
+
+
 @lru_cache(maxsize=1)
 def _s3_client():
     try:
         import boto3
         from botocore.config import Config
     except ImportError as exc:  # pragma: no cover — зависимость объявлена
-        raise StorageError("Хранилище файлов не настроено") from exc
+        raise StorageUnavailable(
+            "Хранилище файлов не настроено на сервере: не установлен boto3"
+        ) from exc
 
     return boto3.client(
         "s3",
