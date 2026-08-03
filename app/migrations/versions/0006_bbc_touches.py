@@ -38,13 +38,18 @@ depends_on: Union[str, Sequence[str], None] = None
 
 SCHEMA = "bbc"
 
+# sa.text(), а не голая строка: обычную питоновскую строку SQLAlchemy цитирует
+# как литерал, и `"''"` уезжает в DDL как DEFAULT '''''' — то есть значением
+# становятся два апострофа, а не пустая строка. Ровно на этом и погорело:
+# подпись под касанием читалась как «''» вместо имени. Ревизия 0007 чинит уже
+# записанное; здесь — чтобы чистая база сразу получала правильное.
 USER_COLUMNS = (
-    ("full_name", sa.String(120), "''"),
-    ("status", sa.String(16), "'active'"),
-    ("must_change_password", sa.Boolean(), "false"),
+    ("full_name", sa.String(120), sa.text("''")),
+    ("status", sa.String(16), sa.text("'active'")),
+    ("must_change_password", sa.Boolean(), sa.text("false")),
     ("departments", sa.JSON(), None),
     ("blocks", sa.JSON(), None),
-    ("data_scope", sa.String(16), "'own'"),
+    ("data_scope", sa.String(16), sa.text("'own'")),
     ("employee_aliases", sa.JSON(), None),
 )
 
@@ -88,9 +93,9 @@ def upgrade() -> None:
             sa.Column("author_name", sa.String(120), nullable=False),
             sa.Column("contacted_at", sa.Date(), nullable=False),
             sa.Column("contact_role", sa.String(32), nullable=False),
-            sa.Column("contact_name", sa.String(120), nullable=False, server_default="''"),
-            sa.Column("channel", sa.String(16), nullable=False, server_default="'whatsapp'"),
-            sa.Column("summary", sa.Text(), nullable=False, server_default="''"),
+            sa.Column("contact_name", sa.String(120), nullable=False, server_default=sa.text("''")),
+            sa.Column("channel", sa.String(16), nullable=False, server_default=sa.text("'whatsapp'")),
+            sa.Column("summary", sa.Text(), nullable=False, server_default=sa.text("''")),
             sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
             sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
             sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True),
@@ -132,11 +137,11 @@ def upgrade() -> None:
             ),
             sa.Column("filename", sa.String(255), nullable=False),
             sa.Column("content_type", sa.String(128), nullable=False),
-            sa.Column("size_bytes", sa.Integer(), nullable=False, server_default="0"),
+            sa.Column("size_bytes", sa.Integer(), nullable=False, server_default=sa.text("0")),
             # s3 → байты в Cloudflare R2, ключ в storage_key;
             # postgres → байты прямо здесь, в data. Файловая система контейнера
             # не используется никогда: на Railway она стирается при деплое.
-            sa.Column("storage_backend", sa.String(16), nullable=False, server_default="'postgres'"),
+            sa.Column("storage_backend", sa.String(16), nullable=False, server_default=sa.text("'postgres'")),
             sa.Column("storage_key", sa.String(255), nullable=True),
             sa.Column("data", sa.LargeBinary(), nullable=True),
             sa.Column(
