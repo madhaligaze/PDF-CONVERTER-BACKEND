@@ -93,19 +93,44 @@ def visible_client_keys(scope: Scope) -> set[str] | None:
     }
 
 
-def employee_names() -> list[str]:
+def employee_names() -> list[dict[str, Any]]:
     """Написания из колонки «Сотрудник» — для привязки учётки к её клиентам.
 
-    Читается из полного снимка, а не из области видимости: список нужен админу
-    на экране создания сотрудника, и урезать его там нечем.
+    Не просто список имён, а имя вместе с его отделами и объёмом: «Жанара —
+    ОБО, 18 клиентов». Без этого админ собирает учётку вслепую и может отметить
+    человека из НО, выдав при этом отдел ОБО, — пересечение пусто, аккаунт
+    выглядит рабочим и не показывает ни одной строки. Сказать об этом надо в тот
+    момент, когда галочка ставится, а не когда сотрудник увидит пустой экран.
+
+    Читается из полного снимка, а не из области видимости: список нужен админу,
+    и урезать его там нечем.
     """
-    seen: dict[str, str] = {}
+    seen: dict[str, dict[str, Any]] = {}
     for row in live.ensure_loaded().rows:
         name = (row.employee or "").strip()
         if not name:
             continue
-        seen.setdefault(name.casefold(), name)
-    return sorted(seen.values(), key=str.casefold)
+        entry = seen.setdefault(
+            name.casefold(),
+            {"name": name, "departments": set(), "clients": set(), "rows": 0},
+        )
+        entry["rows"] += 1
+        entry["departments"].update(row.departments)
+        if row.client:
+            entry["clients"].add(row.client)
+
+    return sorted(
+        (
+            {
+                "name": entry["name"],
+                "departments": sorted(entry["departments"]),
+                "clients": len(entry["clients"]),
+                "rows": entry["rows"],
+            }
+            for entry in seen.values()
+        ),
+        key=lambda item: (-item["clients"], item["name"].casefold()),
+    )
 
 
 def get_dataset(scope: Scope, *, refresh: bool = False) -> dict[str, Any]:
