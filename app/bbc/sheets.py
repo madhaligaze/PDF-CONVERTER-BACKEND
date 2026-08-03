@@ -125,15 +125,31 @@ def open_worksheet(
 
 def list_worksheets(spreadsheet_id: str | None = None) -> list[dict[str, Any]]:
     """Metadata for every tab — used by the dashboard's sheet picker."""
+    spreadsheet = open_spreadsheet(spreadsheet_id)
+    try:
+        tabs = spreadsheet.worksheets()
+    except Exception as exc:  # noqa: BLE001
+        raise BbcError(humanize(exc)) from exc
     return [
         {"title": ws.title, "index": ws.index, "rows": ws.row_count, "cols": ws.col_count}
-        for ws in open_spreadsheet(spreadsheet_id).worksheets()
+        for ws in tabs
     ]
 
 
 def read_values(name: str | None = None, spreadsheet_id: str | None = None) -> list[list[str]]:
-    """Raw grid (list of rows) of the worksheet, exactly as displayed."""
-    return open_worksheet(name, spreadsheet_id).get_all_values()
+    """Raw grid (list of rows) of the worksheet, exactly as displayed.
+
+    Само чтение обёрнуто отдельно от открытия листа, и это не формальность:
+    открытие уже возвращало BbcError, а `get_all_values()` — нет. Именно тут
+    прилетает 429 по квоте, и раньше он летел наружу голым APIError: мимо
+    обработчика в маршруте (502 с понятным текстом превращалось в 500) и мимо
+    человеческой формулировки.
+    """
+    worksheet = open_worksheet(name, spreadsheet_id)
+    try:
+        return worksheet.get_all_values()
+    except Exception as exc:  # noqa: BLE001 — gspread raises many types
+        raise BbcError(humanize(exc)) from exc
 
 
 def read_source(source: str) -> list[list[str]]:

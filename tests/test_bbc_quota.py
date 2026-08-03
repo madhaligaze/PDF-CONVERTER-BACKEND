@@ -147,3 +147,38 @@ def test_permission_and_missing_sheet_are_named_too() -> None:
 def test_unknown_failure_is_passed_through_unchanged() -> None:
     """Придумывать формулировку для незнакомого отказа — врать о причине."""
     assert sheets.humanize(Exception("что-то новое")) == "что-то новое"
+
+
+# ── Отказ чтения обязан быть BbcError ────────────────────────────────────────────
+
+
+def test_read_failure_becomes_bbc_error(monkeypatch) -> None:
+    """Иначе 429 летит наружу голым APIError.
+
+    Открытие листа уже возвращало BbcError, а само `get_all_values()` — нет. В
+    маршруте ловится только BbcError, поэтому понятное 502 превращалось в 500, и
+    человек видел не «Google ограничил чтение», а пустой сбой сервера.
+    """
+
+    class Boom:
+        def get_all_values(self):
+            raise RuntimeError("APIError: [429]: Quota exceeded for quota metric 'Read requests'")
+
+    monkeypatch.setattr(sheets, "open_worksheet", lambda name=None, sid=None: Boom())
+
+    with pytest.raises(sheets.BbcError) as caught:
+        sheets.read_values("Журнал", "a")
+
+    assert "Google" in str(caught.value)
+    assert "quota metric" not in str(caught.value)
+
+
+def test_worksheet_listing_failure_becomes_bbc_error(monkeypatch) -> None:
+    class Boom:
+        def worksheets(self):
+            raise RuntimeError("APIError: [429]: Quota exceeded")
+
+    monkeypatch.setattr(sheets, "open_spreadsheet", lambda sid=None: Boom())
+
+    with pytest.raises(sheets.BbcError):
+        sheets.list_worksheets("omip")
