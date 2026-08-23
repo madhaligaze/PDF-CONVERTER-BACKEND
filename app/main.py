@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import api_router
 from app.core.config import settings
 from app.core.database import get_resolved_database_url, init_database
+from app.mcp.config import mcp_settings  # MCP-коннектор (удаляемый модуль)
 
 log = logging.getLogger(__name__)
 
@@ -199,6 +200,15 @@ app.add_middleware(
 )
 
 app.include_router(api_router, prefix=settings.api_v1_prefix)
+
+# MCP-коннектор для Claude (удаляемый модуль). Подключается на уровне
+# приложения, а не в api_router: адрес /mcp/<секрет> не версионируется вместе
+# с API — его вставляют руками в настройки коннектора на claude.ai.
+if mcp_settings.configured:
+    from app.mcp.routes import router as mcp_router
+
+    app.include_router(mcp_router)
+    log.info("MCP connector enabled at /mcp/<secret>")
 
 
 @app.get("/")
