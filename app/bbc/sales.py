@@ -16,6 +16,7 @@ import logging
 from dataclasses import asdict, dataclass, field
 from typing import Any, Sequence
 
+from app.bbc.layout import Column, Layout, resolve_layout
 from app.bbc.normalize import clean, parse_money
 
 log = logging.getLogger(__name__)
@@ -307,44 +308,57 @@ def channel_results(
 
 # ── Реестр продаж ────────────────────────────────────────────────────────────────
 
-class SalesCol:
-    """Позиции колонок в «Общий Реестр Продаж»."""
+REGISTRY_WORKSHEET = "Общий Реестр Продаж"
 
-    MONTH = 0
-    DATE = 2
-    MOP = 3
-    EXECUTOR = 4
-    CLIENT = 5
-    CONTRACT = 6
-    SERVICE = 7
-    TOTAL_AMOUNT = 9
-    FACT_AMOUNT = 10
-    REMAINDER = 11
-    SOURCE = 13
+#: Колонки реестра продаж. Ищутся по заголовку — см. `app.bbc.layout`.
+REGISTRY_COLUMNS: tuple[Column, ...] = (
+    Column("month", "Мес", ("Мес",), hint=0, required=False),
+    Column("date", "Дата", ("Дата",), hint=2, required=False),
+    Column("mop", "МОП", ("МОП",), hint=3),
+    Column("executor", "Исполнитель (BBC)", ("Исполнитель (BBC)", "Исполнитель"), hint=4, required=False),
+    Column("client", "Клиент", ("Клиент",), hint=5),
+    Column("contract", "№ Договора", ("№ Договора",), hint=6, required=False),
+    Column("service", "Тип Услуги", ("Тип Услуги",), hint=7, required=False),
+    Column("total_amount", "Общая Сумма", ("Общая Сумма",), hint=9),
+    Column("fact_amount", "Факт Сумма", ("Факт Сумма",), hint=10),
+    Column("remainder", "Остаток Сумма", ("Остаток Сумма",), hint=11, required=False),
+    Column("source", "Источник", ("Источник",), hint=13, required=False),
+)
+
+
+def resolve_registry_layout(header: Sequence[str]) -> Layout:
+    return resolve_layout(REGISTRY_WORKSHEET, REGISTRY_COLUMNS, header)
 
 
 def parse_sales_registry(grid: Sequence[Sequence[str]]) -> list[dict[str, Any]]:
     """Строки реестра продаж, пригодные для аналитики по каналам и менеджерам."""
+    if not grid:
+        return []
+    layout = resolve_registry_layout(grid[0])
+
+    def cell(raw: Sequence[str], key: str) -> str:
+        return clean(layout.cell(raw, key))
+
     rows: list[dict[str, Any]] = []
     for index, raw in enumerate(grid[1:], start=2):
-        client = _cell([raw], 0, SalesCol.CLIENT)
-        mop = _cell([raw], 0, SalesCol.MOP)
+        client = cell(raw, "client")
+        mop = cell(raw, "mop")
         # Лист содержит повторяющиеся строки-заголовки — отбрасываем их.
         if not client or client.casefold() == "клиент" or mop.casefold() == "моп":
             continue
         rows.append(
             {
                 "index": index,
-                "month": _cell([raw], 0, SalesCol.MONTH),
-                "date": _cell([raw], 0, SalesCol.DATE),
+                "month": cell(raw, "month"),
+                "date": cell(raw, "date"),
                 "mop": mop,
-                "executor": _cell([raw], 0, SalesCol.EXECUTOR),
+                "executor": cell(raw, "executor"),
                 "client": client,
-                "contract": _cell([raw], 0, SalesCol.CONTRACT),
-                "service": _cell([raw], 0, SalesCol.SERVICE),
-                "amount": parse_money(_cell([raw], 0, SalesCol.TOTAL_AMOUNT)) or 0.0,
-                "paid": parse_money(_cell([raw], 0, SalesCol.FACT_AMOUNT)) or 0.0,
-                "source": _cell([raw], 0, SalesCol.SOURCE),
+                "contract": cell(raw, "contract"),
+                "service": cell(raw, "service"),
+                "amount": parse_money(cell(raw, "total_amount")) or 0.0,
+                "paid": parse_money(cell(raw, "fact_amount")) or 0.0,
+                "source": cell(raw, "source"),
             }
         )
     return rows
@@ -353,11 +367,12 @@ def parse_sales_registry(grid: Sequence[Sequence[str]]) -> list[dict[str, Any]]:
 __all__ = [
     "ChannelResult",
     "PayrollLine",
-    "SalesCol",
+    "REGISTRY_COLUMNS",
     "SalesReport",
     "SpendLine",
     "canonical_channel",
     "channel_results",
     "parse_sales_registry",
     "parse_sales_report",
+    "resolve_registry_layout",
 ]

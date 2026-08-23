@@ -15,29 +15,38 @@ from dataclasses import asdict, dataclass
 from datetime import date
 from typing import Any, Callable, Sequence
 
+from app.bbc.layout import Column, Layout, resolve_layout
 from app.bbc.normalize import clean, parse_date, parse_money
 
 log = logging.getLogger(__name__)
 
+WORKSHEET = "Журнал"
 
-class Col:
-    """Позиции колонок в листе «Журнал»."""
-
-    DDS_MONTH = 0  # ДДС Мес (цифра)
-    PNL_PERIOD = 1  # ОПиУ период
-    DATE = 2
-    ACCOUNT = 3  # Счет
-    INFLOW = 4  # Приход
-    OUTFLOW = 5  # Расход
-    COUNTERPARTY = 6  # Контрагент
-    CONTRACT = 8  # №Дог.
-    SUBCATEGORY = 9
-    PROJECT = 10
-    CATEGORY = 11
-    COMMENT = 12
-    PAYROLL_LOAN = 13  # ФОТ, займ
-    PRODUCT = 22
-    FIRM = 24
+#: Колонки листа «Журнал». Ищутся по заголовку — см. `app.bbc.layout`.
+#:
+#: Здесь это не перестраховка, а исправление. Раньше позиции были прибиты
+#: числами и проверки шапки у «Журнала» не было вовсе. В книгу вставили колонку
+#: «ФОТ/Детали» на позицию 10, и «Проект», «Категория», «Комментарии» уехали на
+#: +1. Парсер продолжал читать молча: в «Категорию» попадал «Проект», в
+#: «Комментарий» — «Категория». Сводка по категориям расходов была неверной и
+#: ничем себя не выдавала. Ровно поэтому колонки теперь ищутся по названию.
+JOURNAL_COLUMNS: tuple[Column, ...] = (
+    Column("dds_month", "ДДС Мес", ("ДДС Мес (цифра)",), hint=0, required=False),
+    Column("pnl_period", "ОПиУ период", ("ОПиУ период",), hint=1, required=False),
+    Column("date", "Дата", ("Дата",), hint=2),
+    Column("account", "Счет", ("Счет",), hint=3),
+    Column("inflow", "Приход", ("Приход",), hint=4),
+    Column("outflow", "Расход", ("Расход",), hint=5),
+    Column("counterparty", "Контрагент", ("Контрагент",), hint=6),
+    Column("contract", "№ Договора", ("№Дог.", "№ Дог.", "№ Договора"), hint=8, required=False),
+    Column("subcategory", "Подкатегория", ("Подкатегория",), hint=9, required=False),
+    Column("payroll_loan", "ФОТ/Детали", ("ФОТ/Детали", "ФОТ, займ"), hint=10, required=False),
+    Column("project", "Проект", ("Проект",), hint=11, required=False),
+    Column("category", "Категория", ("Категория",), hint=12, required=False),
+    Column("comment", "Комментарии", ("Комментарии", "Комментарий"), hint=13, required=False),
+    Column("product", "Продукт", ("Продукт",), hint=22, required=False),
+    Column("firm", "Фирма", ("Фирма",), hint=24, required=False),
+)
 
 
 @dataclass
@@ -66,10 +75,14 @@ class JournalRow:
         return data
 
 
-def _cell(row: Sequence[str], index: int) -> str:
-    value = clean(row[index]) if index < len(row) else ""
+def _cell(layout: Layout, row: Sequence[str], key: str) -> str:
+    value = clean(layout.cell(row, key))
     # Формульные ошибки в текстовых колонках — то же самое, что пусто.
     return "" if value.startswith("#") else value
+
+
+def resolve_journal_layout(header: Sequence[str]) -> Layout:
+    return resolve_layout(WORKSHEET, JOURNAL_COLUMNS, header)
 
 
 def parse_journal(grid: Sequence[Sequence[str]]) -> list[JournalRow]:
@@ -79,25 +92,29 @@ def parse_journal(grid: Sequence[Sequence[str]]) -> list[JournalRow]:
     (а их в листе большинство) отбрасываются: они только раздували бы выдачу и
     портили проценты полноты.
     """
+    if not grid:
+        return []
+    layout = resolve_journal_layout(grid[0])
+
     rows: list[JournalRow] = []
     for index, raw in enumerate(grid[1:], start=2):
-        at = parse_date(_cell(raw, Col.DATE))
-        inflow = parse_money(_cell(raw, Col.INFLOW)) or 0.0
-        outflow = parse_money(_cell(raw, Col.OUTFLOW)) or 0.0
+        at = parse_date(_cell(layout, raw, "date"))
+        inflow = parse_money(_cell(layout, raw, "inflow")) or 0.0
+        outflow = parse_money(_cell(layout, raw, "outflow")) or 0.0
         if at is None and not inflow and not outflow:
             continue
         rows.append(
             JournalRow(
                 index=index,
                 at=at,
-                account=_cell(raw, Col.ACCOUNT),
-                counterparty=_cell(raw, Col.COUNTERPARTY),
-                firm=_cell(raw, Col.FIRM),
-                category=_cell(raw, Col.CATEGORY),
-                subcategory=_cell(raw, Col.SUBCATEGORY),
-                project=_cell(raw, Col.PROJECT),
-                contract=_cell(raw, Col.CONTRACT),
-                comment=_cell(raw, Col.COMMENT),
+                account=_cell(layout, raw, "account"),
+                counterparty=_cell(layout, raw, "counterparty"),
+                firm=_cell(layout, raw, "firm"),
+                category=_cell(layout, raw, "category"),
+                subcategory=_cell(layout, raw, "subcategory"),
+                project=_cell(layout, raw, "project"),
+                contract=_cell(layout, raw, "contract"),
+                comment=_cell(layout, raw, "comment"),
                 inflow=inflow,
                 outflow=outflow,
             )
@@ -230,10 +247,11 @@ def dimensions(rows: list[JournalRow]) -> dict[str, list[str]]:
 __all__ = [
     "GROUPS",
     "MEASURES",
-    "Col",
+    "JOURNAL_COLUMNS",
     "JournalRow",
     "coverage",
     "dimensions",
     "parse_journal",
+    "resolve_journal_layout",
     "summarize",
 ]

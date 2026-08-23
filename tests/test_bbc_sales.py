@@ -231,9 +231,30 @@ def test_deals_are_counted_per_channel(grid) -> None:
 # ── Реестр продаж ────────────────────────────────────────────────────────────────
 
 
+def registry_header() -> list[str]:
+    """Настоящая шапка реестра: колонки теперь ищутся по названиям.
+
+    Раньше здесь хватало двух подписей, потому что позиции были прибиты
+    числами. Теперь шапка — это и есть контракт с книгой, и подделывать её
+    наполовину значило бы проверять не то, что работает на проде.
+    """
+    return [column.names[0] if column.hint is not None else "" for column in _registry_slots()]
+
+
+def _registry_slots():
+    from app.bbc.sales import REGISTRY_COLUMNS
+
+    width = max(c.hint for c in REGISTRY_COLUMNS if c.hint is not None) + 1
+    slots: list = [type("Blank", (), {"names": ("",), "hint": None})] * width
+    for column in REGISTRY_COLUMNS:
+        if column.hint is not None:
+            slots[column.hint] = column
+    return slots
+
+
 def test_registry_rows_are_parsed() -> None:
     grid = [
-        cell({0: "Мес", 5: "Клиент"}),
+        registry_header(),
         cell({0: "7", 2: "01.07.2026", 3: "Акежан", 4: "ТОО BBC LEGAL SUPPORT",
               5: "ImpExtrans", 6: "№ЮО/103", 7: "Юр. разовое", 9: "75 000",
               10: "75 000", 13: "Контекст"}),
@@ -250,7 +271,7 @@ def test_registry_rows_are_parsed() -> None:
 def test_repeated_header_rows_are_skipped() -> None:
     """Лист содержит повторяющиеся шапки — они не должны стать «продажами»."""
     grid = [
-        cell({5: "Клиент"}),
+        registry_header(),
         cell({3: "МОП", 5: "Клиент"}),
         cell({0: "7", 3: "Усман", 5: "ТОО Реальный", 9: "50 000"}),
     ]

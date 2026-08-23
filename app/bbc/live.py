@@ -38,7 +38,7 @@ from app.bbc.dataset import (
     collect_dimensions,
     content_hash,
     coverage,
-    parse_contract_rows,
+    parse_dataset,
 )
 from app.bbc.recognition import annotate_all
 from app.bbc.sheets import BbcError
@@ -71,6 +71,9 @@ class Snapshot:
     warnings: list[dict[str, Any]] = field(default_factory=list)
     warnings_summary: dict[str, Any] = field(default_factory=dict)
     sources: dict[str, SourceState] = field(default_factory=dict)
+    #: Раскладка мастер-листа: какие колонки нашлись и какие уехали. Уходит в
+    #: интерфейс, чтобы «книгу поправили» было видно раньше, чем поедут цифры.
+    layout: dict[str, Any] = field(default_factory=dict)
 
 
 _lock = threading.Lock()
@@ -94,6 +97,7 @@ def revision_payload() -> dict[str, Any]:
         "revision": snapshot.revision,
         "changed_at": snapshot.changed_at,
         "rows": len(snapshot.rows),
+        "layout_shifted": bool(snapshot.layout.get("shifted")),
         "sources": {
             name: {
                 "fetched_at": state.fetched_at,
@@ -192,7 +196,8 @@ def _read_sources(*, force: bool) -> bool:
         if digest == state.content_hash and not force:
             return False
 
-        rows = annotate_all(parse_contract_rows(grid))
+        parsed, layout = parse_dataset(grid)
+        rows = annotate_all(parsed)
         findings = analyze(rows)
         now = datetime.now(UTC).isoformat()
 
@@ -207,6 +212,7 @@ def _read_sources(*, force: bool) -> bool:
                 coverage=coverage(rows),
                 warnings=[finding.to_dict() for finding in findings],
                 warnings_summary=summarize(findings),
+                layout=layout.to_dict() if layout else {},
                 sources={
                     sheets.SOURCE_MASTER: SourceState(
                         source=sheets.SOURCE_MASTER,

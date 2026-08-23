@@ -1,10 +1,10 @@
 """Разбор листа «Сводка все ЮР лица»: раскладка и долг.
 
-Эти два предмета проверяются вместе не случайно. Позиции колонок прибиты
-числами, а долг читается из колонки 47 — и если книга сдвинется, парсер
-продолжит читать соседнюю ячейку и выдаст правдоподобную, но неверную сумму
-денег. Тест на раскладку здесь — не про аккуратность, а про то, чтобы такой
-сдвиг остановил сборку, а не доехал до экрана.
+Эти два предмета проверяются вместе не случайно. Долг читается из колонки
+«Дебет / Кредит», и если книга сдвинется, парсер обязан прочитать её на новом
+месте, а не соседнюю ячейку — иначе на экран уедет правдоподобная, но неверная
+сумма денег. Поэтому здесь проверяется и то, что сдвиг переживается, и то, что
+неопознанная раскладка останавливает чтение.
 """
 from __future__ import annotations
 
@@ -13,28 +13,27 @@ import pytest
 from app.bbc.dataset import (
     EXPECTED_SPREADSHEET_ID,
     EXPECTED_WORKSHEET,
-    Col,
+    MASTER_COLUMNS,
     LayoutError,
     parse_contract_row,
     parse_contract_rows,
-    verify_layout,
+    parse_dataset,
+    resolve_master_layout,
 )
 
-WIDTH = 57
+#: Ширина книги с запасом — реальный лист на август 2026 имеет 61 колонку.
+WIDTH = 61
+
+#: Логическое имя колонки → её позиция в эталонной книге.
+HINT = {column.key: column.hint for column in MASTER_COLUMNS}
 
 
 def header() -> list[str]:
-    """Заголовок книги в тех местах, по которым сверяется раскладка."""
+    """Шапка эталонной книги: каждое название на своём месте."""
     row = [""] * WIDTH
-    row[Col.MONTH] = "Мес"
-    row[Col.CLIENT] = "Заказчик\n(Название Фирмы)"
-    row[Col.CONTRACT_AMOUNT] = "Сумма\nДоговора"
-    row[Col.DEPARTMENT] = "Отдел"
-    row[Col.CONTRACT_NO] = "№\nДоговора"
-    row[Col.SALDO_START] = "Сальдо\nНачало"
-    row[Col.AVR_FLAG] = "АВР\n(Реал.)"
-    row[Col.SALDO_END] = "Сальдо\nКонец"
-    row[Col.DEBIT_CREDIT] = "Дебет / Кредит \n(в т.ч без АВР)"
+    for column in MASTER_COLUMNS:
+        if column.hint is not None:
+            row[column.hint] = column.names[0]
     return row
 
 
@@ -42,46 +41,117 @@ def sheet_row(**cells) -> list[str]:
     """Строка листа. «Вид Услуги» по умолчанию заполнен: пустой означает
     «договор не вступил в силу», и тест на долг молча считал бы ноль."""
     row = [""] * WIDTH
-    row[Col.SERVICE_KIND] = "Абон.П."
+    row[HINT["service_kind"]] = "Абон.П."
     for name, value in cells.items():
-        row[getattr(Col, name.upper())] = value
+        row[HINT[name]] = value
     return row
+
+
+LAYOUT = resolve_master_layout(header())
+
+
+def parse_row(index: int, row: list[str], layout=None):
+    return parse_contract_row(index, row, layout or LAYOUT)
 
 
 # ── Раскладка ───────────────────────────────────────────────────────────────
 
 
-def test_matching_header_passes() -> None:
-    verify_layout(header())
+def test_the_reference_header_resolves_every_column() -> None:
+    layout = resolve_master_layout(header())
+    assert not layout.shifted
+    assert not layout.absent
+    for column in MASTER_COLUMNS:
+        assert layout.at(column.key) == column.hint, column.key
 
 
 def test_the_expected_book_is_recorded_in_the_code() -> None:
-    """`.env` в репозиторий не попадает, поэтому нужная книга записана в коде.
-
-    Без этого следующий, кто откроет `Col`, не узнает, под какую раскладку
-    прибиты позиции, — и сверить их будет не с чем.
-    """
+    """`.env` в репозиторий не попадает, поэтому нужная книга записана в коде."""
     assert EXPECTED_SPREADSHEET_ID == "1xEp_QEirE49gREHrSvXwcYJRO1ZTVVzGF4Web43tDvI"
     assert EXPECTED_WORKSHEET == "Сводка все ЮР лица"
-    assert EXPECTED_SPREADSHEET_ID in str(
-        pytest.raises(LayoutError, verify_layout, [""] * WIDTH).value
-    )
 
 
-def test_a_column_inserted_at_the_front_is_caught() -> None:
-    """Ровно та поломка, которая уже случилась при переезде на новую книгу."""
-    shifted = [""] + header()
-    with pytest.raises(LayoutError):
-        verify_layout(shifted)
+def test_a_column_inserted_at_the_front_no_longer_breaks_anything() -> None:
+    """Ровно та поломка, из-за которой дашборд встал: колонка сдвинула все.
+
+    Раньше это была ошибка «раскладка не совпала». Теперь колонки находятся по
+    названию, сдвиг переживается, а долг читается с нового места — не с соседнего.
+    """
+    grid = [[""] + header(), [""] + sheet_row(client="ТОО Тест", debit_credit="85 000")]
+    rows, layout = parse_dataset(grid)
+    assert layout is not None and layout.shifted
+    assert rows[0].client == "ТОО Тест"
+    assert rows[0].debt == 85_000
 
 
-def test_the_error_names_the_columns_that_did_not_match() -> None:
+def test_the_august_2026_avr_columns_are_survived() -> None:
+    """В блок АВР добавили четыре колонки — всё правее уехало на +4.
+
+    Это настоящая поломка августа 2026: «Сальдо Конец» переехал с 42 на 46,
+    «Дебет / Кредит» с 47 на 51. Долг обязан приехать целым.
+    """
+    #: Книга ДО августа: четырёх новых колонок нет, поэтому всё, что стояло
+    #: правее блока АВР, лежит на 4 позиции левее.
+    NEW = {"avr_accepted", "esf_sent"}
+    INSERT_AT = HINT["avr_date"] + 1
+
+    def old_position(column) -> int:
+        return column.hint - 4 if column.hint > INSERT_AT else column.hint
+
+    old_header = [""] * (WIDTH - 4)
+    positions: dict[str, int] = {}
+    for column in MASTER_COLUMNS:
+        if column.hint is None or column.key in NEW:
+            continue
+        positions[column.key] = old_position(column)
+        old_header[positions[column.key]] = column.names[-1]
+
+    old_row = [""] * (WIDTH - 4)
+    old_row[positions["service_kind"]] = "Абон.П."
+    old_row[positions["client"]] = "ИП Vector"
+    old_row[positions["debit_credit"]] = "1 200 000"
+    old_row[positions["saldo_end"]] = "-1 200 000"
+
+    rows, layout = parse_dataset([old_header, old_row])
+
+    assert layout is not None
+    # Именно те позиции, что были до августа, — и парсер их находит.
+    assert layout.at("saldo_end") == 42
+    assert layout.at("debit_credit") == 47
+    assert layout.shifted, "переезд обязан быть виден в примечании"
+    assert set(layout.absent) >= NEW
+    # Главное: деньги приехали целыми, а не из соседней ячейки.
+    assert rows[0].debt == 1_200_000
+    assert rows[0].saldo_end == -1_200_000
+
+
+def test_a_renamed_required_column_stops_the_read() -> None:
+    """Переименование — единственное, что теперь ломает чтение. И должно."""
     broken = header()
-    broken[Col.DEPARTMENT] = "Направление"
+    broken[HINT["department"]] = "Направление"
     with pytest.raises(LayoutError) as caught:
-        verify_layout(broken)
+        resolve_master_layout(broken)
     assert "Отдел" in str(caught.value)
-    assert "Направление" in str(caught.value)
+
+
+def test_the_error_shows_what_stands_near_the_old_position() -> None:
+    """Ошибка обязана подсказывать, чем колонку заменили, а не только что её нет."""
+    broken = header()
+    broken[HINT["debit_credit"]] = "Итого к оплате"
+    with pytest.raises(LayoutError) as caught:
+        resolve_master_layout(broken)
+    assert "итого к оплате" in str(caught.value).lower()
+
+
+def test_optional_columns_may_be_absent() -> None:
+    """Старая копия книги без колонок «АВР (клиент принял)» и «ЭСФ» читается."""
+    old = header()
+    old[HINT["avr_accepted"]] = ""
+    old[HINT["esf_sent"]] = ""
+    layout = resolve_master_layout(old)
+    assert set(layout.absent) >= {"avr_accepted", "esf_sent"}
+    row = parse_row(2, sheet_row(debit_credit="1 000"), layout)
+    assert row.avr_accepted is None and row.esf_sent is None
 
 
 def test_parsing_refuses_a_sheet_with_a_foreign_layout() -> None:
@@ -97,7 +167,7 @@ def test_an_empty_grid_is_not_an_error() -> None:
 
 
 def test_debt_is_read_from_the_book() -> None:
-    row = parse_contract_row(2, sheet_row(client="ИП Vector", debit_credit="85 000"))
+    row = parse_row(2, sheet_row(client="ИП Vector", debit_credit="85 000"))
     assert row.debt == 85_000
     assert row.debt_pending is False
     assert row.debt_broken is False
@@ -106,14 +176,14 @@ def test_debt_is_read_from_the_book() -> None:
 
 def test_a_period_that_has_not_started_is_not_debt() -> None:
     """«Еще рано» — книга сама решает, когда долг становится долгом."""
-    row = parse_contract_row(2, sheet_row(contract_amount="85 000", debit_credit="Еще рано"))
+    row = parse_row(2, sheet_row(contract_amount="85 000", debit_credit="Еще рано"))
     assert row.debt is None
     assert row.debt_pending is True
     assert row.total_debt == 0
 
 
 def test_a_formula_error_is_marked_rather_than_silently_zeroed() -> None:
-    row = parse_contract_row(2, sheet_row(debit_credit="#VALUE!"))
+    row = parse_row(2, sheet_row(debit_credit="#VALUE!"))
     assert row.debt is None
     assert row.debt_broken is True
     assert row.debt_pending is False
@@ -200,21 +270,21 @@ def test_a_contract_not_in_force_is_not_debt() -> None:
     Не наша трактовка: ни одна такая строка не попала во вкладки «(для Рук)»,
     по которым живут отделы, — бизнес уже не считает их долгом.
     """
-    row = parse_contract_row(2, sheet_row(service_kind="нет", debit_credit="4 060 000"))
+    row = parse_row(2, sheet_row(service_kind="нет", debit_credit="4 060 000"))
     assert row.in_force is False
     assert row.total_debt == 0
     assert row.parked_debt == 4_060_000
 
 
 def test_an_empty_service_kind_is_also_not_in_force() -> None:
-    row = parse_contract_row(2, sheet_row(service_kind="", debit_credit="100 000"))
+    row = parse_row(2, sheet_row(service_kind="", debit_credit="100 000"))
     assert row.in_force is False
     assert row.total_debt == 0
 
 
 def test_a_normal_service_kind_is_in_force() -> None:
     for kind in ("Абон.П.", "Разовый", "Аренда", "По квартальный ???"):
-        row = parse_contract_row(2, sheet_row(service_kind=kind, debit_credit="85 000"))
+        row = parse_row(2, sheet_row(service_kind=kind, debit_credit="85 000"))
         assert row.in_force is True, kind
         assert row.total_debt == 85_000, kind
         assert row.parked_debt == 0, kind

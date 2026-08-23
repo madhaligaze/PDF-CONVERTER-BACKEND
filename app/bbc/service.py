@@ -159,6 +159,9 @@ def get_dataset(scope: Scope, *, refresh: bool = False) -> dict[str, Any]:
         "coverage": coverage(rows),
         "warnings": [finding.to_dict() for finding in findings],
         "warnings_summary": summarize(findings),
+        # Раскладка книги: если колонки уехали, дашборд говорит об этом сам, не
+        # дожидаясь, пока кто-нибудь заметит неверную цифру.
+        "layout": snapshot.layout,
         "sources": live.revision_payload()["sources"],
     }
 
