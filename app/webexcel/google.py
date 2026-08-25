@@ -201,8 +201,12 @@ _GRID_FIELDS = ",".join(
         "sheets.data.startColumn",
         "sheets.data.rowMetadata(pixelSize,hiddenByUser)",
         "sheets.data.columnMetadata(pixelSize,hiddenByUser)",
+        # dataValidation нужен ровно ради одного случая — флажков. В Google
+        # это не «значение TRUE», а ячейка с условием BOOLEAN, и без него
+        # колонка «Счет» приезжает столбцом слова TRUE вместо галочек.
         "sheets.data.rowData.values("
         "formattedValue,effectiveValue,userEnteredValue,note,hyperlink,"
+        "dataValidation.condition.type,"
         "effectiveFormat("
         "numberFormat,backgroundColor,borders,horizontalAlignment,"
         "verticalAlignment,wrapStrategy,textRotation,"

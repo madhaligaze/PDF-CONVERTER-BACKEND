@@ -35,6 +35,8 @@ from typing import Any
 _H_ALIGN = {"LEFT": 1, "CENTER": 2, "RIGHT": 3, "JUSTIFY": 4}
 _V_ALIGN = {"TOP": 1, "MIDDLE": 2, "BOTTOM": 3}
 _WRAP = {"OVERFLOW_CELL": 1, "LEGACY_WRAP": 3, "CLIP": 2, "WRAP": 3}
+_WRAP_OVERFLOW = 1
+_WRAP_CLIP = 2
 
 # BorderStyleTypes из @univerjs/core
 _BORDER = {
@@ -147,10 +149,6 @@ def _style_of(cell_format: dict[str, Any] | None, locale_tag: str = "") -> dict[
     v = _V_ALIGN.get(str(cell_format.get("verticalAlignment", "")).upper())
     if v:
         style["vt"] = v
-    w = _WRAP.get(str(cell_format.get("wrapStrategy", "")).upper())
-    if w:
-        style["tb"] = w
-
     rotation = cell_format.get("textRotation") or {}
     if rotation.get("angle"):
         style["tr"] = {"a": int(rotation["angle"])}
@@ -166,6 +164,26 @@ def _style_of(cell_format: dict[str, Any] | None, locale_tag: str = "") -> dict[
     if bd:
         style["bd"] = bd
 
+    # Перенос решается последним, потому что зависит от рамок.
+    #
+    # `OVERFLOW` у ячейки С РАМКОЙ заменяется на `CLIP`, и это не косметика.
+    # Пара «рамка + перетекание» — самое дорогое, что есть в отрисовке: на
+    # каждую видимую ячейку движок ищет, чей текст мог бы налезть на эту
+    # границу, и обходит ради этого строки. В профиле прокрутки «Журнала» на
+    # `renderBorderByCell → _getOverflowExclusion → forRow` уходило 36%
+    # времени, 95-й процентиль кадра — 574 мс, то есть таблица заметно
+    # дёргалась под рукой. Со снятым перетеканием у обрамлённых ячеек — 121 мс.
+    #
+    # Расхождение с Google при этом почти не видно: обрамлённая ячейка и так
+    # выглядит замкнутой коробкой, а текст, переехавший через нарисованную
+    # границу, в этих книгах смотрится ошибкой. Ячейки без рамок перетекание
+    # сохраняют — там оно и заметно, и уместно.
+    w = _WRAP.get(str(cell_format.get("wrapStrategy", "")).upper())
+    if w == _WRAP_OVERFLOW and bd:
+        w = _WRAP_CLIP
+    if w:
+        style["tb"] = w
+
     number = cell_format.get("numberFormat") or {}
     pattern = number.get("pattern")
     # `TEXT` без образца и `NUMBER` с пустым образцом — это «как есть»: свой
@@ -178,6 +196,32 @@ def _style_of(cell_format: dict[str, Any] | None, locale_tag: str = "") -> dict[
         style["n"] = {"pattern": f"{prefix}{pattern}"}
 
     return style
+
+
+def _merge_columns(cells: list[tuple[int, int]]) -> list[dict[str, int]]:
+    """Клетки → вертикальные диапазоны по колонкам.
+
+    Флажки в книге стоят колонками на всю таблицу: у «Сводки все ЮР лица» это
+    900 ячеек в одном столбце. Отдавать их поштучно — 900 правил проверки
+    данных на лист, и Univer честно создаст 900 объектов. Склейка в подряд
+    идущие отрезки превращает это в одно правило.
+    """
+    by_column: dict[int, list[int]] = {}
+    for row, column in cells:
+        by_column.setdefault(column, []).append(row)
+
+    ranges: list[dict[str, int]] = []
+    for column, rows in sorted(by_column.items()):
+        rows.sort()
+        start = previous = rows[0]
+        for row in rows[1:]:
+            if row == previous + 1:
+                previous = row
+                continue
+            ranges.append({"startRow": start, "endRow": previous, "startColumn": column, "endColumn": column})
+            start = previous = row
+        ranges.append({"startRow": start, "endRow": previous, "startColumn": column, "endColumn": column})
+    return ranges
 
 
 def _canonical(style: dict[str, Any]) -> str:
@@ -235,6 +279,8 @@ def convert_tab(payload: dict[str, Any]) -> dict[str, Any]:
     # ── Проход 1: стили и значения ──────────────────────────────────────────
     style_counts: dict[str, int] = {}
     fonts: set[str] = set()
+    # Клетки-флажки, собираемые построчно и потом склеиваемые в диапазоны.
+    checkbox_cells: list[tuple[int, int]] = []
     parsed: list[list[tuple[Any, int | None, str, str | None, str | None]]] = []
     max_col = 0
 
@@ -242,8 +288,20 @@ def convert_tab(payload: dict[str, Any]) -> dict[str, Any]:
         values = row.get("values") or []
         max_col = max(max_col, len(values))
         parsed_row: list[tuple[Any, int | None, str, str | None, str | None]] = []
-        for cell in values:
+        for column, cell in enumerate(values):
+            condition = (cell.get("dataValidation") or {}).get("condition") or {}
+            is_checkbox = str(condition.get("type", "")).upper() == "BOOLEAN"
+            if is_checkbox:
+                checkbox_cells.append((len(parsed), column))
             value, kind = _value_of(cell)
+            if is_checkbox and kind == _T_BOOLEAN:
+                # Флажок Univer рисуется, только если значение ячейки совпадает
+                # с «отмечено»/«снято» его правила, а это 1 и 0. Булево True
+                # строкой даёт «true», не совпадает ни с чем, и вместо галочки
+                # на экране остаётся слово TRUE — ровно то, что и увидели на
+                # первой импортированной книге. В Sheets и Excel ИСТИНА и так
+                # равна единице, так что подмена не меняет смысла ячейки.
+                value, kind = (1 if value else 0), _T_NUMBER
             style = _style_of(cell.get("effectiveFormat"), locale_tag)
             if style.get("ff"):
                 fonts.add(style["ff"])
@@ -305,6 +363,12 @@ def convert_tab(payload: dict[str, Any]) -> dict[str, Any]:
         entry: dict[str, Any] = {}
         if meta.get("pixelSize"):
             entry["h"] = int(meta["pixelSize"])
+            # `ia: 0` — «высота задана, мерить не надо». Без этого движок считает
+            # строку самоподстраивающейся и на каждом кадре обходит её ячейки,
+            # чтобы вычислить высоту по содержимому. В профиле прокрутки это
+            # 35% времени в одной функции обхода строк. Высота у нас точная,
+            # пришла из Google в пикселях, и пересчитывать её не по чему.
+            entry["ia"] = 0
         if meta.get("hiddenByUser"):
             entry["hd"] = 1
         if entry:
@@ -334,8 +398,17 @@ def convert_tab(payload: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
-    row_count = max(len(row_data), int(grid_props.get("rowCount", 0) or 0), 100)
-    col_count = max(max_col, len(col_meta), int(grid_props.get("columnCount", 0) or 0), 26)
+    # Размер листа — ровно то, что мы привезли, и ни строкой больше.
+    #
+    # Раньше сюда шёл `gridProperties.rowCount` исходной книги. У «Журнала» это
+    # 5837 строк при потолке импорта в 2000: лист объявлялся на 5000 строк, из
+    # которых 3000 — пустая порода. И это не просто память: `defaultStyle`
+    # вкладки несёт рамки со всех четырёх сторон, то есть движок обходил и
+    # обрисовывал 5000×32 клеток вместо 2050×32. Замер прокрутки: 95-й
+    # процентиль кадра 552 мс против 22 мс у вкладки, где объявленный размер
+    # совпадал с привезённым. Это и была «таблица подвисает».
+    row_count = max(len(row_data), 100)
+    col_count = max(max_col, len(col_meta), 26)
 
     worksheet: dict[str, Any] = {
         "id": f"gs-{props.get('sheetId', 0)}",
@@ -372,6 +445,9 @@ def convert_tab(payload: dict[str, Any]) -> dict[str, Any]:
             "source_rows": payload.get("source_rows", 0),
             "source_cols": payload.get("source_cols", 0),
         },
+        # Диапазоны флажков — отдельным списком, потому что в снимке Univer они
+        # живут не в ячейках, а в ресурсе плагина проверки данных.
+        "checkboxes": _merge_columns(checkbox_cells),
         # Шрифты листа отдаются наружу, чтобы фронт подгрузил ровно их.
         # Univer рисует в canvas: незагруженное семейство там не «подменяется
         # похожим», а падает в засечковый шрифт по умолчанию — лист, набранный
