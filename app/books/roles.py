@@ -358,6 +358,7 @@ class SectionStatus:
     key: str
     title: str
     computes: bool
+    required: tuple[str, ...]
     missing_required: tuple[str, ...]
     missing_optional: tuple[str, ...]
 
@@ -367,11 +368,26 @@ class SectionStatus:
             _BY_KEY[key].title for key in self.missing_required if key in _BY_KEY
         )
 
+    @property
+    def bound_required(self) -> int:
+        """Сколько обязательных ролей раздел получил именно из этой книги.
+
+        Отличает «раздел сломан» от «раздел не про эту книгу», а это разные
+        вещи, и путать их дорого. Журнал операций не содержит ни заказчика, ни
+        суммы договора — и не должен: дебиторка считается из мастер-книги. Пока
+        табло об этом не знало, оно писало над журналом «Дебиторка — не хватает
+        Заказчик, Сумма договора, Сальдо конец», и экран читался как три
+        сломанных раздела там, где всё в порядке.
+        """
+        return len(self.required) - len(self.missing_required)
+
     def to_dict(self) -> dict[str, object]:
         return {
             "key": self.key,
             "title": self.title,
             "computes": self.computes,
+            "required": list(self.required),
+            "bound_required": self.bound_required,
             "missing_required": list(self.missing_required),
             "missing_optional": list(self.missing_optional),
             "missing_titles": list(self.missing_titles),
@@ -389,6 +405,7 @@ def section_status(bound_roles: set[str] | frozenset[str]) -> list[SectionStatus
                 key=item.key,
                 title=item.title,
                 computes=not missing_required,
+                required=item.required,
                 missing_required=missing_required,
                 missing_optional=missing_optional,
             )

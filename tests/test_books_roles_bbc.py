@@ -184,6 +184,55 @@ def test_same_header_two_roles_resolved_by_type() -> None:
     assert "account" not in master_bound
 
 
+def test_journal_does_not_pretend_to_owe_receivables() -> None:
+    """Раздел, которому книга ничего не даёт, не считается «сломанным».
+
+    Это не придирка к формулировке, а разница между «почини» и «не твоё».
+    Табло привязок над журналом операций писало: «Дебиторка — не хватает:
+    Заказчик, Сумма договора, Сальдо конец». Дебиторка считается из
+    мастер-книги и от журнала не ждёт ничего; экран выглядел как три сломанных
+    раздела при полностью исправной книге, и разобрать по нему, что делать,
+    было нельзя.
+
+    Различает эти случаи `bound_required` — сколько обязательных величин раздел
+    получил именно отсюда. Ноль означает «раздел не про эту книгу», и на её
+    табло он не показывается вовсе.
+    """
+    from app.books.roles import section_status
+
+    journal_bound, _ = _bind(_load("journal"))
+    by_key = {s.key: s for s in section_status(set(JOURNAL_EXPECTED.values()))}
+
+    assert by_key["journal"].computes, "журнал не считается по собственной книге"
+    assert by_key["journal"].bound_required == len(by_key["journal"].required)
+
+    for foreign in ("receivables", "calendar", "reports"):
+        assert by_key[foreign].bound_required == 0, (
+            f"раздел «{by_key[foreign].title}» считает, что журнал должен ему "
+            f"{', '.join(by_key[foreign].missing_titles)}"
+        )
+
+    # Привязка журнала действительно состоялась — иначе проверка выше была бы
+    # зелёной на пустом наборе ролей и не значила бы ничего.
+    assert journal_bound
+
+
+def test_partially_bound_section_is_still_asked_to_be_finished() -> None:
+    """Половина величин на месте — это «доразложите», а не «не ваша книга».
+
+    Граница между двумя случаями проходит по единице: хотя бы одна обязательная
+    роль привязана — раздел показывается со списком недостающего.
+    """
+    from app.books.roles import section_status
+
+    partial = section_status({"client", "contract_amount"})
+    receivables = next(s for s in partial if s.key == "receivables")
+
+    assert not receivables.computes
+    assert receivables.bound_required == 2
+    assert "Сальдо конец" in receivables.missing_titles
+
+
 def test_service_columns_stay_unbound() -> None:
     """Служебные колонки книги не попадают в роли.
 
