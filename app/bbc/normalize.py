@@ -1,119 +1,26 @@
-"""Turning the spreadsheet's raw strings into typed values.
+"""Приведение значений книги к каноническому виду — справочники BBC.
 
-The source is hand-maintained, so every parser here is written against dirt that
-actually exists in the sheets:
+Разбор ячейки в типизированное значение (`clean`, `parse_money`, `parse_date`,
+`parse_bool`) переехал в `app/core/scalars.py` и реэкспортируется отсюда: грязь
+в ячейках — свойство таблиц, которые ведут руками, а не свойство BBC, и тот же
+разбор нужен разделу «Книги». Вызывающие этого переезда не заметили — имена и
+поведение прежние.
 
-* numbers as text with NBSP/narrow-NBSP thousands separators — `50 000`, `190,00`;
-* formula errors leaking into values — `#N/A`, `#VALUE!`, `#REF!`, `#DIV/0!`;
-* two date formats — `21.05.2026` and `пн 18.05.26` (with U+202F after it);
-* booleans that are not booleans — `TRUE` / `FALSE` / `Часть` / `Еще рано` / `-`;
-* the same category spelled several ways — `Разовый` / `Разовая` / `Разовая услуга`.
-
-Everything returns `None` rather than guessing, so a bad cell is visibly empty
-instead of silently becoming zero.
+Здесь осталось то, что действительно про BBC: как в книгах пишут названия
+юрлиц, видов услуг, статусов договора и отделов. Одно и то же значение пишут
+по-разному («Разовый» / «Разовая» / «Разовая услуга»), и свод по такой колонке
+без приведения к канону распадается на три строки вместо одной.
 """
 from __future__ import annotations
 
-import re
-from datetime import date
-
-# Formula errors and placeholders that must never be read as data.
-_ERRORS = frozenset(
-    {"#N/A", "#VALUE!", "#REF!", "#DIV/0!", "#NAME?", "#NULL!", "#NUM!", "#ERROR!"}
+from app.core.scalars import (
+    SPACE_RE as _SPACE_RE,
+    clean,
+    is_error,
+    parse_bool,
+    parse_date,
+    parse_money,
 )
-
-# NBSP, narrow NBSP, thin space, zero-width space — all used as separators here.
-_SPACES = "   ​"
-_SPACE_RE = re.compile(f"[{_SPACES}\\s]+")
-
-_DATE_DMY = re.compile(r"(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})")
-
-
-def clean(value: object) -> str:
-    """Trim a cell and drop the invisible separators the sheet is full of."""
-    if value is None:
-        return ""
-    text = str(value)
-    for char in _SPACES:
-        text = text.replace(char, " ")
-    return text.strip()
-
-
-def is_error(value: object) -> bool:
-    return clean(value).upper() in _ERRORS
-
-
-def parse_money(value: object) -> float | None:
-    """Parse an amount. Returns None for blanks, formula errors and garbage.
-
-    Handles `50 000` (NBSP), `1 200 000,00` (comma decimal), `190,00`, `-2 500`
-    and plain `500000`.
-    """
-    text = clean(value)
-    if not text or text.upper() in _ERRORS:
-        return None
-
-    text = _SPACE_RE.sub("", text)
-    text = text.replace("₸", "").replace("KZT", "").replace("kzt", "")
-    if not text:
-        return None
-
-    negative = text.startswith("(") and text.endswith(")")
-    if negative:
-        text = text[1:-1]
-
-    if "," in text and "." in text:
-        # Whichever separator comes last is the decimal one.
-        text = (
-            text.replace(".", "").replace(",", ".")
-            if text.rfind(",") > text.rfind(".")
-            else text.replace(",", "")
-        )
-    elif "," in text:
-        text = text.replace(",", ".")
-
-    try:
-        amount = float(text)
-    except ValueError:
-        return None
-    return -amount if negative else amount
-
-
-def parse_date(value: object) -> date | None:
-    """Parse `21.05.2026` and `пн 18.05.26`. Two-digit years are 2000-based."""
-    text = clean(value)
-    if not text or text.upper() in _ERRORS:
-        return None
-
-    match = _DATE_DMY.search(text)
-    if match is None:
-        return None
-
-    day, month, year = (int(part) for part in match.groups())
-    if year < 100:
-        year += 2000
-    try:
-        return date(year, month, day)
-    except ValueError:
-        return None
-
-
-_TRUE = frozenset({"TRUE", "ДА", "YES", "1", "+", "V", "ИСТИНА"})
-_FALSE = frozenset({"FALSE", "НЕТ", "NO", "0", "-", "ЛОЖЬ", ""})
-
-
-def parse_bool(value: object) -> bool | None:
-    """Parse a checkbox-ish cell.
-
-    Returns None for the free text that also lives in these columns («Часть»,
-    «Еще рано») — the caller decides what a partial state means.
-    """
-    text = clean(value).upper()
-    if text in _TRUE:
-        return True
-    if text in _FALSE:
-        return False
-    return None
 
 
 # ── Canonical dimensions ─────────────────────────────────────────────────────────

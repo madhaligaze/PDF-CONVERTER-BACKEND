@@ -602,6 +602,9 @@ async def revision(_: Scope = Depends(require_scope)) -> dict:
 @router.get("/dataset")
 async def dataset(
     refresh: bool = Query(default=False),
+    # Откуда брать строки: из листа Google или из внутренней книги. Переключатель
+    # существует, чтобы цифры можно было сверить — см. `app.bbc.books_source`.
+    source: str = Query(default="sheets", pattern="^(sheets|books)$"),
     scope: Scope = Depends(require_scope),
 ) -> dict:
     """Rows + dimensions + coverage + warnings, narrowed to the caller's scope.
@@ -610,11 +613,18 @@ async def dataset(
     never reach the browser at all, and every aggregate is computed on what is
     left, so totals cannot leak either.
     """
-    _require_configured()
+    if source == "sheets":
+        _require_configured()
     try:
-        return service.get_dataset(scope, refresh=refresh)
+        return service.get_dataset(scope, refresh=refresh, source=source)
     except BbcError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 — «книга не размечена» и т. п.
+        from app.bbc.books_source import NoBookSource
+
+        if isinstance(exc, NoBookSource):
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise
 
 
 @router.get("/calendar")

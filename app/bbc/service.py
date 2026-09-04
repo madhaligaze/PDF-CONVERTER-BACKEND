@@ -21,7 +21,7 @@ from app.bbc import sheets
 from app.bbc import touches as touches_module
 from app.bbc.config import bbc_settings
 from app.bbc.dataset import ContractRow, collect_dimensions, coverage
-from app.bbc.recognition import DEFAULT_MODE, MODES, PRESETS, describe_mode
+from app.bbc.recognition import DEFAULT_MODE, MODES, PRESETS, annotate_all, describe_mode
 from app.bbc.schemas import BbcSheetInfo, BbcSnapshot, BbcStatus
 from app.bbc.scope import Scope, filter_rows
 from app.bbc.sheets import BbcError
@@ -133,12 +133,68 @@ def employee_names() -> list[dict[str, Any]]:
     )
 
 
-def get_dataset(scope: Scope, *, refresh: bool = False) -> dict[str, Any]:
+#: Откуда дашборд берёт строки.
+SOURCE_SHEETS = "sheets"
+SOURCE_BOOKS = "books"
+SOURCES: tuple[str, ...] = (SOURCE_SHEETS, SOURCE_BOOKS)
+
+
+def _rows_from_books(scope: Scope) -> tuple[list[Any], dict[str, Any]]:
+    """Строки внутренней книги, суженные до области видимости вызывающего.
+
+    Фильтрация здесь та же, что и для листа: `scope.filter_rows`. Иначе смена
+    источника молча расширила бы кому-то доступ — сотрудник, видящий своих
+    клиентов, увидел бы всех, просто переключив тумблер.
+    """
+    from app.bbc.books_source import rows_from_books
+    from app.books.db import books_session
+    from app.books.service import ensure_workspace
+
+    with books_session() as session:
+        workspace = ensure_workspace(session)
+        rows, info = rows_from_books(session, workspace.id)
+
+    if scope.sees_nothing:
+        return [], info
+    return filter_rows(annotate_all(rows), scope), info
+
+
+def get_dataset(
+    scope: Scope, *, refresh: bool = False, source: str = SOURCE_SHEETS
+) -> dict[str, Any]:
     """Everything the frontend needs for one load, already narrowed to the scope.
 
     Dimensions, coverage and warnings are recomputed on the *visible* rows —
     otherwise a filter list or a total would betray rows the caller may not see.
+
+    `source` выбирает, откуда взяты строки: из листа Google (`sheets`) или из
+    внутренней книги (`books`). Всё остальное — разбор, признание выручки,
+    предупреждения, область видимости — одно и то же для обоих. Переключатель
+    существует, чтобы цифры можно было сверить: если они разойдутся, это будет
+    видно сразу, а не выяснится через квартал.
     """
+    if source == SOURCE_BOOKS:
+        rows, book_info = _rows_from_books(scope)
+        findings = analyze(rows)
+        return {
+            "revision": 0,
+            "changed_at": None,
+            "source": SOURCE_BOOKS,
+            "source_info": book_info,
+            "scope": scope.to_dict(),
+            "modes": list(MODES),
+            "default_mode": DEFAULT_MODE,
+            "presets": PRESETS,
+            "mode_descriptions": {mode: describe_mode(mode) for mode in MODES},
+            "rows": [row.to_dict() for row in rows],
+            "dimensions": collect_dimensions(rows),
+            "coverage": coverage(rows),
+            "warnings": [finding.to_dict() for finding in findings],
+            "warnings_summary": summarize(findings),
+            "layout": {},
+            "sources": {},
+        }
+
     if refresh:
         live.refresh(force=True)
 
@@ -149,6 +205,8 @@ def get_dataset(scope: Scope, *, refresh: bool = False) -> dict[str, Any]:
     return {
         "revision": snapshot.revision,
         "changed_at": snapshot.changed_at,
+        "source": SOURCE_SHEETS,
+        "source_info": {},
         "scope": scope.to_dict(),
         "modes": list(MODES),
         "default_mode": DEFAULT_MODE,
@@ -276,6 +334,9 @@ def invalidate_cache() -> None:
 __all__ = [
     "BbcError",
     "get_calendar",
+    "SOURCES",
+    "SOURCE_BOOKS",
+    "SOURCE_SHEETS",
     "get_dataset",
     "get_journal",
     "get_revision",

@@ -18,7 +18,7 @@ import json
 import logging
 from dataclasses import asdict, dataclass, field
 from datetime import date
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from app.bbc.layout import Column, Layout, LayoutError, resolve_layout
 from app.bbc.normalize import (
@@ -256,8 +256,29 @@ def _parse_debt(raw: str) -> tuple[float | None, bool, bool]:
 
 
 def parse_contract_row(index: int, row: Sequence[str], layout: Layout) -> ContractRow:
-    def cell(key: str) -> str:
-        return clean(layout.cell(row, key))
+    """Строка мастер-листа Google → `ContractRow`."""
+    return build_contract_row(
+        index,
+        cell=lambda key: clean(layout.cell(row, key)),
+        has=layout.has,
+    )
+
+
+def build_contract_row(
+    index: int,
+    *,
+    cell: Callable[[str], str],
+    has: Callable[[str], bool],
+) -> ContractRow:
+    """Сборка строки договора из значений по логическим именам колонок.
+
+    Откуда берутся значения — не её дело. Из листа Google их достаёт
+    `parse_contract_row` через `Layout`, из внутренней книги —
+    `app.bbc.books_source` через привязки полей к ролям. Разбор один и тот же,
+    и это важнее удобства: дашборд, считающий по двум источникам разными
+    правилами, показывал бы два разных ответа на один вопрос, и оба
+    выглядели бы одинаково уверенно.
+    """
 
     def flag(key: str) -> bool | None:
         """Флаг колонки, которой может не быть в книге.
@@ -267,7 +288,7 @@ def parse_contract_row(index: int, row: Sequence[str], layout: Layout) -> Contra
         в другое значило бы отчитаться, что клиент не принял ни одного АВР, на
         книге, которая этого просто не отслеживает.
         """
-        return parse_bool(cell(key)) if layout.has(key) else None
+        return parse_bool(cell(key)) if has(key) else None
 
     firm_code = canonical_firm(cell("firm"))
     service_raw = cell("service_kind")
@@ -449,6 +470,7 @@ def content_hash(values: list[list[str]]) -> str:
 __all__ = [
     "NOT_DUE",
     "assign_carry_in",
+    "build_contract_row",
     "ONE_OFF",
     "RENT",
     "SUBSCRIPTION",

@@ -3,6 +3,7 @@ import contextlib
 import logging
 import traceback
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,42 +31,64 @@ def _init_bbc() -> None:
         log.warning("BBC schema init failed (%s: %s)", type(exc).__name__, exc)
 
 
+#: Пути к alembic считаются от каталога `backend`, а не от рабочего каталога
+#: процесса. Раньше конфиг открывался как `Config("alembic.ini")`, и миграции
+#: молча не находились, если приложение запускали не из `backend/`.
+_BACKEND_DIR = Path(__file__).resolve().parents[1]
+
+
 def _run_migrations() -> None:
-    """Apply pending Alembic migrations, fall back to create_all for SQLite."""
-    log.info("Starting migrations...")
+    """Привести схему в соответствие с кодом. Не смогли — не поднимаемся.
+
+    Здесь раньше стоял молчаливый откат на `create_all`: если alembic падал,
+    таблицы всё равно создавались, `alembic_version` оставалась на старой
+    ревизии, приложение отвечало 200 — и схема расходилась с миграциями
+    навсегда. Следующая ревизия падала уже на «таблица существует» и снова
+    уходила в откат. Наружу это не выходило ничем: ни ошибки, ни симптома.
+
+    Пока Postgres был кэшем прочитанного из Google, цена была невелика — книгу
+    всегда можно перечитать. Теперь в нём живут данные, которых больше нигде
+    нет, и приложение, не сумевшее привести схему в порядок, обязано не
+    подняться, а не делать вид, что всё хорошо.
+
+    Для SQLite alembic не гоняется намеренно: ревизии написаны под Postgres со
+    схемами, которых у SQLite нет. Там схема собирается через `create_all` — и
+    это законный путь, а не запасной.
+    """
     db_url = get_resolved_database_url()
-    db_driver = db_url.split("://")[0] if "://" in db_url else db_url
-    log.info("DB URL resolved to driver: %s", db_driver)
+    driver = db_url.split("://")[0] if "://" in db_url else db_url
 
     if db_url.startswith("sqlite"):
-        log.info("SQLite detected, skipping alembic and running create_all")
+        log.info("Схема: SQLite (%s) — create_all вместо ревизий", driver)
         init_database()
         _init_bbc()
-        log.info("Database initialized with SQLite")
         return
 
-    log.info("PostgreSQL detected, attempting alembic migrations")
-    try:
-        from alembic import command
-        from alembic.config import Config
+    from alembic import command
+    from alembic.config import Config
 
-        alembic_cfg = Config("alembic.ini")
-        alembic_cfg.set_main_option("sqlalchemy.url", db_url)
-        log.info("Running alembic upgrade to head...")
+    alembic_cfg = Config(str(_BACKEND_DIR / "alembic.ini"))
+    alembic_cfg.set_main_option("script_location", str(_BACKEND_DIR / "app" / "migrations"))
+    alembic_cfg.set_main_option("sqlalchemy.url", db_url)
+    # Не трогать логирование процесса: секции [logger_*] из alembic.ini
+    # предназначены для запуска из командной строки, а здесь они затирали
+    # настройки uvicorn — после миграций пропадал журнал запросов.
+    alembic_cfg.attributes["configure_logger"] = False
+
+    try:
         command.upgrade(alembic_cfg, "head")
-        log.info("Alembic migrations applied successfully")
     except Exception as exc:
-        log.warning("Alembic failed (%s: %s), falling back to create_all", type(exc).__name__, exc)
-        log.debug(traceback.format_exc())
-        try:
-            log.info("Attempting create_all fallback...")
-            init_database()
-            _init_bbc()
-            log.info("create_all fallback succeeded")
-        except Exception as exc2:
-            log.error("create_all fallback also failed: %s: %s", type(exc2).__name__, exc2)
-            log.error(traceback.format_exc())
-            raise
+        log.error(
+            "Миграции не применились (%s: %s). Приложение не поднимется: схема "
+            "не соответствует коду, а работать на расходящейся схеме опаснее, "
+            "чем не работать вовсе.",
+            type(exc).__name__,
+            exc,
+        )
+        log.error(traceback.format_exc())
+        raise
+
+    log.info("Схема приведена к последней ревизии")
 
 
 async def _autocall_sync_loop() -> None:
@@ -143,6 +166,17 @@ async def _bbc_refresh_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # Схема — первым делом, до всего остального.
+    #
+    # В контейнере миграции гоняет ENTRYPOINT (backend/Dockerfile), и там этот
+    # вызов — повторный и почти бесплатный: `upgrade head` на актуальной базе
+    # стоит один запрос. А вот локально их не гонял никто: разработчик
+    # запускает `uv run python main.py`, минуя ENTRYPOINT. Из-за этого рабочая
+    # база отставала от кода на две ревизии, и таблиц журнала касаний в ней
+    # просто не было. Один вызов здесь избавляет от целого класса «у меня не
+    # воспроизводится».
+    _run_migrations()
+
     # Warm up Smart NLP Correction Engine (fails silently if models unavailable)
     try:
         from app.services import smart_correction_service
