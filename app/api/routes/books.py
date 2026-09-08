@@ -116,21 +116,45 @@ def get_table(
     # Страницами продолжают ходить карточки — им хватает 250 за раз.
     limit: int = Query(default=100, le=10000),
     offset: int = Query(default=0, ge=0),
-    # «recent» — порядок для ввода: свежее сверху. Без него запись, добавленная
-    # через форму, оказывалась в конце книги и человеку не показывалась.
-    order: str = Query(default="position", pattern="^(position|recent)$"),
+    # Три порядка, каждый под свою поверхность:
+    #   position — порядок самой книги, для таблицы;
+    #   date     — хроникой по дате операции, для карточек;
+    #   recent   — по времени правки, для «что я только что вводил».
+    order: str = Query(default="position", pattern="^(position|date|recent)$"),
     # Поиск по всей вкладке. Пока его не было, фильтровать умел только фронт —
     # по тем строкам, что уже приехали, и отвечал неполной правдой.
     q: str = Query(default="", max_length=200),
+    # Отборы вида «роль:значение», например `f=firm:ТОО "BBC HR"`. Именно роль,
+    # а не имя колонки: у следующей компании колонка называется иначе, а фирма
+    # остаётся фирмой. Двоеточие делит по первому вхождению — в значениях оно
+    # встречается, в ключах ролей нет.
+    f: list[str] = Query(default=[]),
+    since: str = Query(default="", max_length=10),
+    until: str = Query(default="", max_length=10),
     user=Depends(require_user),
 ) -> dict[str, Any]:
     with books_session() as session:
         table = _table(session, table_id)
         fields, _ = service.suggest_for_table(session, table)
-        page = service.list_rows(
-            session, table_id, limit=limit, offset=offset,
-            newest_first=order == "recent", query=q,
-        )
+        try:
+            page = service.list_rows(
+                session, table_id, limit=limit, offset=offset,
+                newest_first=order == "recent",
+                by_date=order == "date",
+                query=q,
+                filters=[
+                    (part.split(":", 1)[0], part.split(":", 1)[1])
+                    for part in f
+                    if ":" in part
+                ],
+                since=since,
+                until=until,
+            )
+        except ValueError as exc:
+            # Дата пришла не датой. Отказ вместо тихого игнорирования: молча
+            # выброшенный отбор показал бы человеку всю книгу как ответ на его
+            # запрос за август.
+            raise HTTPException(status_code=400, detail=f"Неверная дата: {exc}") from exc
         return {
             "table": {
                 "id": str(table.id),
@@ -153,6 +177,10 @@ def get_table(
                 for f in fields
             ],
             "bindings": service.bindings_of(session, table_id),
+            # Чем можно отобрать: величина, её подпись и значения, которые
+            # реально встречаются в книге. Собирается по привязанным колонкам,
+            # поэтому у другой компании отборы получатся свои, без правки кода.
+            "facets": service.facets_of(session, table_id),
             # Подписи ролей по-русски. Без них в шапку грида уезжали ключи
             # вида `entry_date` — английское слово посреди русских названий.
             # В этом продукте так уже случалось, и заметил это не разработчик.

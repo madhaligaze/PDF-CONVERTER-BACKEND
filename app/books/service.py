@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any, Sequence
 from uuid import UUID
 
@@ -1096,6 +1096,12 @@ def row_payload(row: BookRow) -> dict[str, Any]:
     }
 
 
+#: Роль, по которой книга читается как хроника. Дата операции, а не дата
+#: правки: журнал ведут по дням, и «когда это случилось» — единственный
+#: порядок, в котором он читается человеком.
+DATE_ROLE = "entry_date"
+
+
 def list_rows(
     session: Session,
     table_id: UUID,
@@ -1103,7 +1109,11 @@ def list_rows(
     limit: int = 100,
     offset: int = 0,
     newest_first: bool = False,
+    by_date: bool = False,
     query: str = "",
+    filters: Sequence[tuple[str, str]] = (),
+    since: str = "",
+    until: str = "",
 ) -> dict[str, Any]:
     """Страница строк вкладки.
 
@@ -1136,16 +1146,120 @@ def list_rows(
             )
         )
 
+    # Отборы по величинам — через проекцию: там значения уже разобраны по типам,
+    # и «Фирма = ТОО "BBC HR"» означает одно и то же независимо от того, как
+    # называется колонка в этой книге. Каждый отбор — отдельное EXISTS, то есть
+    # условия складываются: фирма И счёт, а не фирма ИЛИ счёт.
+    for role_key, value in filters:
+        if not role_key or not value:
+            continue
+        where.append(
+            # `literal(1)`, а не колонка: у проекции составной ключ, и
+            # «какую колонку выбрать» здесь вопрос без смысла — EXISTS
+            # интересует только наличие строки.
+            select(sa.literal(1))
+            .where(
+                RowFact.row_id == BookRow.id,
+                RowFact.role_key == role_key,
+                RowFact.text_value == value,
+            )
+            .exists()
+        )
+
+    if since or until:
+        bounds = [RowFact.row_id == BookRow.id, RowFact.role_key == DATE_ROLE]
+        if since:
+            bounds.append(RowFact.date_value >= date.fromisoformat(since))
+        if until:
+            bounds.append(RowFact.date_value <= date.fromisoformat(until))
+        where.append(select(sa.literal(1)).where(*bounds).exists())
+
     total = session.scalar(select(func.count(BookRow.id)).where(*where))
-    order = (
-        (BookRow.updated_at.desc(), BookRow.position.desc())
-        if newest_first
-        else (BookRow.position,)
-    )
-    rows = session.scalars(
-        select(BookRow).where(*where).order_by(*order).limit(limit).offset(offset)
-    ).all()
+
+    statement = select(BookRow).where(*where)
+    if by_date:
+        # Хроникой, а не по времени правки. Порядок «свежие сверху» брал
+        # `updated_at`, и для импортированной книги это порядок случайный:
+        # 3 августа, 27 июля, 20 июля, 4 августа подряд. Человек видел
+        # разброс и не мог понять, по какому правилу это разложено.
+        #
+        # Строки без даты уходят вниз: у них нет места в хронике, и ставить их
+        # первыми значило бы прятать за ними всё остальное.
+        entry = (
+            select(RowFact.date_value)
+            .where(RowFact.row_id == BookRow.id, RowFact.role_key == DATE_ROLE)
+            .limit(1)
+            .scalar_subquery()
+        )
+        statement = statement.order_by(
+            sa.case((entry.is_(None), 1), else_=0),
+            entry.desc(),
+            BookRow.position.desc(),
+        )
+    elif newest_first:
+        statement = statement.order_by(BookRow.updated_at.desc(), BookRow.position.desc())
+    else:
+        statement = statement.order_by(BookRow.position)
+
+    rows = session.scalars(statement.limit(limit).offset(offset)).all()
     return {"total": total or 0, "rows": [row_payload(row) for row in rows]}
+
+
+#: По каким величинам предлагаем отбирать и в каком порядке.
+#:
+#: Список короткий намеренно. Отобрать в журнале можно по чему угодно, но
+#: экран, где выпадающих списков больше, чем строк на нём помещается, не
+#: помогает выбрать — он заставляет читать. Это те четыре, по которым в книге
+#: спрашивают: чья операция, по какому счёту, за что и на что.
+FILTER_ROLES: tuple[str, ...] = ("firm", "account", "category", "subcategory")
+
+#: Больше этого значений в список не кладём: длинный выпадающий список хуже
+#: поиска, а поиск по книге и так есть.
+FACET_LIMIT = 60
+
+
+def facets_of(session: Session, table_id: UUID) -> list[dict[str, Any]]:
+    """Чем можно отобрать книгу: величина, её подпись и встречающиеся значения.
+
+    Значения берутся из самой книги, а не из справочника: в журнале живут те
+    счета и фирмы, которые в нём есть, и предлагать человеку выбрать то, чего
+    в книге нет, значит показать ему пустой ответ и оставить гадать почему.
+
+    Считается по `row_facts` — то есть по разобранным значениям привязанных
+    колонок. Поэтому у другой компании отборы получатся свои, без правки кода:
+    как только её «Организация» привязана к роли «фирма», она здесь появится.
+    """
+    titles = {item.key: item.title for item in role_catalog.all_roles()}
+    bound = set(bindings_of(session, table_id).values())
+
+    facets: list[dict[str, Any]] = []
+    for role_key in FILTER_ROLES:
+        if role_key not in bound:
+            continue
+        values = session.scalars(
+            select(RowFact.text_value)
+            .where(
+                RowFact.table_id == table_id,
+                RowFact.role_key == role_key,
+                RowFact.text_value.is_not(None),
+                RowFact.text_value != "",
+            )
+            .distinct()
+            .order_by(RowFact.text_value)
+            .limit(FACET_LIMIT + 1)
+        ).all()
+        # Отбор из одного значения ничего не отбирает: он показывает ту же
+        # книгу и занимает место, где человек ищет, чем сузить. Такой не
+        # предлагаем — в пилотном журнале это «Категория: Доходы».
+        #
+        # Верхняя граница с другой стороны: список длиннее шестидесяти строк
+        # хуже поиска, а поиск по книге и так есть.
+        if len(values) < 2 or len(values) > FACET_LIMIT:
+            continue
+        facets.append(
+            {"role": role_key, "title": titles.get(role_key, role_key), "values": values}
+        )
+    return facets
 
 
 def save_row(
@@ -1276,6 +1390,7 @@ __all__ = [
     "books_session",
     "delete_row",
     "ensure_workspace",
+    "facets_of",
     "field_usage",
     "learned_synonyms",
     "list_books",
