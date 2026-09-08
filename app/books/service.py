@@ -26,9 +26,10 @@ from sqlalchemy.orm import Session
 
 from app.books import roles as role_catalog
 from app.books.db import books_session
-from app.books.discover import discover_fields
+from app.books.discover import discover_fields, slugify, unique_key
 from app.books.ingest import Plan, SourceRow, meaningful_rows, merge, propose_identity
 from app.books.models import (
+    FIELD_TYPES,
     POSITION_STEP,
     Binding,
     Book,
@@ -277,11 +278,228 @@ def sync_fields(
         result.append(row)
 
     for key, row in existing.items():
-        if key not in seen and row.deleted_at is None:
+        # Колонку, заведённую у нас, импорт не трогает: в листе Google её нет и
+        # не будет, а «нет в листе» для неё не значит «удалили». Без этой
+        # проверки первое же повторное чтение книги прятало бы всё, что
+        # добавили руками, — молча и целиком.
+        if key not in seen and row.deleted_at is None and row.origin != "app":
             row.deleted_at = datetime.now(UTC)
 
     session.flush()
     return result, header_row
+
+
+# ── Колонки, заведённые в приложении ─────────────────────────────────────────
+#
+# Книга должна жить дальше без Google: раз в ней завели новый вид расхода,
+# колонку под него надо добавить здесь, а не идти в чужую таблицу. Поэтому
+# состав колонок — правда, которую можно менять, а не слепок импорта.
+
+
+def _fields_of(session: Session, table_id: UUID) -> list[BookField]:
+    return list(
+        session.scalars(
+            select(BookField)
+            .where(BookField.table_id == table_id)
+            .order_by(BookField.position)
+        )
+    )
+
+
+def add_field(
+    session: Session,
+    table: BookTable,
+    *,
+    title: str,
+    type: str = "text",
+    after: str | None = None,
+    actor: str = "",
+) -> BookField:
+    """Завести колонку. `after` — ключ той, следом за которой встать.
+
+    Удалённая колонка с тем же ключом не создаётся заново, а возвращается к
+    жизни. Значения из неё никуда не девались (они лежат в `rows.values`), и
+    завести рядом вторую с ключом `summa_2` значило бы оставить старые числа
+    висеть в невидимой колонке.
+    """
+    name = clean(title)
+    if not name:
+        raise BooksError("У колонки должно быть название")
+    if type not in FIELD_TYPES:
+        raise BooksError(f"Неизвестный тип колонки: {type}")
+
+    fields = _fields_of(session, table.id)
+
+    # Ключ ищем по «естественному» написанию, не уникализируя: колонка с таким
+    # ключом могла быть удалена, и тогда её надо вернуть, а не завести рядом
+    # вторую. Значения-то никуда не делись — они лежат в `rows.values` под этим
+    # самым ключом, и `summa_2` оставила бы прежние числа в невидимой колонке.
+    natural = slugify(name)
+    revived = next(
+        (f for f in fields if f.deleted_at is not None and f.key == natural), None
+    )
+    if revived is None:
+        # Ключ не должен совпасть ни с одним существующим, включая удалённые:
+        # уникальность `(table_id, key)` проверяет база.
+        key = unique_key(name, len(fields), {f.key for f in fields})
+
+    field = revived or BookField(
+        workspace_id=table.workspace_id,
+        table_id=table.id,
+        key=key,
+        origin="app",
+    )
+    field.title = name
+    field.type = type
+    field.deleted_at = None
+    field.names = list(dict.fromkeys([*(field.names or []), name]))
+    if revived is None:
+        session.add(field)
+
+    _place(session, table.id, field, _slot(session, table.id, field, after, last=True))
+    session.flush()
+    log.info("books: колонка %r заведена в таблице %s (%s)", name, table.id, actor)
+    return field
+
+
+def _slot(
+    session: Session,
+    table_id: UUID,
+    field: BookField,
+    after: str | None,
+    *,
+    last: bool,
+) -> int:
+    """Куда встать: следом за `after`, а без него — как скажет `last`.
+
+    Отсутствие соседа означает разное у разных операций, и молчаливого общего
+    умолчания тут быть не может. Заводя колонку без указания места, человек
+    ждёт её в конце — так дописывают столбец в любой таблице. Перетаскивая
+    колонку «никуда», он ведёт её в самое начало: иначе первую позицию занять
+    было бы нечем.
+    """
+    others = [f for f in _fields_of(session, table_id) if f.id != field.id]
+    if after:
+        found = next((index for index, f in enumerate(others) if f.key == after), None)
+        if found is not None:
+            return found + 1
+    return len(others) if last else 0
+
+
+def _place(session: Session, table_id: UUID, field: BookField, at: int) -> None:
+    """Поставить колонку на место `at` и перенумеровать соседей.
+
+    Позиции идут подряд, без промежутков: колонок в книге десятки, а не тысячи,
+    и перенумеровать их целиком дешевле, чем заводить арифметику разрежённых
+    позиций ради операции, которая случается раз в месяц.
+    """
+    others = [f for f in _fields_of(session, table_id) if f.id != field.id]
+    others.insert(max(0, min(at, len(others))), field)
+    for position, item in enumerate(others):
+        item.position = position
+
+
+def update_field(
+    session: Session,
+    table: BookTable,
+    key: str,
+    *,
+    title: str | None = None,
+    type: str | None = None,
+    after: str | None = None,
+    move: bool = False,
+    actor: str = "",
+) -> BookField:
+    """Переименовать колонку, сменить её тип или подвинуть.
+
+    Ключ при переименовании не меняется, и это главное свойство операции. Ключом
+    адресованы значения во всех строках, привязка к роли и настройки; менять его
+    вслед за заголовком значило бы переписать `rows.values` у всей книги ради
+    исправленной опечатки. Прежнее написание уходит в `names`, чтобы повторный
+    импорт узнал колонку под старым именем.
+    """
+    field = next(
+        (f for f in _fields_of(session, table.id) if f.key == key and f.deleted_at is None),
+        None,
+    )
+    if field is None:
+        raise BooksError("Колонка не найдена")
+
+    if title is not None:
+        name = clean(title)
+        if not name:
+            raise BooksError("У колонки должно быть название")
+        if name != field.title:
+            field.names = list(dict.fromkeys([*(field.names or []), field.title, name]))
+            field.title = name
+
+    if type is not None:
+        if type not in FIELD_TYPES:
+            raise BooksError(f"Неизвестный тип колонки: {type}")
+        field.type = type
+
+    if move:
+        _place(session, table.id, field, _slot(session, table.id, field, after, last=False))
+
+    session.flush()
+    log.info("books: колонка %r изменена в таблице %s (%s)", key, table.id, actor)
+    return field
+
+
+def field_usage(session: Session, table_id: UUID, key: str) -> int:
+    """Сколько строк книги реально что-то держат в этой колонке.
+
+    Нужно до удаления, а не после: «удалить колонку» и «удалить колонку и 3128
+    заполненных значений» — разные решения, и второе человек должен принимать,
+    зная число.
+    """
+    rows = session.scalars(
+        select(BookRow).where(BookRow.table_id == table_id, BookRow.deleted_at.is_(None))
+    )
+    return sum(1 for row in rows if clean(str((row.values or {}).get(key, ""))))
+
+
+def remove_field(
+    session: Session, table: BookTable, key: str, *, actor: str = ""
+) -> int:
+    """Убрать колонку. Значения остаются в строках, но перестают быть видны.
+
+    Удаление мягкое, и это не осторожность ради осторожности. Значения живут в
+    `rows.values` под ключом колонки; вычистить их — необратимая правка всех
+    трёх с половиной тысяч строк ради операции, которую делают мышью и часто по
+    ошибке. Помеченная удалённой колонка исчезает из таблицы, из карточек и из
+    расчётов, а вернуть её — это снова «Добавить колонку» с тем же названием.
+
+    Что удаляется по-настоящему — привязка к роли и проекция в `row_facts`:
+    и то и другое производное, и держать их для невидимой колонки нельзя, иначе
+    дашборд продолжит считать по колонке, которой на экране нет.
+    """
+    field = next(
+        (f for f in _fields_of(session, table.id) if f.key == key and f.deleted_at is None),
+        None,
+    )
+    if field is None:
+        raise BooksError("Колонка не найдена")
+
+    hidden = field_usage(session, table.id, key)
+    binding = session.scalar(
+        select(Binding).where(Binding.table_id == table.id, Binding.field_id == field.id)
+    )
+    if binding is not None:
+        session.execute(
+            delete(RowFact).where(
+                RowFact.table_id == table.id, RowFact.role_key == binding.role_key
+            )
+        )
+        session.delete(binding)
+
+    field.deleted_at = datetime.now(UTC)
+    session.flush()
+    log.info(
+        "books: колонка %r убрана из таблицы %s, скрыто значений: %d (%s)",
+        key, table.id, hidden, actor,
+    )
+    return hidden
 
 
 def field_views(fields: Sequence[BookField]) -> list[FieldView]:
@@ -1050,6 +1268,7 @@ def delete_row(
 
 __all__ = [
     "BooksError",
+    "add_field",
     "ImportPreview",
     "apply_import",
     "board",
@@ -1057,12 +1276,14 @@ __all__ = [
     "books_session",
     "delete_row",
     "ensure_workspace",
+    "field_usage",
     "learned_synonyms",
     "list_books",
     "list_rows",
     "persist_suggestions",
     "preview_import",
     "rebuild_facts",
+    "remove_field",
     "rebuild_row_facts",
     "row_payload",
     "save_row",
@@ -1070,4 +1291,5 @@ __all__ = [
     "set_binding",
     "suggest_for_table",
     "sync_fields",
+    "update_field",
 ]

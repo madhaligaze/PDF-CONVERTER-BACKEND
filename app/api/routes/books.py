@@ -25,7 +25,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from app.bbc.deps import require_user
+from app.bbc.deps import require_admin, require_user
 from app.books import roles as role_catalog, service
 from app.books.config import books_settings
 from app.books.db import books_session
@@ -111,7 +111,10 @@ def list_books(user=Depends(require_user)) -> dict[str, Any]:
 @router.get("/tables/{table_id}")
 def get_table(
     table_id: UUID,
-    limit: int = Query(default=100, le=500),
+    # Потолок поднят под таблицу: Univer показывает книгу целиком, а не
+    # страницами, и 3632 строки уезжают одним ответом (2,4 МБ, секунда).
+    # Страницами продолжают ходить карточки — им хватает 250 за раз.
+    limit: int = Query(default=100, le=10000),
     offset: int = Query(default=0, ge=0),
     # «recent» — порядок для ввода: свежее сверху. Без него запись, добавленная
     # через форму, оказывалась в конце книги и человеку не показывалась.
@@ -158,6 +161,93 @@ def get_table(
             },
             **page,
         }
+
+
+# ── Колонки книги ────────────────────────────────────────────────────────────
+#
+# Менять состав колонок может только администратор, и это не осторожность ради
+# осторожности: колонка — общая для всех, кто ведёт книгу. Сотрудник, убравший
+# «Проект», убрал бы его у всех и заодно из расчётов дашборда.
+
+
+class FieldRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    type: str = Field(default="text", max_length=20)
+    #: Ключ колонки, следом за которой встать. Пусто — в конец.
+    after: str | None = Field(default=None, max_length=200)
+
+
+@router.post("/tables/{table_id}/fields")
+def add_field(
+    table_id: UUID, request: FieldRequest, user=Depends(require_admin)
+) -> dict[str, Any]:
+    with books_session() as session:
+        table = _table(session, table_id)
+        try:
+            field = service.add_field(
+                session,
+                table,
+                title=request.title,
+                type=request.type,
+                after=request.after,
+                actor=_actor(user),
+            )
+        except service.BooksError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"key": field.key, "title": field.title, "type": field.type,
+                "position": field.position}
+
+
+class FieldPatch(BaseModel):
+    title: str | None = Field(default=None, max_length=200)
+    type: str | None = Field(default=None, max_length=20)
+    after: str | None = Field(default=None, max_length=200)
+    #: Двигать ли колонку. Отдельным признаком, потому что `after: null` —
+    #: это осмысленное «в самое начало», а не «не трогай порядок».
+    move: bool = False
+
+
+@router.patch("/tables/{table_id}/fields/{key}")
+def update_field(
+    table_id: UUID, key: str, request: FieldPatch, user=Depends(require_admin)
+) -> dict[str, Any]:
+    with books_session() as session:
+        table = _table(session, table_id)
+        try:
+            field = service.update_field(
+                session,
+                table,
+                key,
+                title=request.title,
+                type=request.type,
+                after=request.after,
+                move=request.move,
+                actor=_actor(user),
+            )
+        except service.BooksError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        service.rebuild_facts(session, table_id)
+        return {"key": field.key, "title": field.title, "type": field.type,
+                "position": field.position}
+
+
+@router.get("/tables/{table_id}/fields/{key}/usage")
+def field_usage(table_id: UUID, key: str, user=Depends(require_admin)) -> dict[str, int]:
+    """Сколько строк держат значение в этой колонке — вопрос перед удалением."""
+    with books_session() as session:
+        _table(session, table_id)
+        return {"filled": service.field_usage(session, table_id, key)}
+
+
+@router.delete("/tables/{table_id}/fields/{key}")
+def remove_field(table_id: UUID, key: str, user=Depends(require_admin)) -> dict[str, int]:
+    with books_session() as session:
+        table = _table(session, table_id)
+        try:
+            hidden = service.remove_field(session, table, key, actor=_actor(user))
+        except service.BooksError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"hidden": hidden}
 
 
 # ── Табло привязок ───────────────────────────────────────────────────────────

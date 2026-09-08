@@ -72,6 +72,10 @@ def _uuid() -> uuid.UUID:
 SOURCE_KINDS = ("google_sheets", "app")
 FIELD_TYPES = ("text", "number", "money", "date", "bool", "enum", "formula", "unknown")
 ROW_ORIGINS = ("source", "app")
+#: Откуда взялась колонка. Те же два слова, что у строк, и по той же причине:
+#: «нашлось в книге» и «завели у нас» — разные вещи, и повторный импорт обязан
+#: их различать.
+FIELD_ORIGINS = ("source", "app")
 ROW_STATES = ("live", "missing_in_source")
 BINDING_CONFIDENCE = ("exact", "squashed", "loose", "data", "manual")
 SYNONYM_SOURCES = ("seed", "learned")
@@ -204,6 +208,7 @@ class BookField(BooksBase):
         sa.UniqueConstraint("id", "workspace_id", name="uq_fields_id_workspace"),
         sa.UniqueConstraint("table_id", "key", name="uq_fields_table_key"),
         sa.CheckConstraint(_in("type", FIELD_TYPES), name="type"),
+        sa.CheckConstraint(_in("origin", FIELD_ORIGINS), name="origin"),
         sa.Index("ix_fields_workspace_id", "workspace_id"),
     )
 
@@ -216,6 +221,14 @@ class BookField(BooksBase):
     title: Mapped[str] = mapped_column(sa.Text)
     type: Mapped[str] = mapped_column(sa.Text, default="unknown")
     position: Mapped[int] = mapped_column(sa.Integer, default=0)
+    #: Откуда взялась колонка: `source` — нашлась в книге при импорте,
+    #: `app` — её завёл человек прямо в таблице.
+    #:
+    #: Различать обязательно. `sync_fields` помечает удалённым всё, чего в
+    #: прочитанном листе не оказалось, — и колонка, заведённая в приложении, в
+    #: листе Google не окажется никогда. Без этого признака первый же повторный
+    #: импорт молча прятал бы всё, что здесь добавили.
+    origin: Mapped[str] = mapped_column(sa.Text, default="source")
     #: Все написания заголовка, которые считаются этим полем. Книгу
     #: переименовывают, и повторный импорт обязан узнать колонку по любому из
     #: прежних имён.
