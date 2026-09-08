@@ -53,6 +53,8 @@ from app.bbc.schemas import (
     BbcLoginRequest,
     BbcMe,
     BbcOk,
+    BbcSession,
+    BbcSessions,
     BbcSetPasswordRequest,
     BbcSheetInfo,
     BbcSnapshot,
@@ -140,6 +142,51 @@ async def auth_logout(request: Request, response: Response) -> BbcOk:
     auth_module.logout(request.cookies.get(SESSION_COOKIE))
     response.delete_cookie(SESSION_COOKIE, path="/")
     return BbcOk(detail="Вы вышли")
+
+
+# ── Свои заходы ──────────────────────────────────────────────────────────────
+
+
+@router.get("/account/sessions", response_model=BbcSessions)
+async def account_sessions(
+    request: Request, user: AuthedUser = Depends(require_user)
+) -> BbcSessions:
+    """Открытые заходы: свои — всем, чужие — только администратору.
+
+    Кто что видит, решает `auth.list_sessions`, а не этот обработчик. Правило
+    видимости, размазанное по маршрутам, однажды будет в одном из них забыто, и
+    выглядеть это будет как работающий экран.
+    """
+    return BbcSessions(
+        sessions=[
+            BbcSession(**row)
+            for row in auth_module.list_sessions(
+                user, current_token=request.cookies.get(SESSION_COOKIE)
+            )
+        ]
+    )
+
+
+@router.delete("/account/sessions/{session_id}", response_model=BbcOk)
+async def end_account_session(
+    session_id: str,
+    request: Request,
+    response: Response,
+    user: AuthedUser = Depends(require_user),
+) -> BbcOk:
+    try:
+        was_current = auth_module.end_session(
+            user, session_id, current_token=request.cookies.get(SESSION_COOKIE)
+        )
+    except AuthError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    # Оборвали свой текущий заход — значит вышли. Cookie убираем здесь же,
+    # иначе браузер продолжит слать мёртвый токен, а форму входа человек
+    # увидит только после следующего запроса и не поймёт, что произошло.
+    if was_current:
+        response.delete_cookie(SESSION_COOKIE, path="/")
+    return BbcOk(detail="Заход завершён")
 
 
 @router.get("/me", response_model=BbcMe)

@@ -233,6 +233,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Сессия дашборда продлевается на каждом обращении — иначе cookie в браузере
+# умирает раньше, чем сессия в базе, и человек, работающий каждый день, всё
+# равно однажды утром видит форму входа. См. `app/bbc/middleware.py`.
+from app.bbc.config import bbc_settings as _bbc_settings  # noqa: E402
+
+if _bbc_settings.enabled:
+    from app.bbc.middleware import keep_session_cookie
+
+    app.middleware("http")(keep_session_cookie)
+
 app.include_router(api_router, prefix=settings.api_v1_prefix)
 
 # MCP-коннектор для Claude (удаляемый модуль). Подключается на уровне

@@ -20,7 +20,14 @@ LINK_HEADER = "X-BBC-Link"
 
 
 def current_user(request: Request) -> AuthedUser | None:
-    return resolve_session(request.cookies.get(SESSION_COOKIE))
+    user = resolve_session(request.cookies.get(SESSION_COOKIE))
+    if user is not None:
+        # Отметка для прослойки `bbc.middleware`: она продлит cookie ровно
+        # тогда, когда сессия действительно жива. Держать это здесь, а не
+        # спрашивать базу второй раз в прослойке, — единственное чтение сессии
+        # на запрос остаётся единственным.
+        request.state.bbc_session_alive = True
+    return user
 
 
 def current_scope(

@@ -219,3 +219,34 @@ class BbcLink(BaseModel):
 class BbcOk(BaseModel):
     ok: bool = True
     detail: str | None = None
+
+
+class BbcSession(BaseModel):
+    """Один открытый заход — как он выглядит в кабинете.
+
+    `user_agent` отдаётся вместе с разобранным `device` намеренно. Разбор —
+    догадка по строке, которую браузер сообщает о себе сам; когда он говорит
+    «неизвестное устройство», человеку нужно чем-то это перепроверить, иначе
+    решение «мой это заход или чужой» принимать не по чему.
+    """
+
+    id: str
+    user_id: int
+    username: str = ""
+    full_name: str = ""
+    role: str = ""
+    #: Заход этого же человека. У сотрудника всегда true, у админа — не всегда.
+    mine: bool = False
+    #: Тот самый заход, из которого пришёл запрос. Его завершать — выйти.
+    current: bool = False
+    device: str = ""
+    mobile: bool = False
+    user_agent: str = ""
+    ip: str = ""
+    created_at: str | None = None
+    last_seen_at: str | None = None
+    expires_at: str | None = None
+
+
+class BbcSessions(BaseModel):
+    sessions: list[BbcSession] = []

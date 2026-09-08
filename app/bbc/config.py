@@ -108,8 +108,17 @@ class BbcSettings(BaseSettings):
         default="",
         validation_alias=AliasChoices("BBC_MSFO_SPREADSHEET_ID"),
     )
+    # Сколько сессия живёт БЕЗ ОБРАЩЕНИЙ. Окно сдвигается на каждом запросе
+    # (см. `auth.resolve_session`), поэтому это не «сколько можно работать», а
+    # «сколько можно не заходить».
+    #
+    # Было 12 часов и отсчитывалось от входа: человека выбрасывало на форму
+    # посреди рабочего дня, а в понедельник — всегда, потому что с пятницы
+    # проходило больше. 30 суток означают, что тот, кто заходит хотя бы раз в
+    # месяц, формы входа не видит вовсе, а забытая сессия на чужом ноутбуке
+    # всё же умирает сама. Оборвать её раньше можно из кабинета.
     session_ttl_hours: float = Field(
-        default=12.0,
+        default=24.0 * 30,
         validation_alias=AliasChoices("BBC_SESSION_TTL_HOURS"),
     )
     # Read once, only while bbc.users is empty; ignored afterwards.

@@ -93,7 +93,7 @@ BBC_SALES_SPREADSHEET_ID=
 BBC_OMIP_SPREADSHEET_ID=
 BBC_SERVICE_ACCOUNT_JSON=bbc-sheets.json   # путь (относительный — от корня репо) ИЛИ сам JSON
 BBC_POLL_INTERVAL_SECONDS=15               # фоновый live-цикл; 0 = выключить
-BBC_SESSION_TTL_HOURS=12
+BBC_SESSION_TTL_HOURS=720                 # сколько сессия живёт БЕЗ обращений (окно сдвигается)
 BBC_PUBLIC_BASE_URL=                       # база для реферальных ссылок
 BBC_BOOTSTRAP_ADMIN=                       # читается один раз, пока bbc.users пуста
 BBC_BOOTSTRAP_PASSWORD=

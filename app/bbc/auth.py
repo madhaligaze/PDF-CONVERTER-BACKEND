@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from app.bbc.config import bbc_settings
 from app.bbc.db import bbc_session
+from app.bbc.devices import describe_device, is_mobile
 from app.bbc.models import BbcUser, BbcUserSession
 
 log = logging.getLogger(__name__)
@@ -204,19 +205,101 @@ def login(username: str, password: str, *, ip: str | None = None, user_agent: st
                 id=secrets.token_hex(16),
                 user_id=user.id,
                 token_hash=hash_token(token),
-                expires_at=datetime.now(UTC) + timedelta(hours=bbc_settings.session_ttl_hours),
+                expires_at=datetime.now(UTC) + session_window(),
                 ip=ip,
                 user_agent=(user_agent or "")[:255] or None,
             )
         )
+        session.flush()
+        _trim_sessions(session, user.id, keep=hash_token(token))
         return token
 
 
+#: Сколько заходов одной учётки держим живыми одновременно.
+#:
+#: Ограничение появилось из-за списка в кабинете. Вход создаёт запись, а
+#: браузер, который больше не вернулся, её не закрывает: cookie у него уже
+#: другая, а строка живёт весь свой срок. Пока срок был 12 часов, такие
+#: строки исчезали сами и никто их не видел. С окном в 30 суток список
+#: превратился в полсотни одинаковых «Chrome на Windows» — и чужое устройство,
+#: ради которого экран и сделан, в нём стало не найти.
+MAX_LIVE_SESSIONS = 10
+
+
+def _trim_sessions(session: Session, user_id: int, *, keep: str) -> int:
+    """Оставить десять заходов; `keep` — хэш только что выданного, он неприкосновенен.
+
+    Что здесь важно
+    ───────────────
+    1. **Только что созданный заход не трогаем.** Это cookie, которую человек
+       получает прямо сейчас; выкинуть её значит не пустить его туда, куда он
+       только что вошёл.
+
+    2. **Сначала выкидываем те, которыми ни разу не воспользовались.** Заход
+       без единого обращения после входа — это выданная и забытая cookie:
+       браузер за ней не вернулся. Из всех записей она значит меньше всего.
+
+    3. **Дальше — по последнему обращению, а не по времени входа.** Выкидывать
+       надо забытые, а не старые: ноутбук, на котором работают каждый день
+       полгода, — самый «старый» по входу, и считай мы по нему, вылетал бы
+       именно он.
+
+    Пункт 2 появился не из рассуждения. Без него проверка «долго работающее
+    устройство переживает уборку» падала: заход, которым пользовались, и
+    десяток свежих, которыми не пользовались, получали одинаковую отметку
+    времени с точностью до секунды, и кого из них считать свежее — решал
+    случай.
+
+    Выкинуть лишнего не страшно: человек войдёт заново. Обратная ошибка —
+    оставить живым заход, о котором никто не помнит, — стоит дороже.
+    """
+    long_ago = datetime.min.replace(tzinfo=UTC)
+
+    def freshness(record: BbcUserSession) -> tuple[bool, datetime]:
+        seen = _aware(record.last_seen_at)
+        return (seen is not None, seen or _aware(record.created_at) or long_ago)
+
+    others = [
+        record
+        for record in session.scalars(
+            select(BbcUserSession).where(BbcUserSession.user_id == user_id)
+        )
+        if record.token_hash != keep
+    ]
+    others.sort(key=freshness, reverse=True)
+
+    doomed = others[MAX_LIVE_SESSIONS - 1 :]
+    for record in doomed:
+        session.delete(record)
+    return len(doomed)
+
+
+def session_window() -> timedelta:
+    """Сколько сессия живёт без обращений.
+
+    Не «сколько живёт вообще»: окно сдвигается на каждом запросе, поэтому тот,
+    кто заходит в дашборд каждый день, не встречает форму входа никогда, а
+    забытая сессия на чужом ноутбуке умирает сама.
+    """
+    return timedelta(hours=bbc_settings.session_ttl_hours)
+
+
 def resolve_session(token: str | None) -> AuthedUser | None:
-    """Return the user behind a cookie token, or None when it is absent/expired."""
+    """Return the user behind a cookie token, or None when it is absent/expired.
+
+    Заодно продлевает сессию. Раньше срок жизни отсчитывался от входа: ровно
+    через `BBC_SESSION_TTL_HOURS` человека выбрасывало на форму входа посреди
+    работы, независимо от того, что он всё это время в дашборде и сидел.
+    Теперь окно отсчитывается от последнего обращения.
+
+    Продление пишется в базу не на каждый запрос, а когда израсходована
+    половина окна. Иначе каждый опрос дашборда — а он опрашивает сам —
+    превращался бы в запись в таблицу сессий.
+    """
     if not token:
         return None
     now = datetime.now(UTC)
+    window = session_window()
     with bbc_session() as session:
         record = session.scalar(
             select(BbcUserSession).where(BbcUserSession.token_hash == hash_token(token))
@@ -226,10 +309,13 @@ def resolve_session(token: str | None) -> AuthedUser | None:
         if _expired(record.expires_at, now):
             session.delete(record)
             return None
-        record.last_seen_at = now
         user = session.get(BbcUser, record.user_id)
         if user is None or not user.is_active:
             return None
+
+        record.last_seen_at = now
+        if _left(record.expires_at, now) < window / 2:
+            record.expires_at = now + window
         return _snapshot(user)
 
 
@@ -244,13 +330,26 @@ def logout(token: str | None) -> None:
             session.delete(record)
 
 
+def _aware(value: datetime | None) -> datetime | None:
+    """SQLite отдаёт наивные отметки времени; считаем их UTC."""
+    if value is None:
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
 def _expired(expires_at: datetime | None, now: datetime) -> bool:
-    if expires_at is None:
+    moment = _aware(expires_at)
+    if moment is None:
         return False
-    # SQLite hands back naive datetimes; treat those as UTC.
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=UTC)
-    return expires_at <= now
+    return moment <= now
+
+
+def _left(expires_at: datetime | None, now: datetime) -> timedelta:
+    """Сколько осталось до конца окна. Бессрочная сессия — «очень много»."""
+    moment = _aware(expires_at)
+    if moment is None:
+        return timedelta.max
+    return moment - now
 
 
 # ── Credential changes ───────────────────────────────────────────────────────────
@@ -297,6 +396,106 @@ def change_credentials(
         user.updated_at = datetime.now(UTC)
 
 
+# ── История заходов ──────────────────────────────────────────────────────────
+
+
+def list_sessions(viewer: AuthedUser, current_token: str | None = None) -> list[dict]:
+    """Живые сессии, которые этому человеку положено видеть.
+
+    Правило видимости
+    ─────────────────
+    Администратор видит заходы сотрудников: это его работа — заметить, что в
+    учётку бухгалтера кто-то зашёл с незнакомого устройства, и оборвать заход.
+    Сотрудник видит только свои. Обратное направление закрыто намеренно:
+    список админских сессий — это карта того, откуда и когда приходит человек с
+    полным доступом, и выдавать её каждому сотруднику незачем.
+
+    Отсюда же следует, что фильтр стоит здесь, а не в маршруте. Забыть его в
+    одном из двух обработчиков — значит открыть список целиком, и ошибка эта
+    выглядела бы как работающий экран.
+
+    Просроченные не показываем: это список того, что прямо сейчас открыто, а не
+    журнал за всё время. Их подчищает `purge_expired_sessions`, но между
+    уборками они лежат в таблице и в ответе выглядели бы как живой заход.
+    """
+    now = datetime.now(UTC)
+    wanted = hash_token(current_token) if current_token else None
+
+    with bbc_session() as session:
+        query = select(BbcUserSession)
+        if not viewer.is_admin:
+            query = query.where(BbcUserSession.user_id == viewer.id)
+
+        records = [
+            record
+            for record in session.scalars(query)
+            if not _expired(record.expires_at, now)
+        ]
+        names = {
+            user.id: user
+            for user in session.scalars(
+                select(BbcUser).where(
+                    BbcUser.id.in_({record.user_id for record in records})
+                )
+            )
+        }
+
+        rows = [
+            {
+                "id": record.id,
+                "user_id": record.user_id,
+                "username": getattr(names.get(record.user_id), "username", ""),
+                "full_name": getattr(names.get(record.user_id), "full_name", "") or "",
+                "role": getattr(names.get(record.user_id), "role", ""),
+                "mine": record.user_id == viewer.id,
+                "current": wanted is not None and record.token_hash == wanted,
+                "device": describe_device(record.user_agent),
+                "mobile": is_mobile(record.user_agent),
+                "user_agent": record.user_agent or "",
+                "ip": record.ip or "",
+                "created_at": _iso(record.created_at),
+                "last_seen_at": _iso(record.last_seen_at),
+                "expires_at": _iso(record.expires_at),
+            }
+            for record in records
+        ]
+
+    # Свои сверху, внутри — свежие первыми. Два устойчивых прохода, а не один
+    # составной ключ: по свежести порядок обратный, по «своим» — прямой, и в
+    # одном ключе это пришлось бы выражать через отрицание строки.
+    rows.sort(key=lambda row: row["last_seen_at"] or "", reverse=True)
+    rows.sort(key=lambda row: not row["mine"])
+    return rows
+
+
+def end_session(
+    viewer: AuthedUser, session_id: str, current_token: str | None = None
+) -> bool:
+    """Оборвать заход. Свой — всегда, чужой — только администратору.
+
+    Возвращает, был ли это тот самый заход, из которого пришёл запрос: тогда
+    вызывающему надо ещё и убрать cookie. Отвечает на это здесь, потому что
+    здесь уже известен хэш токена; маршруту пришлось бы лезть в таблицу сессий
+    вторым запросом и знать про её устройство.
+
+    Чужая сессия и несуществующая отвечают одинаково. Сотрудник, перебирающий
+    идентификаторы, иначе узнал бы по разнице ответов, какие из них настоящие,
+    — а это и есть список админских заходов, только собранный по одному.
+    """
+    with bbc_session() as session:
+        record = session.get(BbcUserSession, session_id)
+        if record is None or (not viewer.is_admin and record.user_id != viewer.id):
+            raise AuthError("Сессия не найдена")
+        was_current = bool(current_token) and record.token_hash == hash_token(current_token or "")
+        session.delete(record)
+        return was_current
+
+
+def _iso(value: datetime | None) -> str | None:
+    moment = _aware(value)
+    return moment.isoformat() if moment else None
+
+
 def purge_expired_sessions() -> int:
     """Housekeeping for the background loop. Returns how many were removed."""
     now = datetime.now(UTC)
@@ -313,14 +512,17 @@ __all__ = [
     "AuthError",
     "AuthedUser",
     "change_credentials",
+    "end_session",
     "ensure_bootstrap_admin",
     "hash_password",
     "hash_token",
     "has_any_user",
+    "list_sessions",
     "login",
     "logout",
     "new_token",
     "purge_expired_sessions",
     "resolve_session",
+    "session_window",
     "verify_password",
 ]
