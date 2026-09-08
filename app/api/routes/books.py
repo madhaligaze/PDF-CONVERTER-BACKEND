@@ -116,6 +116,9 @@ def get_table(
     # «recent» — порядок для ввода: свежее сверху. Без него запись, добавленная
     # через форму, оказывалась в конце книги и человеку не показывалась.
     order: str = Query(default="position", pattern="^(position|recent)$"),
+    # Поиск по всей вкладке. Пока его не было, фильтровать умел только фронт —
+    # по тем строкам, что уже приехали, и отвечал неполной правдой.
+    q: str = Query(default="", max_length=200),
     user=Depends(require_user),
 ) -> dict[str, Any]:
     with books_session() as session:
@@ -123,7 +126,7 @@ def get_table(
         fields, _ = service.suggest_for_table(session, table)
         page = service.list_rows(
             session, table_id, limit=limit, offset=offset,
-            newest_first=order == "recent",
+            newest_first=order == "recent", query=q,
         )
         return {
             "table": {
@@ -133,7 +136,17 @@ def get_table(
                 "header_row": table.header_row,
             },
             "fields": [
-                {"key": f.key, "title": f.title, "type": f.type, "position": f.position}
+                {
+                    "key": f.key,
+                    "title": f.title,
+                    "type": f.type,
+                    "position": f.position,
+                    # Готовые значения колонки-списка. Их уже собрал разбор при
+                    # импорте, и до сих пор они лежали мёртвым грузом в
+                    # статистике: человек вбивал «Счет» руками и заводил
+                    # двадцать третий вариант написания там, где их 22.
+                    "options": (f.stats or {}).get("options") or [],
+                }
                 for f in fields
             ],
             "bindings": service.bindings_of(session, table_id),
@@ -299,6 +312,11 @@ class RowRequest(BaseModel):
     version: int | None = None
 
 
+# Сохранение отвечает строкой целиком, а не только её версией. Оба вида держат
+# один список строк в памяти; раньше обновиться после правки можно было только
+# перечитав вкладку — 250 строк по сети на исправленную ячейку.
+
+
 @router.post("/tables/{table_id}/rows")
 def create_row(
     table_id: UUID, request: RowRequest, user=Depends(require_user)
@@ -308,8 +326,8 @@ def create_row(
         row = service.save_row(
             session, table, row_id=None, values=request.values, actor=_actor(user)
         )
-        service.rebuild_facts(session, table_id)
-        return {"id": str(row.id), "version": row.version}
+        service.rebuild_row_facts(session, row)
+        return service.row_payload(row)
 
 
 @router.patch("/tables/{table_id}/rows/{row_id}")
@@ -329,8 +347,26 @@ def update_row(
             )
         except service.BooksError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        service.rebuild_facts(session, table_id)
-        return {"id": str(row.id), "version": row.version}
+        service.rebuild_row_facts(session, row)
+        return service.row_payload(row)
+
+
+@router.delete("/tables/{table_id}/rows/{row_id}")
+def delete_row(
+    table_id: UUID,
+    row_id: UUID,
+    version: int | None = Query(default=None),
+    user=Depends(require_user),
+) -> dict[str, Any]:
+    with books_session() as session:
+        table = _table(session, table_id)
+        try:
+            service.delete_row(
+                session, table, row_id=row_id, version=version, actor=_actor(user)
+            )
+        except service.BooksError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"ok": True}
 
 
 __all__ = ["router"]

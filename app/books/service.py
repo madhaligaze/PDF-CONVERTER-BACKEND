@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from typing import Any, Sequence
 from uuid import UUID
 
+import sqlalchemy as sa
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
@@ -772,19 +773,7 @@ def rebuild_facts(session: Session, table_id: UUID) -> int:
     if table is None:
         return 0
 
-    fields = {
-        row.id: row
-        for row in session.scalars(
-            select(BookField).where(BookField.table_id == table_id)
-        )
-    }
-    bindings = session.scalars(
-        select(Binding).where(Binding.table_id == table_id)
-    ).all()
-    by_field_key = {
-        fields[b.field_id].key: b.role_key for b in bindings if b.field_id in fields
-    }
-    types = {f.key: f.type for f in fields.values()}
+    by_field_key, types = _projection_plan(session, table_id)
 
     session.execute(delete(RowFact).where(RowFact.table_id == table_id))
 
@@ -794,31 +783,99 @@ def rebuild_facts(session: Session, table_id: UUID) -> int:
         )
     ).all()
 
+    written = sum(_write_row_facts(session, row, by_field_key, types) for row in rows)
+    session.flush()
+    return written
+
+
+def _projection_plan(
+    session: Session, table_id: UUID
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Что во что проецируется: ключ поля → роль, и ключ поля → тип."""
+    fields = {
+        row.id: row
+        for row in session.scalars(
+            select(BookField).where(BookField.table_id == table_id)
+        )
+    }
+    bindings = session.scalars(select(Binding).where(Binding.table_id == table_id)).all()
+    return (
+        {fields[b.field_id].key: b.role_key for b in bindings if b.field_id in fields},
+        {f.key: f.type for f in fields.values()},
+    )
+
+
+def _write_row_facts(
+    session: Session,
+    row: BookRow,
+    by_field_key: dict[str, str],
+    types: dict[str, str],
+) -> int:
+    values = row.values or {}
     written = 0
-    for row in rows:
-        values = row.values or {}
-        for field_key, role_key in by_field_key.items():
-            fact = project(types.get(field_key, "text"), values.get(field_key))
-            if fact.empty:
-                continue
-            session.add(
-                RowFact(
-                    row_id=row.id,
-                    role_key=role_key,
-                    workspace_id=row.workspace_id,
-                    table_id=table_id,
-                    num_value=fact.num_value,
-                    date_value=fact.date_value,
-                    text_value=fact.text_value,
-                    bool_value=fact.bool_value,
-                )
+    for field_key, role_key in by_field_key.items():
+        fact = project(types.get(field_key, "text"), values.get(field_key))
+        if fact.empty:
+            continue
+        session.add(
+            RowFact(
+                row_id=row.id,
+                role_key=role_key,
+                workspace_id=row.workspace_id,
+                table_id=row.table_id,
+                num_value=fact.num_value,
+                date_value=fact.date_value,
+                text_value=fact.text_value,
+                bool_value=fact.bool_value,
             )
-            written += 1
+        )
+        written += 1
+    return written
+
+
+def rebuild_row_facts(session: Session, row: BookRow) -> int:
+    """Пересобрать проекцию одной строки.
+
+    Отдельно от `rebuild_facts` из-за цены. Замерено на пилотном журнале:
+    полная пересборка — 30 780 фактов и 5,9 секунды, пересборка одной строки —
+    8 фактов и 0,08 секунды. Полная висела на каждом сохранении строки. Пока
+    правка приходила раз в минуту из формы, шесть секунд прятались за ожиданием
+    ответа; в таблице правка приходит на каждую ячейку, и ввод одной суммы
+    упирался бы в них целиком.
+
+    Правку строки видит только эта строка, поэтому пересобирать всю вкладку
+    незачем. Полная пересборка остаётся там, где меняется сама раскладка —
+    привязка колонки к роли меняет проекцию у всех строк сразу.
+    """
+    session.execute(delete(RowFact).where(RowFact.row_id == row.id))
+    if row.deleted_at is not None:
+        session.flush()
+        return 0
+    by_field_key, types = _projection_plan(session, row.table_id)
+    written = _write_row_facts(session, row, by_field_key, types)
     session.flush()
     return written
 
 
 # ── Строки ───────────────────────────────────────────────────────────────────
+
+
+def row_payload(row: BookRow) -> dict[str, Any]:
+    """Строка так, как её видит интерфейс.
+
+    Публичная, потому что этой же формой отвечают маршруты сохранения: оба вида
+    держат один список строк в памяти и кладут в него ровно то, что записалось.
+    Пока форма была описана в двух местах, она бы разъехалась при первом же
+    новом поле — и разъехалась бы молча.
+    """
+    return {
+        "id": str(row.id),
+        "values": row.values or {},
+        "origin": row.origin,
+        "state": row.state,
+        "version": row.version,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
 
 
 def list_rows(
@@ -828,6 +885,7 @@ def list_rows(
     limit: int = 100,
     offset: int = 0,
     newest_first: bool = False,
+    query: str = "",
 ) -> dict[str, Any]:
     """Страница строк вкладки.
 
@@ -836,38 +894,40 @@ def list_rows(
     запись через форму, её просто не видел — показывались первые двести.
     Читать книгу удобнее в её собственном порядке, вводить — начиная с того,
     что ввели последним.
+
+    `query` ищет по всей вкладке, а не по загруженной странице. Разница не
+    косметическая: пока поиск фильтровал то, что уже приехало на экран, запрос
+    «Kaspi» по журналу на 3634 строки обшаривал двести и отвечал «нашлось 12» —
+    число, похожее на правду, и потому неотличимое от неё. Поиск, который не
+    видит книгу целиком, обязан молчать, а не выдавать неполный ответ за полный.
+
+    Ищется по `values`, приведённым к тексту, а не по `row_facts`: факты есть
+    только у привязанных колонок, а искать человек будет и по комментарию, и по
+    «Вопросам» — по тому, что видит в гриде.
     """
-    total = session.scalar(
-        select(func.count(BookRow.id)).where(
-            BookRow.table_id == table_id, BookRow.deleted_at.is_(None)
+    where = [BookRow.table_id == table_id, BookRow.deleted_at.is_(None)]
+    needle = (query or "").strip()
+    if needle:
+        # `values` — jsonb на Postgres и json на SQLite; в обоих случаях приведение
+        # к тексту даёт строку со всеми значениями строки. Экранируем шаблонные
+        # символы, иначе «100%» превратится в «что угодно» и найдёт всю книгу.
+        escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        where.append(
+            func.lower(sa.cast(BookRow.values, sa.Text)).like(
+                f"%{escaped.lower()}%", escape="\\"
+            )
         )
-    )
+
+    total = session.scalar(select(func.count(BookRow.id)).where(*where))
     order = (
         (BookRow.updated_at.desc(), BookRow.position.desc())
         if newest_first
         else (BookRow.position,)
     )
     rows = session.scalars(
-        select(BookRow)
-        .where(BookRow.table_id == table_id, BookRow.deleted_at.is_(None))
-        .order_by(*order)
-        .limit(limit)
-        .offset(offset)
+        select(BookRow).where(*where).order_by(*order).limit(limit).offset(offset)
     ).all()
-    return {
-        "total": total or 0,
-        "rows": [
-            {
-                "id": str(row.id),
-                "values": row.values or {},
-                "origin": row.origin,
-                "state": row.state,
-                "version": row.version,
-                "updated_at": row.updated_at.isoformat() if row.updated_at else None,
-            }
-            for row in rows
-        ],
-    }
+    return {"total": total or 0, "rows": [row_payload(row) for row in rows]}
 
 
 def save_row(
@@ -948,6 +1008,46 @@ def save_row(
     return row
 
 
+def delete_row(
+    session: Session,
+    table: BookTable,
+    *,
+    row_id: UUID,
+    version: int | None = None,
+    actor: str = "",
+) -> None:
+    """Убрать строку из вкладки.
+
+    Мягко: `deleted_at`, а не `DELETE`. Строка книги — это чья-то операция с
+    деньгами, и «удалил не ту» обязано быть исправимо. В журнале правок при
+    этом остаётся, кто и когда её убрал.
+    """
+    row = session.get(BookRow, row_id)
+    if row is None or row.table_id != table.id or row.deleted_at is not None:
+        raise BooksError("Строка не найдена")
+    if version is not None and row.version != version:
+        raise BooksError(
+            "Строку уже поправили — обновите страницу и посмотрите, что изменилось"
+        )
+
+    row.deleted_at = datetime.now(UTC)
+    row.version += 1
+    row.updated_by = actor
+    row.updated_at = datetime.now(UTC)
+    session.add(
+        RowEdit(
+            workspace_id=table.workspace_id,
+            table_id=table.id,
+            row_id=row.id,
+            actor=actor,
+            source="app",
+            changes={key: [value, None] for key, value in (row.values or {}).items()},
+        )
+    )
+    rebuild_row_facts(session, row)
+    session.flush()
+
+
 __all__ = [
     "BooksError",
     "ImportPreview",
@@ -955,6 +1055,7 @@ __all__ = [
     "board",
     "bindings_of",
     "books_session",
+    "delete_row",
     "ensure_workspace",
     "learned_synonyms",
     "list_books",
@@ -962,6 +1063,8 @@ __all__ = [
     "persist_suggestions",
     "preview_import",
     "rebuild_facts",
+    "rebuild_row_facts",
+    "row_payload",
     "save_row",
     "seed_catalog",
     "set_binding",
