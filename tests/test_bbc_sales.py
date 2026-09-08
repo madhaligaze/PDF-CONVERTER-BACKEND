@@ -182,6 +182,68 @@ def test_empty_grid_yields_an_empty_report() -> None:
     assert report.payroll_fact == []
 
 
+def _insert_column(grid: list[list[str]], at: int) -> list[list[str]]:
+    """Вставить пустую колонку — ровно то, что делают в книге руками."""
+    return [[*row[:at], "", *row[at:]] for row in grid]
+
+
+def test_inserted_column_does_not_shift_the_payroll(grid) -> None:
+    """Тихий случай: суммы остаются правдоподобными, но налоги едут в «на руки».
+
+    Раньше колонки внутри секции отсчитывались от края листа (`base_col + 5`),
+    и одна вставленная слева колонка меняла, какая ячейка — налог. Ошибки при
+    этом не возникало: на экране просто стояли другие деньги.
+    """
+    shifted = _insert_column(grid, 3)
+    report = parse_sales_report(shifted)
+
+    plan = next(line for line in report.payroll_plan if line.name == "Кумисбаев Б.")
+    assert plan.fixed == 500_000
+    assert plan.bonus == 700_000
+    assert plan.taxes == pytest.approx(315_151.5)
+    assert plan.total == pytest.approx(1_515_151.5)
+
+
+def test_inserted_column_does_not_shift_the_fact_panel(grid) -> None:
+    """Вставка слева двигает обе панели: факт ищется по своим подписям, не по M."""
+    shifted = _insert_column(grid, 3)
+    report = parse_sales_report(shifted)
+
+    fact = next(line for line in report.payroll_fact if line.name == "Кумисбаев Б.")
+    assert fact.bonus == 537_900
+    assert fact.taxes == pytest.approx(272_579.8)
+    assert report.expense_fact == pytest.approx(5_360_763.9)
+
+
+def test_inserted_row_does_not_zero_the_revenue(grid) -> None:
+    """«ПЛАН»/«ФАКТ» стояли по номеру строки — одна вставка сверху обнуляла выручку."""
+    shifted = [cell({}), *grid]
+    report = parse_sales_report(shifted)
+
+    assert report.revenue_plan == 7_000_000
+    assert report.revenue_fact == 5_379_000
+
+
+def test_missing_column_title_refuses_the_section(grid) -> None:
+    """Нет «налоги» там, где код его ждёт — не читаем соседа, а отказываемся.
+
+    Пустая секция заметна. Налоги, прочитанные из колонки «на руки», выглядят
+    как налоги — это правило «не угадывать» из CLAUDE.md.
+    """
+    broken = [list(row) for row in grid]
+    broken[4][6] = ""  # подпись «налоги» в панели плана
+    report = parse_sales_report(broken)
+
+    assert report.payroll_plan == []
+    assert any("налоги" in issue for issue in report.issues)
+    # Факт при этом читается: ломается только та панель, где подписи не сошлись.
+    assert len(report.payroll_fact) == 3
+
+
+def test_healthy_sheet_reports_no_issues(grid) -> None:
+    assert parse_sales_report(grid).issues == []
+
+
 # ── Каналы ───────────────────────────────────────────────────────────────────────
 
 

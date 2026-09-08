@@ -21,17 +21,36 @@ from app.bbc.normalize import clean, parse_money
 
 log = logging.getLogger(__name__)
 
-# Секции листа и колонки, с которых начинаются план и факт.
-PLAN_COL = 1  # B
-FACT_COL = 12  # M
-# Смещения внутри секции относительно её первой колонки.
-ROLE, FIXED, BONUS, NET, TAXES, TOTAL = 1, 2, 3, 4, 5, 6
-
 PAYROLL_HEADER = "ФОТ"
 CONTRACTORS_HEADER = "Подрядчики"
 AD_HEADER = "Бюджет на рекламу"
 TOTAL_LABEL = "ИТОГО"
 GRAND_TOTAL_LABEL = "ИТОГО РАСХОДЫ"
+
+# Денежные колонки панели и то, как они подписаны в строке под «ФОТ».
+#
+# Раньше здесь стояли числа: PLAN_COL = 1, FACT_COL = 12, а внутри секции
+# ФИКС = +2, БОНУС = +3, НАЛОГИ = +5. Лист ведут руками, и вставленная слева
+# колонка сдвинула бы всё вправо: на экране остались бы правдоподобные суммы,
+# только «Налоги» читались бы из «На руки». Это тот самый тихий случай, из-за
+# которого в CLAUDE.md записано правило искать колонки по названиям, — журнал
+# и сводку на него уже перевели, лист ОМиП оставался последним.
+#
+# Роли в списке нет намеренно: у неё в живом листе подписи нет вовсе, найти её
+# можно только соседством с именем. Зато она и не деньги — ошибиться в ней
+# значит показать «МОП» вместо «РОП», а не 82 039 вместо 250 000.
+PAYROLL_MONEY: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("fixed", ("фикс", "оклад")),
+    ("bonus", ("бонус", "премия")),
+    ("net", ("на руки",)),
+    ("taxes", ("налоги", "налог")),
+    ("total", ("всего", "итого")),
+)
+
+#: Насколько вправо от начала панели ищутся её колонки. Панели плана и факта
+#: стоят на одном листе рядом, и заезжать в соседнюю нельзя: «Фикс» факта не
+#: должен найтись при разборе плана.
+PANEL_WIDTH = 10
 
 
 @dataclass
@@ -100,6 +119,9 @@ class SalesReport:
     expense_plan: float = 0.0
     expense_fact: float = 0.0
     channels: list[ChannelResult] = field(default_factory=list)
+    #: Что разобрать не удалось и почему. Пусто — прочиталось всё.
+    #: Пустая секция без объяснения читается как «расходов нет», а это другое.
+    issues: list[str] = field(default_factory=list)
 
     @property
     def plan_completion(self) -> float:
@@ -124,6 +146,7 @@ class SalesReport:
             "expense_fact": round(self.expense_fact, 2),
             "margin_fact": round(self.margin_fact, 2),
             "channels": [item.to_dict() for item in self.channels],
+            "issues": list(self.issues),
         }
 
 
@@ -142,16 +165,91 @@ def _find_row(grid: Sequence[Sequence[str]], col: int, label: str, start: int = 
     return None
 
 
-def _parse_payroll(grid: Sequence[Sequence[str]], base_col: int) -> list[PayrollLine]:
+def _find_all(grid: Sequence[Sequence[str]], label: str) -> list[tuple[int, int]]:
+    """Все ячейки с такой подписью — (строка, колонка), слева направо и сверху вниз."""
+    needle = label.casefold()
+    found: list[tuple[int, int]] = []
+    for row in range(len(grid)):
+        for col in range(len(grid[row])):
+            if _cell(grid, row, col).casefold() == needle:
+                found.append((row, col))
+    return found
+
+
+@dataclass(frozen=True)
+class Panel:
+    """Половина листа — план или факт: где начинается и где в ней какие деньги."""
+
+    base_col: int
+    header_row: int
+    #: Ключ из `PAYROLL_MONEY` → номер колонки в этой панели.
+    money: dict[str, int]
+
+    @property
+    def role_col(self) -> int:
+        """Роль стоит сразу за именем: подписи у неё нет, искать её нечем."""
+        return self.base_col + 1
+
+
+def _resolve_panel(
+    grid: Sequence[Sequence[str]], header_row: int, base_col: int, issues: list[str]
+) -> Panel | None:
+    """Найти денежные колонки панели по подписям в строке под «ФОТ».
+
+    Не нашлось или нашлось дважды — панель не разбирается вовсе. Это правило из
+    CLAUDE.md: два похожих заголовка на денежную колонку — отказ читать, а не
+    выбор наугад. Пустая секция заметна, а «Налоги», прочитанные из соседней
+    колонки, выглядят как налоги.
+    """
+    titles_row = header_row + 1
+    money: dict[str, int] = {}
+    for key, names in PAYROLL_MONEY:
+        matches = [
+            col
+            for col in range(base_col, base_col + PANEL_WIDTH)
+            if _cell(grid, titles_row, col).casefold() in names
+        ]
+        if len(matches) != 1:
+            issues.append(
+                f"Колонка «{names[0]}» в панели ФОТ (столбец {base_col + 1}): "
+                + ("не найдена" if not matches else f"найдена {len(matches)} раза")
+            )
+            log.warning(
+                "BBC sales: колонка %r не разрешилась в панели с базой %s (совпадений: %s)",
+                names[0],
+                base_col,
+                len(matches),
+            )
+            return None
+        money[key] = matches[0]
+    return Panel(base_col=base_col, header_row=header_row, money=money)
+
+
+def _panels(grid: Sequence[Sequence[str]], issues: list[str]) -> tuple[Panel | None, Panel | None]:
+    """План и факт. Обе панели помечены одной подписью «ФОТ», левая — план."""
+    headers = _find_all(grid, PAYROLL_HEADER)
+    if not headers:
+        issues.append("Не найден заголовок «ФОТ» — лист не похож на отчёт ОМиП")
+        return None, None
+    resolved = [_resolve_panel(grid, row, col, issues) for row, col in headers[:2]]
+    plan = resolved[0] if resolved else None
+    fact = resolved[1] if len(resolved) > 1 else None
+    return plan, fact
+
+
+def _parse_payroll(grid: Sequence[Sequence[str]], panel: Panel | None) -> list[PayrollLine]:
     """Строки ФОТ от заголовка «ФОТ» до «ИТОГО»."""
-    header = _find_row(grid, base_col, PAYROLL_HEADER)
-    if header is None:
+    if panel is None:
         return []
 
     lines: list[PayrollLine] = []
+
+    def money(index: int, key: str) -> float:
+        return parse_money(_cell(grid, index, panel.money[key])) or 0.0
+
     # +2: под заголовком идёт строка с названиями колонок.
-    for index in range(header + 2, len(grid)):
-        name = _cell(grid, index, base_col)
+    for index in range(panel.header_row + 2, len(grid)):
+        name = _cell(grid, index, panel.base_col)
         if not name:
             continue
         if name.casefold() == TOTAL_LABEL.casefold():
@@ -159,39 +257,52 @@ def _parse_payroll(grid: Sequence[Sequence[str]], base_col: int) -> list[Payroll
         lines.append(
             PayrollLine(
                 name=name,
-                role=_cell(grid, index, base_col + ROLE),
-                fixed=parse_money(_cell(grid, index, base_col + FIXED)) or 0.0,
-                bonus=parse_money(_cell(grid, index, base_col + BONUS)) or 0.0,
-                net=parse_money(_cell(grid, index, base_col + NET)) or 0.0,
-                taxes=parse_money(_cell(grid, index, base_col + TAXES)) or 0.0,
-                total=parse_money(_cell(grid, index, base_col + TOTAL)) or 0.0,
+                role=_cell(grid, index, panel.role_col),
+                fixed=money(index, "fixed"),
+                bonus=money(index, "bonus"),
+                net=money(index, "net"),
+                taxes=money(index, "taxes"),
+                total=money(index, "total"),
             )
         )
     return lines
 
 
-def _parse_spend(grid: Sequence[Sequence[str]], header: str) -> list[SpendLine]:
-    """Секция расходов (подрядчики / реклама) сразу в двух колонках: план и факт."""
-    plan_row = _find_row(grid, PLAN_COL, header)
-    fact_row = _find_row(grid, FACT_COL, header)
+def _parse_spend(
+    grid: Sequence[Sequence[str]],
+    header: str,
+    plan: Panel | None,
+    fact: Panel | None,
+) -> list[SpendLine]:
+    """Секция расходов (подрядчики / реклама) сразу в двух колонках: план и факт.
+
+    Своей строки заголовков у этих секций нет — они стоят в той же сетке
+    колонок, что и ФОТ, поэтому номера берутся у разобранной панели, а не
+    отсчитываются от края листа.
+    """
+    if plan is None:
+        return []
+    plan_row = _find_row(grid, plan.base_col, header)
+    fact_row = _find_row(grid, fact.base_col, header) if fact is not None else None
     if plan_row is None:
         return []
 
     lines: list[SpendLine] = []
     for offset in range(1, 12):
         index = plan_row + offset
-        name = _cell(grid, index, PLAN_COL)
+        name = _cell(grid, index, plan.base_col)
         if not name:
             continue
         if name.casefold() == TOTAL_LABEL.casefold():
             break
         fact_index = (fact_row + offset) if fact_row is not None else index
+        fact_col = fact.money["fixed"] if fact is not None else plan.money["fixed"]
         lines.append(
             SpendLine(
                 name=name,
-                channel=_cell(grid, index, PLAN_COL + ROLE),
-                plan=parse_money(_cell(grid, index, PLAN_COL + FIXED)) or 0.0,
-                fact=parse_money(_cell(grid, fact_index, FACT_COL + FIXED)) or 0.0,
+                channel=_cell(grid, index, plan.role_col),
+                plan=parse_money(_cell(grid, index, plan.money["fixed"])) or 0.0,
+                fact=parse_money(_cell(grid, fact_index, fact_col)) or 0.0,
             )
         )
     return lines
@@ -202,35 +313,45 @@ def _parse_revenue(grid: Sequence[Sequence[str]]) -> tuple[float, float, list[di
 
     План и факт стоят под подписями «ПЛАН»/«ФАКТ»; ниже в колонке факта чередуются
     имя менеджера и его сумма.
+
+    Подписи ищутся по всему листу, а не в четвёртой строке: раньше номера строк
+    были прибиты (`_cell(grid, 3, col)`), и одна вставленная сверху строка
+    обнуляла выручку отдела, не сказав об этом ни слова.
     """
     plan = fact = 0.0
     per_mop: list[dict[str, Any]] = []
 
-    for col in range(len(grid[0]) if grid else 0):
-        if _cell(grid, 3, col).casefold() == "план":
-            plan = parse_money(_cell(grid, 4, col)) or 0.0
-        if _cell(grid, 3, col).casefold() == "факт":
-            fact = parse_money(_cell(grid, 4, col)) or 0.0
-            # Пары «имя / сумма» идут вниз по той же колонке.
-            index = 5
-            while index < len(grid) - 1:
-                name = _cell(grid, index, col)
-                amount = parse_money(_cell(grid, index + 1, col))
-                if name and amount is not None and not name[0].isdigit():
-                    per_mop.append({"name": name, "revenue": round(amount, 2)})
-                    index += 2
-                    continue
-                if not name and not _cell(grid, index + 1, col):
-                    break
-                index += 1
+    plan_at = _find_all(grid, "план")
+    if plan_at:
+        row, col = plan_at[0]
+        plan = parse_money(_cell(grid, row + 1, col)) or 0.0
+
+    fact_at = _find_all(grid, "факт")
+    if fact_at:
+        row, col = fact_at[0]
+        fact = parse_money(_cell(grid, row + 1, col)) or 0.0
+        # Пары «имя / сумма» идут вниз по той же колонке.
+        index = row + 2
+        while index < len(grid) - 1:
+            name = _cell(grid, index, col)
+            amount = parse_money(_cell(grid, index + 1, col))
+            if name and amount is not None and not name[0].isdigit():
+                per_mop.append({"name": name, "revenue": round(amount, 2)})
+                index += 2
+                continue
+            if not name and not _cell(grid, index + 1, col):
+                break
+            index += 1
     return plan, fact, per_mop
 
 
-def _grand_total(grid: Sequence[Sequence[str]], base_col: int) -> float:
-    row = _find_row(grid, base_col, GRAND_TOTAL_LABEL)
+def _grand_total(grid: Sequence[Sequence[str]], panel: Panel | None) -> float:
+    if panel is None:
+        return 0.0
+    row = _find_row(grid, panel.base_col, GRAND_TOTAL_LABEL)
     if row is None:
         return 0.0
-    return parse_money(_cell(grid, row, base_col + TOTAL)) or 0.0
+    return parse_money(_cell(grid, row, panel.money["total"])) or 0.0
 
 
 def parse_sales_report(grid: Sequence[Sequence[str]], worksheet: str = "") -> SalesReport:
@@ -238,18 +359,21 @@ def parse_sales_report(grid: Sequence[Sequence[str]], worksheet: str = "") -> Sa
     if not grid:
         return SalesReport(worksheet=worksheet)
 
+    issues: list[str] = []
+    plan_panel, fact_panel = _panels(grid, issues)
     plan, fact, per_mop = _parse_revenue(grid)
     return SalesReport(
         worksheet=worksheet,
         revenue_plan=plan,
         revenue_fact=fact,
         per_mop=per_mop,
-        payroll_plan=_parse_payroll(grid, PLAN_COL),
-        payroll_fact=_parse_payroll(grid, FACT_COL),
-        contractors=_parse_spend(grid, CONTRACTORS_HEADER),
-        ad_budget=_parse_spend(grid, AD_HEADER),
-        expense_plan=_grand_total(grid, PLAN_COL),
-        expense_fact=_grand_total(grid, FACT_COL),
+        payroll_plan=_parse_payroll(grid, plan_panel),
+        payroll_fact=_parse_payroll(grid, fact_panel),
+        contractors=_parse_spend(grid, CONTRACTORS_HEADER, plan_panel, fact_panel),
+        ad_budget=_parse_spend(grid, AD_HEADER, plan_panel, fact_panel),
+        expense_plan=_grand_total(grid, plan_panel),
+        expense_fact=_grand_total(grid, fact_panel),
+        issues=issues,
     )
 
 
@@ -366,6 +490,8 @@ def parse_sales_registry(grid: Sequence[Sequence[str]]) -> list[dict[str, Any]]:
 
 __all__ = [
     "ChannelResult",
+    "PAYROLL_MONEY",
+    "Panel",
     "PayrollLine",
     "REGISTRY_COLUMNS",
     "SalesReport",

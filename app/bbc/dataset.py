@@ -220,6 +220,9 @@ class ContractRow:
     debt_broken: bool = False
     #: Долг, накопленный до учётных периодов. Только у строки «Старые…».
     carry_in: float | None = None
+    #: Обратный случай: входящее сальдо положительное, то есть клиент заплатил
+    #: вперёд. В долг не входит — см. `assign_carry_in`.
+    carry_in_credit: float | None = None
     #: Договор вступил в силу. У «Вид Услуги» = «нет» — ещё нет, и его сумма
     #: не долг, а зафиксированная в реестре договорённость.
     in_force: bool = True
@@ -387,6 +390,17 @@ def assign_carry_in(rows: list[ContractRow]) -> None:
 
     Отличить одно от другого построчно нельзя, поэтому остаток берётся у самой
     ранней строки договора и только у неё.
+
+    Знак — не косметика. В книге долг клиента записан отрицательным: у ИП ПЕН
+    в примере выше −66 000 значит «должен 66 000». Значит положительное сальдо
+    значит обратное — клиент заплатил вперёд, и это кредит, а не долг. `abs`
+    складывал одно с другим: переплата в 50 000 приезжала на экран прибавкой к
+    долгу, и выглядела она как обычная цифра.
+
+    Поэтому в долг уходит только отрицательная часть. Переплата в долг не
+    входит и не пропадает: `carry_in_credit` держит её, а `_carry_in_credit`
+    в `validators` показывает такие строки в «Предупреждениях» — угадывать за
+    книгу, чем на самом деле был этот плюс, здесь нечем.
     """
     contracts: dict[tuple[str, str], list[ContractRow]] = {}
     for row in rows:
@@ -396,8 +410,12 @@ def assign_carry_in(rows: list[ContractRow]) -> None:
         first = min(group, key=_period_order)
         for row in group:
             row.carry_in = None
+            row.carry_in_credit = None
         if first.saldo_start:
-            first.carry_in = abs(first.saldo_start)
+            if first.saldo_start < 0:
+                first.carry_in = -first.saldo_start
+            else:
+                first.carry_in_credit = first.saldo_start
 
 
 def resolve_master_layout(header: Sequence[str]) -> Layout:

@@ -21,7 +21,17 @@ from __future__ import annotations
 import logging
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 
 from app.bbc import auth as auth_module
 from app.bbc import employees as employees_module
@@ -32,11 +42,15 @@ from app.bbc import touches as touches_module
 from app.bbc.auth import AuthError, AuthedUser
 from app.bbc.config import bbc_settings
 from app.bbc.deps import (
+    FILE_COOKIE,
     LINK_HEADER,
     SESSION_COOKIE,
+    cookie_secure,
     current_scope,
+    current_user,
     require_admin,
     require_block,
+    require_file_scope,
     require_scope,
     require_user,
     scope_for_user,
@@ -65,12 +79,22 @@ from app.bbc.schemas import (
     BbcUpdateRequest,
     BbcUpdateResult,
 )
-from app.bbc.scope import BLOCKS, DATA_SCOPES, DEPARTMENTS, Scope
+from app.bbc.scope import ADMIN_BLOCKS, DATA_SCOPES, DEPARTMENTS, EMPLOYEE_BLOCKS, Scope
 from app.bbc.sheets import BbcError
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/bbc")
+
+#: Сколько живёт cookie доступа к файлам. Час: она нужна на время просмотра
+#: журнала, а не на срок ссылки — та бессрочна по умолчанию.
+FILE_COOKIE_TTL_SECONDS = 3600
+
+#: Что открываем в соседней вкладке. Всё прочее уходит вложением — см.
+#: `touch_file`: ZIP, принятый за DOCX, в браузере открывать нечем.
+INLINE_TYPES: frozenset[str] = frozenset(
+    {"image/jpeg", "image/png", "image/gif", "image/webp", "application/pdf"}
+)
 
 
 def _require_configured() -> None:
@@ -129,7 +153,7 @@ async def auth_login(payload: BbcLoginRequest, request: Request, response: Respo
         SESSION_COOKIE,
         token,
         httponly=True,
-        secure=request.url.scheme == "https",
+        secure=cookie_secure(request),
         samesite="lax",
         max_age=int(bbc_settings.session_ttl_hours * 3600),
         path="/",
@@ -311,7 +335,11 @@ async def employees_list(_: AuthedUser = Depends(require_admin)) -> dict:
         "employees": employees_module.list_employees(),
         "presets": list(employees_module.ROLE_PRESETS),
         "departments": list(DEPARTMENTS),
-        "blocks": list(BLOCKS),
+        # Только то, что учётке действительно можно выдать. Журнал и продажи
+        # сюда не попадают: сервер их всё равно не отдаст (`require_admin`), а
+        # галочка, которая ничего не открывает, — обещание, а не настройка.
+        "blocks": list(EMPLOYEE_BLOCKS),
+        "admin_blocks": list(ADMIN_BLOCKS),
         "data_scopes": list(DATA_SCOPES),
     }
 
@@ -576,10 +604,47 @@ async def touches_attach(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+# Объявлен раньше `/files/{file_id}`: file_id — int, и на «access» динамический
+# маршрут ответил бы 422, не дойдя сюда.
+@router.post("/files/access", response_model=BbcOk)
+async def file_access(
+    request: Request,
+    response: Response,
+    k: str | None = Query(default=None),
+    link_header: str | None = Header(default=None, alias=LINK_HEADER),
+) -> BbcOk:
+    """Обменять токен ссылки на HttpOnly-cookie для отдачи файлов.
+
+    Один запрос при открытии журнала касаний — и дальше `<img src>` и `<a href>`
+    ходят без `?k=` в адресе. До этого токен лежал в адресе каждого файла и
+    уезжал в историю браузера, Referer, логи прокси и в пересланную ссылку на
+    картинку; кто получал такой адрес, получал вместе с ним всю дебиторку
+    отдела до отзыва ссылки.
+
+    Срок жизни — час, а не срок ссылки: cookie нужна на время просмотра, и
+    короткое окно означает, что украденная cookie быстрее становится мусором.
+    Кончилась — фронт попросит новую тем же вызовом.
+    """
+    token = link_header or k
+    if not token or links_module.resolve_link(token) is None:
+        raise HTTPException(status_code=401, detail="Ссылка недействительна")
+
+    response.set_cookie(
+        FILE_COOKIE,
+        token,
+        httponly=True,
+        secure=cookie_secure(request),
+        samesite="lax",
+        max_age=FILE_COOKIE_TTL_SECONDS,
+        path="/",
+    )
+    return BbcOk(detail="Доступ к файлам открыт")
+
+
 @router.get("/files/{file_id}")
 async def touch_file(
     file_id: int,
-    scope: Scope = Depends(require_block("touches")),
+    scope: Scope = Depends(require_file_scope),
 ) -> Response:
     """Отдача файла своим эндпоинтом, а не ссылкой на бакет.
 
@@ -596,13 +661,22 @@ async def touch_file(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     quoted = quote(filename)
+    # inline только для того, что браузер точно покажет картинкой или PDF.
+    # Всё остальное — вложением: `read_file` принимает за DOCX любой ZIP (по
+    # сигнатуре `PK\x03\x04`), и открывать такое в соседней вкладке значит
+    # позволить браузеру самому решить, что это было.
+    inline = content_type in INLINE_TYPES
+    disposition = "inline" if inline else "attachment"
     return Response(
         content=blob,
         media_type=content_type,
         headers={
-            # inline: скрин открывается в соседней вкладке, а не падает в
-            # «Загрузки». Имя — в RFC 5987, иначе кириллица приезжает мусором.
-            "Content-Disposition": f"inline; filename*=UTF-8''{quoted}",
+            # Имя — в RFC 5987, иначе кириллица приезжает мусором.
+            "Content-Disposition": f"{disposition}; filename*=UTF-8''{quoted}",
+            # Браузер не должен угадывать тип по содержимому: угадав «html» на
+            # файле, который загрузил посторонний, он выполнил бы его в нашем
+            # источнике.
+            "X-Content-Type-Options": "nosniff",
             "Cache-Control": "private, max-age=300",
         },
     )
@@ -636,14 +710,27 @@ def _assert_client_visible(scope: Scope, key: str) -> None:
 
 
 @router.get("/status", response_model=BbcStatus)
-async def status() -> BbcStatus:
-    return service.get_status()
+async def status(request: Request) -> BbcStatus:
+    """Настроен ли модуль. Отвечает всегда — по нему оболочка рисует экран входа.
+
+    Именно поэтому id боевой книги отсюда убран для всех, кроме админа: экрану
+    «не настроено» хватает `configured` и `detail`, а анониму адрес таблицы,
+    в которой лежат договоры компании, знать незачем.
+    """
+    user = current_user(request)
+    return service.get_status(reveal_ids=bool(user and user.is_admin))
 
 
 @router.get("/revision")
-async def revision(_: Scope = Depends(require_scope)) -> dict:
-    """Cheap change probe the browser polls. Served from memory, no Google call."""
-    return service.get_revision()
+async def revision(scope: Scope = Depends(require_scope)) -> dict:
+    """Cheap change probe the browser polls. Served from memory, no Google call.
+
+    Размеры книги — только админу. `/dataset` давно сужает `coverage.rows` до
+    отдела, а здесь лежал `len(snapshot.rows)` по всей книге: ссылка НО видела
+    свои 120 строк в одном ответе и 524 в другом. Фронту для опроса нужны
+    только `revision` и `changed_at`.
+    """
+    return service.get_revision(scope)
 
 
 @router.get("/dataset")
@@ -662,6 +749,18 @@ async def dataset(
     """
     if source == "sheets":
         _require_configured()
+    # Ручное чтение Google — только админу. Это прямой поход в API мимо
+    # фонового цикла с его отступом на 429: скрипт с токеном ссылки отдела мог
+    # выбрать квоту в 60 чтений/мин, после чего вставал весь дашборд, а не
+    # только тот, кто долбил. Остывание на 10 секунд живёт на клиенте, и это
+    # значит «его нет». Всем остальным хватает цикла: он перечитывает лист
+    # каждые 15 секунд сам.
+    if refresh and not scope.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="Перечитать таблицу вручную может только администратор — "
+            "остальным данные обновляет фоновое чтение раз в 15 секунд",
+        )
     try:
         return service.get_dataset(scope, refresh=refresh, source=source)
     except BbcError as exc:
@@ -687,15 +786,28 @@ async def calendar(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+# Продажи и журнал стоят на `require_admin`, а не на `require_block`, и это не
+# перестраховка. Ни тот, ни другой лист не режется по отделу: в ответе продаж —
+# ФОТ с фамилиями, ставками и налогами по всей компании, в журнале — все
+# операции. Резать их нечем: ключа отдела в этих листах нет. Пока его нет,
+# отказ честнее, чем чужие зарплаты на экране менеджера по долгам, — а раньше
+# их открывала одна галочка в карточке сотрудника, стоящая рядом с «Дебиторкой».
+#
+# Область видимости передаётся админская явно: сюда доходит только админ, и
+# `scope` в этих вызовах ничего не сужает — см. `service.get_sales`.
+
+
 @router.get("/sales")
 async def sales_report(
     worksheet: str | None = Query(default=None),
-    scope: Scope = Depends(require_block("sales")),
+    _: AuthedUser = Depends(require_admin),
 ) -> dict:
     """Отдел продаж: план/факт, KPI и бонусы, отдача на маркетинговый канал."""
     _require_configured()
     try:
-        return service.get_sales(scope, worksheet)
+        return service.get_sales(Scope.admin(), worksheet)
+    except service.WorksheetNotAllowed as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except BbcError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -704,12 +816,12 @@ async def sales_report(
 async def journal(
     group: str = Query(default="counterparty"),
     measure: str = Query(default="outflow"),
-    scope: Scope = Depends(require_block("journal")),
+    _: AuthedUser = Depends(require_admin),
 ) -> dict:
     """Журнал операций и конструктор мини-сводок."""
     _require_configured()
     try:
-        return service.get_journal(scope, group, measure)
+        return service.get_journal(Scope.admin(), group, measure)
     except BbcError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 

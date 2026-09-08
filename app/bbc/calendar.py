@@ -177,9 +177,27 @@ def client_lags(rows: list[ContractRow]) -> dict[str, LagStats]:
 # ── Построение календаря ─────────────────────────────────────────────────────────
 
 
-def _awaiting_payment(row: ContractRow) -> bool:
-    """Деньги ещё ждём: сумма есть, оплаты нет."""
-    return bool(row.contract_amount) and row.paid is not True
+def outstanding(row: ContractRow) -> float:
+    """Сколько по строке ещё ждём. Ноль — ждать нечего.
+
+    Раньше в календарь уходила `contract_amount` целиком, а условием было
+    `paid is not True`. Пустой флаг оплаты в книге — обычное дело, и строка
+    «договор 500 000, оплачено 200 000, флаг не проставлен» ставила в план
+    500 000. Отдел ждал деньги, которые уже пришли.
+
+    Считаем остаток: договор минус то, что по нему поступило. Отрицательный
+    остаток (переплата) — это не «ждём минус двести тысяч», а «ждать нечего».
+    """
+    if not row.in_force:
+        # Договор не вступил в силу: сумма зафиксирована, но платить по ней
+        # пока не за что — то же правило, что в дебиторке (`total_debt`).
+        return 0.0
+    if row.paid is True:
+        return 0.0
+    contract = row.contract_amount or 0.0
+    if not contract:
+        return 0.0
+    return max(0.0, contract - (row.paid_amount or 0.0))
 
 
 def _anchor_date(row: ContractRow) -> tuple[date, str] | None:
@@ -209,7 +227,8 @@ def build_calendar(
     personal_rows = 0
 
     for row in rows:
-        if not _awaiting_payment(row):
+        amount = outstanding(row)
+        if not amount:
             continue
         anchor = _anchor_date(row)
         if anchor is None:
@@ -237,7 +256,7 @@ def build_calendar(
                 row_index=row.index,
                 client=row.client or "—",
                 departments=list(row.departments),
-                amount=row.contract_amount or 0.0,
+                amount=amount,
                 expected_at=expected,
                 anchor=anchor_kind,
                 basis=basis,
@@ -328,5 +347,6 @@ __all__ = [
     "build_calendar",
     "client_lags",
     "forecast_accuracy",
+    "outstanding",
     "payment_lags",
 ]

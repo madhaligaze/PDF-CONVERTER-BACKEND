@@ -16,6 +16,8 @@ from __future__ import annotations
 import hashlib
 import logging
 import secrets
+import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -182,23 +184,82 @@ def has_any_user() -> bool:
         return session.scalar(select(BbcUser).limit(1)) is not None
 
 
+# ── Ограничение перебора ─────────────────────────────────────────────────────────
+#
+# argon2id делает одну попытку дорогой, но не запрещает миллион. Здесь пароли
+# выдаёт админ и диктует по телефону, временный — вообще из трёх слогов и живёт
+# в переписке; перебор с десятка процессов это реальный сценарий, а не теория.
+#
+# Счёт ведётся и по логину, и по IP: только по логину — и перебор идёт по
+# списку имён, только по IP — и офис за одним адресом блокирует сам себя после
+# пяти опечаток пятерых разных людей. Сработавший счётчик отвечает одинаково,
+# существует такой логин или нет: подсказывать, какое имя угадано, незачем.
+
+MAX_LOGIN_FAILURES = 5
+LOGIN_LOCKOUT_SECONDS = 60.0
+
+_failures: dict[str, list[float]] = {}
+_failures_lock = threading.Lock()
+
+
+def _login_keys(username: str, ip: str | None) -> list[str]:
+    keys = [f"user:{(username or '').strip().casefold()}"]
+    if ip:
+        keys.append(f"ip:{ip}")
+    return keys
+
+
+def _assert_not_throttled(username: str, ip: str | None) -> None:
+    now = time.monotonic()
+    with _failures_lock:
+        for key in _login_keys(username, ip):
+            recent = [at for at in _failures.get(key, ()) if now - at < LOGIN_LOCKOUT_SECONDS]
+            if recent:
+                _failures[key] = recent
+            else:
+                _failures.pop(key, None)
+            if len(recent) >= MAX_LOGIN_FAILURES:
+                raise AuthError(
+                    "Слишком много попыток входа. Подождите минуту и попробуйте снова"
+                )
+
+
+def _record_failure(username: str, ip: str | None) -> None:
+    now = time.monotonic()
+    with _failures_lock:
+        for key in _login_keys(username, ip):
+            recent = [at for at in _failures.get(key, ()) if now - at < LOGIN_LOCKOUT_SECONDS]
+            recent.append(now)
+            _failures[key] = recent
+
+
+def _clear_failures(username: str, ip: str | None) -> None:
+    with _failures_lock:
+        for key in _login_keys(username, ip):
+            _failures.pop(key, None)
+
+
 # ── Login / sessions ─────────────────────────────────────────────────────────────
 
 
 def login(username: str, password: str, *, ip: str | None = None, user_agent: str | None = None) -> str:
     """Verify credentials and open a session. Returns the raw cookie token."""
+    _assert_not_throttled(username, ip)
     with bbc_session() as session:
         user = _find_user(session, username)
         # Verify even when the user is missing, so a wrong login and a wrong
         # password take the same time and cannot be told apart.
         if user is None:
             _hasher.hash(password or "x")
+            _record_failure(username, ip)
             raise AuthError("Неверный логин или пароль")
         if not user.is_active:
             raise AuthError("Учётная запись отключена")
         if not verify_password(user.password_hash, password or ""):
+            _record_failure(username, ip)
             raise AuthError("Неверный логин или пароль")
 
+        _clear_failures(username, ip)
         token = new_token()
         session.add(
             BbcUserSession(

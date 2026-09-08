@@ -30,7 +30,13 @@ from app.bbc.validators import analyze, summarize
 log = logging.getLogger(__name__)
 
 
-def get_status() -> BbcStatus:
+def get_status(*, reveal_ids: bool = False) -> BbcStatus:
+    """Состояние модуля. `reveal_ids` — показывать ли адрес книги (только админу).
+
+    Ответ отдаётся без входа: по нему оболочка решает, рисовать дашборд или
+    экран «не настроено». Для этого решения достаточно `configured` и `detail`,
+    а id боевой книги в публичном ответе — лишний адрес чужого сейфа.
+    """
     detail: str | None = None
     if not bbc_settings.enabled:
         detail = "BBC Dashboard выключен (BBC_DASHBOARD_ENABLED=false)"
@@ -41,8 +47,8 @@ def get_status() -> BbcStatus:
     return BbcStatus(
         enabled=bbc_settings.enabled,
         configured=bbc_settings.configured,
-        spreadsheet_id=bbc_settings.spreadsheet_id,
-        worksheet_name=bbc_settings.worksheet_name,
+        spreadsheet_id=bbc_settings.spreadsheet_id if reveal_ids else None,
+        worksheet_name=bbc_settings.worksheet_name if reveal_ids else "",
         credentials_available=bbc_settings.credentials_available,
         detail=detail,
     )
@@ -220,7 +226,9 @@ def get_dataset(
         # Раскладка книги: если колонки уехали, дашборд говорит об этом сам, не
         # дожидаясь, пока кто-нибудь заметит неверную цифру.
         "layout": snapshot.layout,
-        "sources": live.revision_payload()["sources"],
+        # Счётчики строк по источникам — только админу, по той же причине, что
+        # и в `/revision`: они считают весь лист, а не то, что видно спросившему.
+        "sources": live.revision_payload(with_counts=scope.is_admin)["sources"],
     }
 
 
@@ -239,12 +247,23 @@ def get_calendar(scope: Scope, method: str = calendar_module.PREDICTIVE) -> dict
     return payload
 
 
+class WorksheetNotAllowed(Exception):
+    """Запрошен лист, которого нет в списке отчётов ОМиП."""
+
+
 def get_sales(scope: Scope, worksheet: str | None = None) -> dict[str, Any]:
     """Блок «Отдел продаж»: план/факт, ФОТ с бонусами, отдача на канал.
 
     Данные лежат в отдельной таблице ОМиП и не разрезаются по отделам сводной,
-    поэтому блок доступен только тем, чья область его разрешает (админ).
+    поэтому маршрут стоит на `require_admin` — см. `routes.sales_report`.
+
+    Имя листа приходит с экрана, но проверяется по списку: без проверки оно
+    уезжало прямо в `read_cached`, и любая вкладка книги ОМиП читалась запросом
+    вида `?worksheet=…`, включая те, которых в интерфейсе нет.
     """
+    tabs = _report_tabs()
+    if worksheet is not None and worksheet not in tabs:
+        raise WorksheetNotAllowed(f"Лист «{worksheet}» не входит в отчёты ОМиП")
     tab = worksheet or _latest_report_tab()
     report_grid = sheets.read_cached(tab, bbc_settings.omip_spreadsheet_id)
     report = sales_module.parse_sales_report(report_grid, tab)
@@ -260,7 +279,7 @@ def get_sales(scope: Scope, worksheet: str | None = None) -> dict[str, Any]:
     report.channels = sales_module.channel_results(report, registry)
     payload = report.to_dict()
     payload["registry"] = registry
-    payload["tabs"] = _report_tabs()
+    payload["tabs"] = tabs
     return payload
 
 
@@ -283,7 +302,9 @@ def get_journal(scope: Scope, group: str = "counterparty", measure: str = "outfl
     """Журнал операций плюс мини-свод по выбранному измерению.
 
     Строки журнала несут фирму, но не отдел, поэтому по отделам они не режутся —
-    блок доступен только тем, чья область его разрешает (админ).
+    маршрут стоит на `require_admin` (см. `routes.journal`). `scope` в сигнатуре
+    остаётся: появится в журнале ключ отдела — резать будем здесь, и звать эту
+    функцию без области видимости не придётся учиться заново.
     """
     rows = journal_module.parse_journal(sheets.read_source_cached(sheets.SOURCE_JOURNAL))
     return {
@@ -316,9 +337,13 @@ def get_warnings(scope: Scope) -> dict[str, Any]:
     }
 
 
-def get_revision() -> dict[str, Any]:
-    """Served from memory — this is what browsers poll every few seconds."""
-    return live.revision_payload()
+def get_revision(scope: Scope | None = None) -> dict[str, Any]:
+    """Served from memory — this is what browsers poll every few seconds.
+
+    Счётчики строк — только админу: `len(snapshot.rows)` это размер всей книги,
+    и области видимости он не знает. См. `live.revision_payload`.
+    """
+    return live.revision_payload(with_counts=bool(scope and scope.is_admin))
 
 
 def invalidate_cache() -> None:
@@ -333,6 +358,7 @@ def invalidate_cache() -> None:
 
 __all__ = [
     "BbcError",
+    "WorksheetNotAllowed",
     "get_calendar",
     "SOURCES",
     "SOURCE_BOOKS",

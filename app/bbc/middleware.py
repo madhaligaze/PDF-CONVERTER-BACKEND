@@ -29,7 +29,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from app.bbc.auth import session_window
-from app.bbc.deps import SESSION_COOKIE
+from app.bbc.deps import SESSION_COOKIE, cookie_secure
 
 #: Флаг на `request.state`: сессия по cookie была прочитана и оказалась живой.
 SESSION_ALIVE = "bbc_session_alive"
@@ -63,11 +63,14 @@ async def keep_session_cookie(
     if not token:
         return response
 
+    # Флаги те же, что при входе, и берутся из одного места: разойдись они —
+    # продление молча сняло бы `Secure` с cookie, которую логин поставил
+    # правильно, и дыра открылась бы на втором запросе, а не на первом.
     response.set_cookie(
         SESSION_COOKIE,
         token,
         httponly=True,
-        secure=request.url.scheme == "https",
+        secure=cookie_secure(request),
         samesite="lax",
         max_age=int(session_window().total_seconds()),
         path="/",

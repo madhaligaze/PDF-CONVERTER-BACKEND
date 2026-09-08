@@ -33,7 +33,7 @@ from sqlalchemy import select
 from app.bbc.auth import AuthError, AuthedUser, hash_password
 from app.bbc.db import bbc_session
 from app.bbc.models import BbcAuditEntry, BbcUser, BbcUserSession
-from app.bbc.scope import BLOCKS, DATA_SCOPES, DEPARTMENTS, canonical_department
+from app.bbc.scope import DATA_SCOPES, DEPARTMENTS, EMPLOYEE_BLOCKS, canonical_department
 
 log = logging.getLogger(__name__)
 
@@ -124,7 +124,10 @@ def parse_employee_input(
     if not codes:
         raise AuthError(f"Выберите хотя бы один отдел ({', '.join(DEPARTMENTS)})")
 
-    allowed = [key for key in (blocks or ()) if key in BLOCKS]
+    # `EMPLOYEE_BLOCKS`, а не `BLOCKS`: журнал и продажи учётке сотрудника не
+    # выдаются вообще — их нечем сузить до отдела, см. `scope.ADMIN_BLOCKS`.
+    # Отбрасываются молча, как и опечатки: форму рисует экран, а решает сервер.
+    allowed = [key for key in (blocks or ()) if key in EMPLOYEE_BLOCKS]
     if not allowed:
         raise AuthError("Отметьте хотя бы один раздел")
 

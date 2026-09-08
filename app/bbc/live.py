@@ -90,23 +90,30 @@ def get_snapshot() -> Snapshot:
         return _snapshot
 
 
-def revision_payload() -> dict[str, Any]:
-    """Tiny response the browser polls — served from memory, no Google call."""
+def revision_payload(*, with_counts: bool = False) -> dict[str, Any]:
+    """Tiny response the browser polls — served from memory, no Google call.
+
+    `with_counts` добавляет размеры книги. По умолчанию их нет: это счётчики по
+    всему листу, области видимости они не знают, и в ответе, который получает
+    ссылка одного отдела, они рассказывают, сколько строк в книге всего.
+    """
     snapshot = get_snapshot()
-    return {
+    payload: dict[str, Any] = {
         "revision": snapshot.revision,
         "changed_at": snapshot.changed_at,
-        "rows": len(snapshot.rows),
         "layout_shifted": bool(snapshot.layout.get("shifted")),
         "sources": {
             name: {
                 "fetched_at": state.fetched_at,
-                "row_count": state.row_count,
                 "error": state.error,
+                **({"row_count": state.row_count} if with_counts else {}),
             }
             for name, state in snapshot.sources.items()
         },
     }
+    if with_counts:
+        payload["rows"] = len(snapshot.rows)
+    return payload
 
 
 def _persist(source: str, digest: str, revision: int, rows: list[ContractRow]) -> None:

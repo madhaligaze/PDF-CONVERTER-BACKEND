@@ -319,8 +319,24 @@ def _broken_debt(rows: list[ContractRow]) -> Finding | None:
     )
 
 
+def _carry_in_credit(rows: list[ContractRow]) -> Finding | None:
+    affected = [row for row in rows if row.carry_in_credit]
+    return _finding(
+        "carry_in_credit",
+        IMPORTANT,
+        "Входящее сальдо в плюс",
+        "В первой строке договора «Сальдо Начало» положительное. В книге долг "
+        "записан минусом, поэтому плюс здесь читается как оплата вперёд, и в долг "
+        "он не включён. Раньше такая строка прибавлялась к долгу по модулю.",
+        "Сверить с «Дебет / Кредит»: если это всё же долг прошлых периодов, "
+        "знак в книге стоит не тот.",
+        affected,
+    )
+
+
 RULES: tuple[Callable[[list[ContractRow]], Finding | None], ...] = (
     _broken_debt,
+    _carry_in_credit,
     _no_period_start,
     _inverted_period,
     _orphan_row,

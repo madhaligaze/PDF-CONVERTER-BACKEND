@@ -25,7 +25,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from app.bbc.deps import require_admin, require_user
+from app.bbc.deps import require_admin, require_block_user
 from app.books import roles as role_catalog, service
 from app.books.config import books_settings
 from app.books.db import books_session
@@ -36,6 +36,20 @@ from app.books.sources.gsheets import GoogleSheetsSource, invalidate_cache
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/books", tags=["books"])
+
+# Кто пускается в раздел. Отдельными именами, а не `require_user` по всему файлу:
+# «вошёл» — это не право на финансовую книгу компании. Право называется
+# «Реестры» (`registries`) и ставится галочкой в карточке сотрудника.
+#
+# Почему именно так, а не «спрятать вкладку»: вкладка и так спрятана — фронт не
+# рисует её без блока `registries`, — и это ничего не значило. Сервер вкладку не
+# спрашивает, а `/api/v1/books` отвечает на голый запрос с cookie.
+require_books = require_block_user("registries")
+# Всё, что меняет саму книгу, а не запись в ней: состав колонок, привязка
+# колонки к роли, импорт из Google. Привязка — не настройка отображения:
+# пересадив роль «Сальдо конец» на соседнюю колонку, сотрудник заставил бы
+# дашборд считать другие деньги и молчать об этом.
+require_books_admin = require_admin
 
 
 def _guard() -> None:
@@ -63,7 +77,7 @@ def _table(session, table_id: UUID) -> BookTable:
 
 
 @router.get("/sources")
-def list_sources(user=Depends(require_user)) -> dict[str, Any]:
+def list_sources(user=Depends(require_books_admin)) -> dict[str, Any]:
     """Книги Google, доступные сервисному аккаунту."""
     _guard()
     try:
@@ -74,7 +88,7 @@ def list_sources(user=Depends(require_user)) -> dict[str, Any]:
 
 
 @router.get("/sources/{spreadsheet_id}")
-def source_tabs(spreadsheet_id: str, user=Depends(require_user)) -> dict[str, Any]:
+def source_tabs(spreadsheet_id: str, user=Depends(require_books_admin)) -> dict[str, Any]:
     _guard()
     try:
         title, tabs = GoogleSheetsSource().list_tabs(spreadsheet_id)
@@ -92,7 +106,7 @@ def source_tabs(spreadsheet_id: str, user=Depends(require_user)) -> dict[str, An
 
 
 @router.post("/sources/refresh")
-def refresh_sources(user=Depends(require_user)) -> dict[str, bool]:
+def refresh_sources(user=Depends(require_books_admin)) -> dict[str, bool]:
     _guard()
     invalidate_cache()
     return {"ok": True}
@@ -102,7 +116,7 @@ def refresh_sources(user=Depends(require_user)) -> dict[str, bool]:
 
 
 @router.get("")
-def list_books(user=Depends(require_user)) -> dict[str, Any]:
+def list_books(user=Depends(require_books)) -> dict[str, Any]:
     with books_session() as session:
         workspace = service.ensure_workspace(session)
         return {"books": service.list_books(session, workspace.id)}
@@ -131,7 +145,7 @@ def get_table(
     f: list[str] = Query(default=[]),
     since: str = Query(default="", max_length=10),
     until: str = Query(default="", max_length=10),
-    user=Depends(require_user),
+    user=Depends(require_books),
 ) -> dict[str, Any]:
     with books_session() as session:
         table = _table(session, table_id)
@@ -282,7 +296,7 @@ def remove_field(table_id: UUID, key: str, user=Depends(require_admin)) -> dict[
 
 
 @router.get("/tables/{table_id}/board")
-def get_board(table_id: UUID, user=Depends(require_user)) -> dict[str, Any]:
+def get_board(table_id: UUID, user=Depends(require_books)) -> dict[str, Any]:
     """Что нашлось в книге, что нужно приложению и что из этого следует."""
     with books_session() as session:
         table = _table(session, table_id)
@@ -297,7 +311,7 @@ class BindingRequest(BaseModel):
 
 @router.put("/tables/{table_id}/bindings")
 def put_binding(
-    table_id: UUID, request: BindingRequest, user=Depends(require_user)
+    table_id: UUID, request: BindingRequest, user=Depends(require_books_admin)
 ) -> dict[str, Any]:
     with books_session() as session:
         table = _table(session, table_id)
@@ -341,7 +355,7 @@ def _preview_payload(preview: service.ImportPreview) -> dict[str, Any]:
 
 
 @router.post("/import/preview")
-def preview(request: ImportRequest, user=Depends(require_user)) -> dict[str, Any]:
+def preview(request: ImportRequest, user=Depends(require_books_admin)) -> dict[str, Any]:
     """Прочитать книгу и показать, что изменится. Ничего не применяет."""
     _guard()
     with books_session() as session:
@@ -367,7 +381,7 @@ class ApplyRequest(ImportRequest):
 
 
 @router.post("/import/apply")
-def apply(request: ApplyRequest, user=Depends(require_user)) -> dict[str, Any]:
+def apply(request: ApplyRequest, user=Depends(require_books_admin)) -> dict[str, Any]:
     """Применить то, что человек увидел в предпросмотре.
 
     План не хранится, а пересчитывается: книга живая, и между предпросмотром и
@@ -437,7 +451,7 @@ class RowRequest(BaseModel):
 
 @router.post("/tables/{table_id}/rows")
 def create_row(
-    table_id: UUID, request: RowRequest, user=Depends(require_user)
+    table_id: UUID, request: RowRequest, user=Depends(require_books)
 ) -> dict[str, Any]:
     with books_session() as session:
         table = _table(session, table_id)
@@ -450,7 +464,7 @@ def create_row(
 
 @router.patch("/tables/{table_id}/rows/{row_id}")
 def update_row(
-    table_id: UUID, row_id: UUID, request: RowRequest, user=Depends(require_user)
+    table_id: UUID, row_id: UUID, request: RowRequest, user=Depends(require_books)
 ) -> dict[str, Any]:
     with books_session() as session:
         table = _table(session, table_id)
@@ -474,7 +488,7 @@ def delete_row(
     table_id: UUID,
     row_id: UUID,
     version: int | None = Query(default=None),
-    user=Depends(require_user),
+    user=Depends(require_books),
 ) -> dict[str, Any]:
     with books_session() as session:
         table = _table(session, table_id)
