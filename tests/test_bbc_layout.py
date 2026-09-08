@@ -191,3 +191,75 @@ def test_every_journal_column_has_a_distinct_header() -> None:
     layout = resolve_journal_layout(journal_header(with_payroll_column=True))
     found = [layout.at(c.key) for c in JOURNAL_COLUMNS if layout.has(c.key)]
     assert len(found) == len(set(found))
+
+
+# ── Второе сальдо в мастер-книге ─────────────────────────────────────────────
+#
+# В сентябре 2026 в «Сводке все ЮР лица» прежние «Сальдо Начало» и «Сальдо
+# Конец» переименовали в «(АВР)», а в конец листа дописали пару «(без АВР)».
+# Дашборд встал: нечёткое совпадение давало по два кандидата на денежную
+# колонку. Отказ был верным поведением, но починка — это выбор, из какой
+# колонки брать деньги, и он обязан быть закреплён проверкой, а не памятью.
+
+
+def master_header(saldo: str = "(АВР)") -> list[str]:
+    """Шапка мастер-книги: в нынешней редакции или в той, что была до правки.
+
+    Строится из самих определений колонок, а не переписывается руками: копия
+    шапки на 63 позиции разошлась бы с книгой при первой же правке и начала бы
+    охранять вчерашний день.
+
+    Заголовки сальдо при этом подставляются ПО КЛЮЧУ колонки, а не берутся из
+    её `names`. Разница существенная: собери мы шапку из `names`, и попытка
+    убрать оттуда нынешнее написание убрала бы его заодно и из шапки — проверка
+    падала бы на сборке шапки, не дойдя до разбора. Красной она была бы и так,
+    но показывала бы не то, что ломается на проде.
+    """
+    from app.bbc.dataset import MASTER_COLUMNS
+
+    # Перенос строки внутри заголовка — как в самой книге: там «Сальдо» и
+    # «Начало (АВР)» стоят на двух строках одной ячейки.
+    titles = {
+        "saldo_start": f"Сальдо\nНачало {saldo}".strip(),
+        "saldo_end": f"Сальдо\nКонец {saldo}".strip(),
+    }
+    header = [titles.get(column.key, column.names[0]) for column in MASTER_COLUMNS]
+    if saldo != "(АВР)":
+        return header
+    return header + ["Сальдо\nНачало (без АВР)", "Сальдо\nКонец (без АВР)"]
+
+
+def test_master_sheet_reads_with_both_saldo_pairs_present() -> None:
+    from app.bbc.dataset import MASTER_COLUMNS
+
+    layout = resolve_layout("Сводка все ЮР лица", MASTER_COLUMNS, master_header())
+
+    assert layout.has("saldo_start")
+    assert layout.has("saldo_end")
+
+
+def test_saldo_is_taken_from_the_avr_pair_not_the_new_one() -> None:
+    """Берётся та же колонка, что читалась всегда, — переименованная.
+
+    Пара «(без АВР)» новая и считает другое. Если однажды понадобится она, это
+    отдельное решение: проверка упадёт и заставит его проговорить, вместо того
+    чтобы цифры на экране тихо поменяли смысл.
+    """
+    from app.bbc.dataset import MASTER_COLUMNS
+
+    header = master_header()
+    layout = resolve_layout("Сводка все ЮР лица", MASTER_COLUMNS, header)
+
+    assert norm(header[layout.at("saldo_start")]) == norm("Сальдо Начало (АВР)")
+    assert norm(header[layout.at("saldo_end")]) == norm("Сальдо Конец (АВР)")
+
+
+def test_the_master_sheet_from_before_the_rename_still_reads() -> None:
+    """Копия книги без переименования — на ней стоят локальные прогоны."""
+    from app.bbc.dataset import MASTER_COLUMNS  # noqa: F401
+
+    header = master_header(saldo="")
+    layout = resolve_layout("Сводка все ЮР лица", MASTER_COLUMNS, header)
+
+    assert norm(header[layout.at("saldo_start")]) == norm("Сальдо Начало")
+    assert norm(header[layout.at("saldo_end")]) == norm("Сальдо Конец")
