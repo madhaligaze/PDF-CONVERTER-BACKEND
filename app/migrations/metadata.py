@@ -26,7 +26,11 @@ import app.webexcel.models  # noqa: F401 — раздел «Таблицы» (у
 from app.books.db import BooksBase  # Раздел «Книги» (удаляемый модуль)
 import app.books.models  # noqa: F401 — раздел «Книги» (удаляемый модуль)
 
-#: Конвертер в `public`, BBC в `bbc`, «Таблицы» в `webexcel`, «Книги» в `books`.
+from app.finance.db import FinanceBase  # Раздел «Финансы» (удаляемый модуль)
+import app.finance.models  # noqa: F401 — раздел «Финансы» (удаляемый модуль)
+
+#: Конвертер в `public`, BBC в `bbc`, «Таблицы» в `webexcel`, «Книги» в `books`,
+#: «Финансы» в `finance`.
 #: Схема `webexcel` добавлена ревизией 0008 — до неё она жила вне учёта, и
 #: расхождение с моделями обнаружить было нечем.
 target_metadata = [
@@ -34,6 +38,7 @@ target_metadata = [
     BbcBase.metadata,
     WebExcelBase.metadata,
     BooksBase.metadata,
+    FinanceBase.metadata,
 ]
 
 __all__ = ["target_metadata"]
