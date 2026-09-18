@@ -363,8 +363,8 @@ def test_formula_column_does_not_make_a_row_meaningful() -> None:
     """
     from app.books.ingest import is_meaningful
 
-    junk = {"firm": "ТОО «Ромашка»"}          # только след формулы
-    real = {"firm": "ТОО «Ромашка»", "amount": "1000"}
+    junk = {"firm": "ТОО «Компания»"}          # только след формулы
+    real = {"firm": "ТОО «Компания»", "amount": "1000"}
 
     assert not is_meaningful(junk, substantive_fields=("date", "amount"))
     assert is_meaningful(real, substantive_fields=("date", "amount"))

@@ -395,3 +395,24 @@ def test_povtornaya_zagruzka_faila_s_odinakovymi_strokami_ne_dvoit(workspace):
     assert again["imported"] == 0
     assert again["duplicate"] == 2
     assert total == 2
+
+
+def test_data_s_dnem_nedeli_chitaetsya_kak_data(workspace):
+    """«пн 01.06.26» — так пишет дату книга, которую ведут руками.
+
+    Найдено живым переносом «Копии Журнала ГК BBC»: все 1999 строк уходили в
+    отложенные с «не понял дату», потому что ячейка начинается не с цифры.
+    Причём порядок частей при этом объявлялся решённым — «даты пришли из Excel
+    датами», — то есть экран уверял, что с датами всё в порядке.
+    """
+    reading = decide_date_order(["пн 01.06.26", "вт 15.06.26", "ср 16.06.26"])
+    assert reading.order == "dmy"
+    assert not reading.ambiguous
+    assert parse_date("пн 01.06.26", reading) == date(2026, 6, 1)
+    assert parse_date("Mon 15.06.26", reading) == date(2026, 6, 15)
+    assert parse_date("понедельник, 15.06.2026", reading) == date(2026, 6, 15)
+    # Приставка не должна съедать месяц «мар» и ломать словесные даты.
+    assert parse_date("3 мар 2026", reading) == date(2026, 3, 3)
+    assert parse_date("пн 3 сентября 2026", reading) == date(2026, 9, 3)
+    # И не должна превращать в дату то, что датой не является.
+    assert parse_date("среда", reading) is None

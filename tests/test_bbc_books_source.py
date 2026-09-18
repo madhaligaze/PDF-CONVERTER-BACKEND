@@ -60,7 +60,7 @@ VALUES = {
     "Наша Фирма": "BBC",
     "Вид Услуги": "Абон.П.",
     "Наш Сотрудник": "Иванов",
-    "Заказчик (Название Фирмы)": "ТОО «Ромашка»",
+    "Заказчик (Название Фирмы)": "ТОО «Компания»",
     "Число Выставления Счета": "25",
     "Сумма Договора": "1 200 000,00",
     "Отдел": "ОБО",
@@ -128,7 +128,7 @@ def test_the_row_is_actually_parsed_not_just_equal_by_emptiness() -> None:
     layout = resolve_layout("тест", MASTER_COLUMNS, HEADER)
     row = parse_contract_row(2, [VALUES[name] for name in HEADER], layout)
 
-    assert row.client == "ТОО «Ромашка»"
+    assert row.client == "ТОО «Компания»"
     assert row.contract_amount == 1_200_000.0
     assert row.paid_amount == 400_000.0
     assert row.debt == 800_000.0

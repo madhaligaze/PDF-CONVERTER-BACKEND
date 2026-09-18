@@ -218,6 +218,17 @@ KIND_WORDS: dict[str, tuple[str, ...]] = {
 _SPACES = re.compile(r"[\s   ]+")
 _MONEY_JUNK = re.compile(r"[^0-9,.\-()]")
 _DATE_PARTS = re.compile(r"^\s*(\d{1,4})[.\-/\\](\d{1,2})[.\-/\\](\d{1,4})")
+#: День недели перед датой. В книгах, которые ведут руками, дата часто записана
+#: форматом «ддд ДД.ММ.ГГ» — в «Журнале ГК BBC» это «пн 01.06.26». Для человека
+#: это ячейка с датой, для разбора — текст, не начинающийся с цифры: без снятия
+#: приставки книга целиком уходила в отложенные строки с «не понял дату».
+_WEEKDAY = re.compile(
+    r"^\s*(?:пн|вт|ср|чт|пт|сб|вс|понедельник|вторник|среда|четверг|пятница|суббота|"
+    r"воскресенье|дүйсенбі|сейсенбі|сәрсенбі|бейсенбі|жұма|сенбі|жексенбі|"
+    r"mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|"
+    r"saturday|sunday)\.?,?\s+",
+    re.IGNORECASE,
+)
 _MONTH_NAMES = {
     "янв": 1, "фев": 2, "мар": 3, "апр": 4, "май": 5, "мая": 5, "июн": 6, "июл": 7,
     "авг": 8, "сен": 9, "окт": 10, "ноя": 11, "дек": 12,
@@ -566,7 +577,7 @@ class DateReading:
 
 
 def _date_parts(text: str) -> tuple[int, int, int] | None:
-    match = _DATE_PARTS.match(text)
+    match = _DATE_PARTS.match(_WEEKDAY.sub("", text, count=1))
     if not match:
         return None
     a, b, c = (int(part) for part in match.groups())
@@ -673,8 +684,8 @@ def parse_date(raw: Any, reading: DateReading) -> date | None:
         except ValueError:
             return None
 
-    # «3 сентября 2026», «03 сен 2026», «Sep 3, 2026»
-    lowered = text.lower().replace(",", " ")
+    # «3 сентября 2026», «03 сен 2026», «Sep 3, 2026», «пн 3 сентября 2026»
+    lowered = _WEEKDAY.sub("", text, count=1).lower().replace(",", " ")
     chunks = _SPACES.sub(" ", lowered).split(" ")
     day = month = year = 0
     for chunk in chunks:
