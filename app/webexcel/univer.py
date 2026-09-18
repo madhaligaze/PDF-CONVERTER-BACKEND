@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, Callable
 
 # ── Перечисления Univer (дублируются числами: Python не импортирует TS) ─────
 
@@ -252,8 +252,51 @@ def _value_of(cell: dict[str, Any]) -> tuple[Any, int | None]:
     return None, None
 
 
-def convert_tab(payload: dict[str, Any]) -> dict[str, Any]:
-    """Ответ `fetch_tab_grid` → `{sheet, styles, stats}` для сборки книги."""
+def _list_options(
+    condition: dict[str, Any],
+    condition_type: str,
+    resolve_ref: Callable[[str], list[str]] | None,
+    cache: dict[str, tuple[str, ...]],
+) -> tuple[str, ...]:
+    """Состав выпадающего списка ячейки.
+
+    Два вида в Google. `ONE_OF_LIST` несёт значения при себе. `ONE_OF_RANGE`
+    несёт ссылку на диапазон-справочник — именно так сделаны списки в книгах
+    BBC, и без разрешения ссылки колонка приезжает с правилом, но без единого
+    значения: выбирать не из чего, а выглядит как «списки не поддерживаются».
+    """
+    raw = condition.get("values") or []
+    if condition_type == "ONE_OF_LIST":
+        values = [str(item.get("userEnteredValue", "")).strip() for item in raw]
+        return tuple(dict.fromkeys(value for value in values if value))
+
+    ref = str((raw[0] if raw else {}).get("userEnteredValue", "")).strip()
+    if not ref or resolve_ref is None:
+        return ()
+    hit = cache.get(ref)
+    if hit is not None:
+        return hit
+    try:
+        values = tuple(dict.fromkeys(str(value).strip() for value in resolve_ref(ref) if str(value).strip()))
+    except Exception:  # noqa: BLE001
+        # Справочник не прочитался — вкладка всё равно открывается. Список это
+        # удобство, а отказ открыть книгу из-за него был бы несоразмерен.
+        values = ()
+    cache[ref] = values
+    return values
+
+
+def convert_tab(
+    payload: dict[str, Any],
+    resolve_ref: Callable[[str], list[str]] | None = None,
+) -> dict[str, Any]:
+    """Ответ `fetch_tab_grid` → `{sheet, styles, stats}` для сборки книги.
+
+    `resolve_ref` разрешает справочник выпадающего списка, заданный ссылкой
+    (`='Справочник'!$I$2:$I`). Передаётся снаружи, потому что здесь формат, а не
+    сеть: разбор вкладки обязан проверяться без Google и без кредов. Не передан —
+    списки-ссылки просто не появятся, остальное соберётся как прежде.
+    """
     sheet = payload["sheet"]
     locale_tag = _locale_tag(payload.get("spreadsheet_locale", ""))
     props = sheet.get("properties", {})
@@ -281,6 +324,14 @@ def convert_tab(payload: dict[str, Any]) -> dict[str, Any]:
     fonts: set[str] = set()
     # Клетки-флажки, собираемые построчно и потом склеиваемые в диапазоны.
     checkbox_cells: list[tuple[int, int]] = []
+    # Клетки выпадающих списков, разложенные по составу списка: одинаковый
+    # список на десяти колонках — одно правило на десять диапазонов, а не
+    # десять одинаковых правил.
+    list_cells: dict[tuple[str, ...], list[tuple[int, int]]] = {}
+    # Разрешённые справочники-ссылки: один диапазон читается один раз, даже
+    # если на него ссылаются двести ячеек. Без этого перенос книги выбрал бы
+    # квоту Google на первой же колонке.
+    resolved_refs: dict[str, tuple[str, ...]] = {}
     parsed: list[list[tuple[Any, int | None, str, str | None, str | None]]] = []
     max_col = 0
 
@@ -290,9 +341,14 @@ def convert_tab(payload: dict[str, Any]) -> dict[str, Any]:
         parsed_row: list[tuple[Any, int | None, str, str | None, str | None]] = []
         for column, cell in enumerate(values):
             condition = (cell.get("dataValidation") or {}).get("condition") or {}
-            is_checkbox = str(condition.get("type", "")).upper() == "BOOLEAN"
+            condition_type = str(condition.get("type", "")).upper()
+            is_checkbox = condition_type == "BOOLEAN"
             if is_checkbox:
                 checkbox_cells.append((len(parsed), column))
+            elif condition_type in ("ONE_OF_LIST", "ONE_OF_RANGE"):
+                options = _list_options(condition, condition_type, resolve_ref, resolved_refs)
+                if options:
+                    list_cells.setdefault(options, []).append((len(parsed), column))
             value, kind = _value_of(cell)
             if is_checkbox and kind == _T_BOOLEAN:
                 # Флажок Univer рисуется, только если значение ячейки совпадает
@@ -448,6 +504,13 @@ def convert_tab(payload: dict[str, Any]) -> dict[str, Any]:
         # Диапазоны флажков — отдельным списком, потому что в снимке Univer они
         # живут не в ячейках, а в ресурсе плагина проверки данных.
         "checkboxes": _merge_columns(checkbox_cells),
+        # То же для выпадающих списков: значения и диапазоны, на которые они
+        # ставятся. Фронт вешает их через API Univer — сериализовать список в
+        # строку самим нельзя, значение с запятой внутри разъехалось бы надвое.
+        "lists": [
+            {"values": list(options), "ranges": _merge_columns(cells)}
+            for options, cells in list_cells.items()
+        ],
         # Шрифты листа отдаются наружу, чтобы фронт подгрузил ровно их.
         # Univer рисует в canvas: незагруженное семейство там не «подменяется
         # похожим», а падает в засечковый шрифт по умолчанию — лист, набранный

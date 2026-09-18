@@ -20,6 +20,7 @@ from app.webexcel.google import (
     invalidate_cache,
     list_spreadsheets,
     spreadsheet_meta,
+    values_of_ref,
 )
 from app.webexcel.univer import build_workbook, convert_tab
 
@@ -72,7 +73,9 @@ def get_source_tab(spreadsheet_id: str, title: str = Query(...)) -> dict[str, An
     _guard()
     try:
         raw = fetch_tab_grid(spreadsheet_id, title)
-        converted = convert_tab(raw)
+        # Справочники выпадающих списков разрешаются здесь: в разборе вкладки
+        # сети нет намеренно, иначе его нельзя было бы проверить без кредов.
+        converted = convert_tab(raw, lambda ref: values_of_ref(spreadsheet_id, ref))
     except WebExcelError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -84,6 +87,7 @@ def get_source_tab(spreadsheet_id: str, title: str = Query(...)) -> dict[str, An
         "stats": converted["stats"],
         "fonts": converted["fonts"],
         "checkboxes": converted["checkboxes"],
+        "lists": converted["lists"],
     }
 
 

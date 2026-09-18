@@ -86,6 +86,10 @@ def _client() -> gspread.Client:
 _files_cache: tuple[float, list[dict[str, Any]]] | None = None
 _meta_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _grid_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+#: Значения вкладки строками — для переноса книги в учёт.
+_values_cache: dict[tuple[str, str], tuple[float, list[list[str]]]] = {}
+#: Справочники выпадающих списков: диапазон → его значения.
+_ref_cache: dict[tuple[str, str], tuple[float, list[str]]] = {}
 _lock = threading.Lock()
 
 
@@ -99,6 +103,8 @@ def invalidate_cache() -> None:
         _files_cache = None
         _meta_cache.clear()
         _grid_cache.clear()
+        _values_cache.clear()
+        _ref_cache.clear()
 
 
 # ── Перечисление книг ───────────────────────────────────────────────────────
@@ -201,12 +207,14 @@ _GRID_FIELDS = ",".join(
         "sheets.data.startColumn",
         "sheets.data.rowMetadata(pixelSize,hiddenByUser)",
         "sheets.data.columnMetadata(pixelSize,hiddenByUser)",
-        # dataValidation нужен ровно ради одного случая — флажков. В Google
-        # это не «значение TRUE», а ячейка с условием BOOLEAN, и без него
-        # колонка «Счет» приезжает столбцом слова TRUE вместо галочек.
+        # dataValidation — это флажки и выпадающие списки. Флажок в Google не
+        # «значение TRUE», а ячейка с условием BOOLEAN: без условия колонка
+        # «Счет» приезжает столбцом слова TRUE вместо галочек. Списки живут там
+        # же: ONE_OF_LIST держит значения при себе, ONE_OF_RANGE — ссылку на
+        # диапазон-справочник, поэтому `values` берётся вместе с типом.
         "sheets.data.rowData.values("
         "formattedValue,effectiveValue,userEnteredValue,note,hyperlink,"
-        "dataValidation.condition.type,"
+        "dataValidation.condition(type,values),"
         "effectiveFormat("
         "numberFormat,backgroundColor,borders,horizontalAlignment,"
         "verticalAlignment,wrapStrategy,textRotation,"
@@ -279,6 +287,56 @@ def fetch_tab_grid(spreadsheet_id: str, tab_title: str) -> dict[str, Any]:
     return result
 
 
+#: Потолок на справочник выпадающего списка. Список в тысячу строк — это уже не
+#: выбор, а поиск; Univer рисует его целиком, и вкладка встаёт.
+_LIST_LIMIT = 500
+
+
+def values_of_ref(spreadsheet_id: str, ref: str) -> list[str]:
+    """Значения диапазона-справочника из условия ONE_OF_RANGE.
+
+    В книгах BBC списки заданы не перечислением, а ссылкой вида
+    `='Справочник'!$I$2:$I`. Без этого разрешения колонка приезжает без списка:
+    правило есть, выбирать не из чего — а выглядит это как «списки не
+    поддерживаются».
+
+    Пустые ячейки и повторы выбрасываются: конец столбца-справочника почти
+    всегда пустой, и без чистки в списке оказывались бы сотни пустых строк.
+    """
+    cleaned = ref.strip().lstrip("=").strip()
+    if not cleaned:
+        return []
+    key = (spreadsheet_id, cleaned)
+    with _lock:
+        hit = _ref_cache.get(key)
+        if hit and _fresh(hit[0]):
+            return hit[1]
+
+    spreadsheet = _open(spreadsheet_id)
+    try:
+        raw = spreadsheet.values_get(cleaned, params={"valueRenderOption": "FORMATTED_VALUE"})
+    except Exception as exc:  # noqa: BLE001
+        raise WebExcelError(humanize(exc)) from exc
+
+    seen: list[str] = []
+    known: set[str] = set()
+    for row in raw.get("values", []):
+        for cell in row:
+            text = str(cell).strip()
+            if not text or text in known:
+                continue
+            known.add(text)
+            seen.append(text)
+            if len(seen) >= _LIST_LIMIT:
+                break
+        if len(seen) >= _LIST_LIMIT:
+            break
+
+    with _lock:
+        _ref_cache[key] = (time.monotonic(), seen)
+    return seen
+
+
 def fetch_tab_values(spreadsheet_id: str, tab_title: str) -> list[list[str]]:
     """Значения вкладки строками — без оформления, как их видит человек.
 
@@ -333,4 +391,5 @@ __all__ = [
     "invalidate_cache",
     "list_spreadsheets",
     "spreadsheet_meta",
+    "values_of_ref",
 ]
