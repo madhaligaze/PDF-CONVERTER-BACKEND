@@ -13,6 +13,7 @@ from decimal import Decimal
 
 import openpyxl
 import pytest
+import sqlalchemy as sa
 
 from app.finance import service
 from app.finance.db import finance_session
@@ -416,3 +417,27 @@ def test_data_s_dnem_nedeli_chitaetsya_kak_data(workspace):
     assert parse_date("пн 3 сентября 2026", reading) == date(2026, 9, 3)
     # И не должна превращать в дату то, что датой не является.
     assert parse_date("среда", reading) is None
+
+
+def test_povtornyy_razbor_ne_ostavlyaet_broshennyh_partiy(workspace):
+    """Ответ на вопрос раздела не должен плодить «разобрано, не заведено».
+
+    Найдено живым прогоном: на вопрос «на какой счёт?» человек отвечает, раздел
+    разбирает файл заново — и в истории повисали две записи на один файл. Какую
+    из них продолжать, узнать было нельзя.
+    """
+    from app.finance.models import ImportBatch
+
+    data = book([["01.03.2026", "-1 000", "Касса", "", "Связь", "", "интернет"]])
+    with finance_session() as session:
+        space = service.get_workspace(session, workspace)
+        for _ in range(3):
+            preview = analyze(data, "выписка.xlsx", ["Касса"])
+            service.save_preview(session, space, preview, actor="тест")
+        session.flush()
+        previews = session.scalars(
+            sa.select(ImportBatch).where(
+                ImportBatch.workspace_id == space.id, ImportBatch.status == "preview"
+            )
+        ).all()
+        assert len(previews) == 1, "незавершённых партий на один файл больше одной"

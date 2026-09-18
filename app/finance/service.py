@@ -690,6 +690,25 @@ def save_preview(
     Партия сохраняется до применения намеренно: человек уходит разбираться с
     десятью строками, возвращается через час и не должен загружать файл заново.
     """
+    # Прошлый незавершённый разбор ТОГО ЖЕ источника снимается.
+    #
+    # Ответ на вопрос раздела («на какой счёт?», «как записаны даты?») — это
+    # повторный разбор, то есть новая партия. Без уборки в истории оставались
+    # две-три записи «разобрано, не заведено» на один файл, и человек не знал,
+    # какую из них продолжать. Найдено живым прогоном 18 сентября.
+    stale = session.scalars(
+        sa.select(ImportBatch).where(
+            ImportBatch.workspace_id == workspace.id,
+            ImportBatch.file_name == preview.file_name,
+            ImportBatch.status == "preview",
+        )
+    ).all()
+    for old_batch in stale:
+        session.execute(sa.delete(ImportRow).where(ImportRow.batch_id == old_batch.id))
+        session.delete(old_batch)
+    if stale:
+        session.flush()
+
     counts = preview.counts
     batch = ImportBatch(
         workspace_id=workspace.id,
