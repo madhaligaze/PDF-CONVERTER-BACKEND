@@ -40,6 +40,7 @@ from app.finance.models import (
     Category,
     Counterparty,
     Operation,
+    OperationCategory,
     OperationProject,
     Plan,
     Project,
@@ -174,24 +175,63 @@ def _breakdown(
             .join(Project, Project.id == OperationProject.project_id)
             .where(*_live(workspace_id), column >= date_from, column <= date_to)
         )
-    else:
-        label_model = Category if group == "category" else Counterparty
-        label_join = (
-            Operation.category_id == Category.id
-            if group == "category"
-            else Operation.counterparty_id == Counterparty.id
+    elif group == "category":
+        # Дробление платежа по статьям.
+        #
+        # Часть суммы может быть разнесена по статьям отдельно (перевод
+        # поставщику закрывает и товар, и доставку). Тогда в отчёт идут части, а
+        # на статье самой операции остаётся **остаток**. Считать иначе — либо
+        # потерять части, либо посчитать платёж дважды; и то и то отчёт покажет
+        # как обычные цифры, ничего не сообщив.
+        split_sum = (
+            sa.select(
+                OperationCategory.operation_id.label("operation_id"),
+                sa.func.sum(OperationCategory.amount).label("total"),
+            )
+            .group_by(OperationCategory.operation_id)
+            .subquery()
         )
+        own = session.execute(
+            sa.select(
+                column.label("when"),
+                Operation.kind,
+                Operation.status,
+                Operation.amount_base - sa.func.coalesce(split_sum.c.total, 0),
+                Category.name,
+                Operation.account_from_id,
+                Operation.account_to_id,
+            )
+            .outerjoin(Category, Operation.category_id == Category.id)
+            .outerjoin(split_sum, split_sum.c.operation_id == Operation.id)
+            .where(*_live(workspace_id), column >= date_from, column <= date_to)
+        ).all()
+        parts = session.execute(
+            sa.select(
+                column.label("when"),
+                Operation.kind,
+                Operation.status,
+                OperationCategory.amount,
+                Category.name,
+                Operation.account_from_id,
+                Operation.account_to_id,
+            )
+            .join(OperationCategory, OperationCategory.operation_id == Operation.id)
+            .join(Category, Category.id == OperationCategory.category_id)
+            .where(*_live(workspace_id), column >= date_from, column <= date_to)
+        ).all()
+        rows = [row for row in own + parts if Decimal(str(row[3] or 0)) != ZERO]
+    else:
         rows = session.execute(
             sa.select(
                 column.label("when"),
                 Operation.kind,
                 Operation.status,
                 Operation.amount_base,
-                label_model.name,
+                Counterparty.name,
                 Operation.account_from_id,
                 Operation.account_to_id,
             )
-            .outerjoin(label_model, label_join)
+            .outerjoin(Counterparty, Operation.counterparty_id == Counterparty.id)
             .where(*_live(workspace_id), column >= date_from, column <= date_to)
         )
 
@@ -679,6 +719,265 @@ def plan_actual(
             }
         )
     return {"months": months, "method": method, "items": items}
+
+
+def account_statement(
+    session: Session,
+    workspace_id: uuid.UUID,
+    account_id: uuid.UUID,
+    date_from: date,
+    date_to: date,
+) -> dict[str, Any]:
+    """Выписка по счёту: остаток на начало, движение, остаток на конец.
+
+    Это отчёт для сверки с банком, поэтому в нём только факт и только один
+    счёт: ожидания и «все счета вместе» мешают сверке, а не помогают. Строки
+    идут по возрастанию даты и с текущим остатком после каждой — так же, как в
+    настоящей выписке, иначе сверять пришлось бы калькулятором.
+    """
+    account = session.get(Account, account_id)
+    if account is None or account.workspace_id != workspace_id:
+        raise ValueError("Счёт не найден")
+
+    before = account_balances(session, workspace_id, as_of=date_from - timedelta(days=1))
+    opening = ZERO
+    for item in before:
+        if item["id"] == str(account_id):
+            opening = Decimal(item["balance"])
+
+    rows = session.execute(
+        sa.select(
+            Operation.id,
+            Operation.paid_at,
+            Operation.kind,
+            Operation.amount_base,
+            Operation.comment,
+            Category.name,
+            Counterparty.name,
+            Operation.account_from_id,
+            Operation.account_to_id,
+        )
+        .outerjoin(Category, Operation.category_id == Category.id)
+        .outerjoin(Counterparty, Operation.counterparty_id == Counterparty.id)
+        .where(
+            *_live(workspace_id),
+            Operation.status == "fact",
+            Operation.paid_at >= date_from,
+            Operation.paid_at <= date_to,
+            sa.or_(
+                Operation.account_from_id == account_id,
+                Operation.account_to_id == account_id,
+            ),
+        )
+        .order_by(Operation.paid_at, Operation.created_at)
+    ).all()
+
+    running = opening
+    income_total = ZERO
+    expense_total = ZERO
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        (
+            operation_id,
+            paid_at,
+            kind,
+            amount,
+            comment,
+            category,
+            counterparty,
+            account_from,
+            account_to,
+        ) = row
+        value = Decimal(str(amount or 0))
+        # Перевод внутри компании для этого счёта — либо приход, либо расход,
+        # смотря с какой он стороны. Без этого перевод между своими счетами
+        # выглядел бы как исчезновение денег.
+        incoming = account_to == account_id
+        signed = value if incoming else -value
+        running += signed
+        if incoming:
+            income_total += value
+        else:
+            expense_total += value
+        items.append(
+            {
+                "id": str(operation_id),
+                "paid_at": paid_at.isoformat(),
+                "kind": kind,
+                "direction": "in" if incoming else "out",
+                "amount": str(value),
+                "balance": str(running),
+                "category": category or "",
+                "counterparty": counterparty or "",
+                "comment": comment or "",
+            }
+        )
+
+    return {
+        "account": {"id": str(account.id), "name": account.name, "kind": account.kind},
+        "opening_balance": str(opening),
+        "closing_balance": str(running),
+        "income": str(income_total),
+        "expense": str(expense_total),
+        "rows": items,
+    }
+
+
+def _by_nature(
+    session: Session, workspace_id: uuid.UUID, date_from: date, date_to: date
+) -> dict[str, Decimal]:
+    """Суммы по природе статьи за период — основа показателей.
+
+    Считается по дате сделки: показатели про заработанное, а не про
+    полученное. Иначе EBITDA месяца зависела бы от того, когда клиент решил
+    заплатить.
+    """
+    column = sa.func.coalesce(Operation.accrued_at, Operation.paid_at)
+    # Одно и то же выражение в SELECT и GROUP BY — буквально один объект, и
+    # литерал без параметра. С `sa.literal("other")` каждое упоминание стало
+    # отдельным параметром (%(param_1)s и %(param_2)s), Postgres счёл выражения
+    # разными и отказал в группировке. SQLite это пропускает, поэтому тесты
+    # молчали, а живой отчёт отдавал 500.
+    nature = sa.func.coalesce(Category.nature, sa.literal_column("'other'"))
+    rows = session.execute(
+        sa.select(Operation.kind, nature, sa.func.sum(Operation.amount_base))
+        .outerjoin(Category, Operation.category_id == Category.id)
+        .where(*_live(workspace_id), column >= date_from, column <= date_to)
+        .group_by(Operation.kind, nature)
+    ).all()
+
+    totals: dict[str, Decimal] = defaultdict(lambda: ZERO)
+    for kind, nature, amount in rows:
+        # Переводы и движение капитала — не доход и не расход. Полученный
+        # кредит, посчитанный выручкой, сделал бы месяц «прибыльным» ровно на
+        # сумму долга; погашение, посчитанное расходом, — наоборот.
+        if kind == "transfer" or nature == "capital":
+            continue
+        value = Decimal(str(amount or 0))
+        if kind == "income":
+            # Выручка — только доход от основной деятельности. «Прочий доход»
+            # (штрафы, курсовая разница) входит в чистую прибыль, но не в
+            # выручку: иначе маржа считалась бы от чужих денег.
+            if nature in ("revenue", "operating"):
+                totals["revenue"] += value
+            else:
+                totals["income_other"] += value
+        else:
+            totals[nature or "other"] += value
+    return totals
+
+
+def indicators(
+    session: Session, workspace_id: uuid.UUID, date_from: date, date_to: date
+) -> dict[str, Any]:
+    """EBITDA, валовая прибыль, маржа, рентабельность.
+
+    Всё это считается из природы статей (`categories.nature`), а не из их
+    названий. Пока природа не расставлена, статьи расходов считаются
+    операционными — ошибка в эту сторону **занижает** EBITDA, и это
+    предпочтительнее: завышенный показатель принимают на веру, заниженный
+    заставляют проверить.
+
+    Показатели, которых мы не считаем, не показываются вовсе. Строка «ROE: 0%»
+    там, где нет данных о капитале, — это не ноль, а неправда.
+    """
+    totals = _by_nature(session, workspace_id, date_from, date_to)
+    revenue = totals.get("revenue", ZERO)
+    cogs = totals.get("cogs", ZERO)
+    operating = totals.get("operating", ZERO)
+    financial = totals.get("financial", ZERO)
+    depreciation = totals.get("depreciation", ZERO)
+    tax = totals.get("tax", ZERO)
+    other = totals.get("other", ZERO)
+    income_other = totals.get("income_other", ZERO)
+
+    gross = revenue - cogs
+    ebitda = gross - operating - other
+    operating_profit = ebitda - depreciation
+    net = operating_profit + income_other - financial - tax
+
+    def percent(part: Decimal, whole: Decimal) -> str | None:
+        if whole == ZERO:
+            return None
+        return str((part / whole * 100).quantize(Decimal("0.1")))
+
+    return {
+        "period": {"from": date_from.isoformat(), "to": date_to.isoformat()},
+        "revenue": str(revenue),
+        "cogs": str(cogs),
+        "gross_profit": str(gross),
+        "operating_costs": str(operating + other),
+        "ebitda": str(ebitda),
+        "depreciation": str(depreciation),
+        "operating_profit": str(operating_profit),
+        "other_income": str(income_other),
+        "financial_costs": str(financial),
+        "tax": str(tax),
+        "net_profit": str(net),
+        "gross_margin": percent(gross, revenue),
+        "ebitda_margin": percent(ebitda, revenue),
+        "net_margin": percent(net, revenue),
+        # Что именно не учтено в показателях — списком, а не молчанием.
+        "not_counted": [
+            name
+            for name, present in (
+                ("основные средства и их амортизация по графику", depreciation == ZERO),
+                ("запасы", True),
+                ("капитал и заёмные средства", True),
+            )
+            if present
+        ],
+    }
+
+
+def balance(session: Session, workspace_id: uuid.UUID, *, as_of: date | None = None) -> dict[str, Any]:
+    """Баланс: чем компания владеет и что должна, на дату.
+
+    Считается из того, что в учёте действительно есть: остатки на счетах,
+    дебиторка и кредиторка. Основных средств, запасов и кредитов в модели нет —
+    и они не подставляются нулями, а перечислены отдельно как неучтённое.
+    Баланс с молчаливыми нулями сходится идеально и не значит ничего.
+    """
+    day = as_of or date.today()
+    accounts = account_balances(session, workspace_id, as_of=day)
+    money = ZERO
+    money_rows = []
+    for item in accounts:
+        if item["excluded_from_reports"]:
+            continue
+        value = Decimal(item["balance"])
+        money += value
+        money_rows.append({"name": item["name"], "amount": str(value)})
+
+    debt = debts(session, workspace_id, as_of=day)
+    receivable = Decimal(debt["receivable"]["total"])
+    payable = Decimal(debt["payable"]["total"])
+
+    assets = money + receivable
+    liabilities = payable
+    equity = assets - liabilities
+
+    return {
+        "as_of": day.isoformat(),
+        "assets": {
+            "total": str(assets),
+            "rows": [
+                {"name": "Деньги на счетах", "amount": str(money), "details": money_rows},
+                {"name": "Дебиторка — нам должны", "amount": str(receivable)},
+            ],
+        },
+        "liabilities": {
+            "total": str(liabilities),
+            "rows": [{"name": "Кредиторка — мы должны", "amount": str(payable)}],
+        },
+        "equity": str(equity),
+        "not_counted": [
+            "основные средства",
+            "запасы и товары на складе",
+            "кредиты и займы",
+            "уставный капитал",
+        ],
+    }
 
 
 def _checks(

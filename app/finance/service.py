@@ -38,6 +38,7 @@ from app.finance.models import (
     ImportBatch,
     ImportRow,
     Operation,
+    OperationCategory,
     OperationProject,
     OperationTag,
     Plan,
@@ -85,6 +86,20 @@ SEED_CATEGORIES: tuple[tuple[str, str, str], ...] = (
     ("expense", "Погашение кредита", "loan_out"),
     ("expense", "Дивиденды", "dividend"),
 )
+
+#: Природа начальных статей. Отдельным словарём, а не четвёртым полем
+#: кортежа: так её видно одним взглядом, и ошибка «кредит посчитан выручкой»
+#: ловится чтением, а не отчётом.
+SEED_NATURES: dict[str, str] = {
+    "Выручка": "revenue",
+    "Прочий доход": "other",
+    "Получение кредита": "capital",
+    "Возврат займа": "capital",
+    "Закуп товара": "cogs",
+    "Налоги и сборы": "tax",
+    "Погашение кредита": "capital",
+    "Дивиденды": "capital",
+}
 
 
 def create_workspace(session: Session, *, title: str) -> Workspace:
@@ -205,6 +220,7 @@ def _seed(session: Session, workspace: Workspace) -> None:
                 name=name,
                 normalized_name=norm(name),
                 system_key=system_key,
+                nature=SEED_NATURES.get(name, "operating"),
                 position=position * POSITION_STEP,
             )
         )
@@ -402,7 +418,12 @@ class OperationInput:
     counterparty_id: uuid.UUID | None = None
     comment: str = ""
     projects: Sequence[tuple[uuid.UUID, Decimal]] = ()
+    #: Дробление по статьям: один платёж на несколько статей.
+    categories: Sequence[tuple[uuid.UUID, Decimal]] = ()
     tags: Sequence[uuid.UUID] = ()
+    #: Откуда операция родилась, если не руками.
+    recurrence_id: uuid.UUID | None = None
+    integration_id: uuid.UUID | None = None
     source: str = "app"
     external_key: str | None = None
     raw: dict[str, Any] | None = None
@@ -417,6 +438,14 @@ def _validate(session: Session, workspace: Workspace, data: OperationInput) -> N
             raise FinanceError("Для перевода нужны оба счёта")
         if data.account_from_id == data.account_to_id:
             raise FinanceError("Перевод на тот же счёт ничего не меняет")
+    # У ожидания счёта может не быть, и это не пробел в данных.
+    #
+    # Счёт клиенту выставляют, не зная, на какой из своих счетов придут деньги:
+    # это выяснится в момент оплаты. Требовать счёт заранее значит заставить
+    # выбрать наугад — а потом сверять выписку с угаданным. Для факта счёт
+    # обязателен по-прежнему: деньги всегда откуда-то и куда-то двигаются.
+    if data.status == "plan":
+        return
     if data.kind == "income" and not data.account_to_id:
         raise FinanceError("Не указано, на какой счёт пришли деньги")
     if data.kind == "expense" and not data.account_from_id:
@@ -451,6 +480,42 @@ def _split_state(amount: Decimal, splits: Sequence[tuple[uuid.UUID, Decimal]]) -
     return "partial"
 
 
+def _write_category_splits(
+    session: Session, operation: Operation, splits: Sequence[tuple[uuid.UUID, Decimal]]
+) -> None:
+    """Переписать дробление операции по статьям.
+
+    Части всегда положительные — знак задаёт вид операции. Сумма частей больше
+    суммы операции запрещена: это не «частичное разнесение», а ошибка, и
+    показать её надо в момент ввода, а не в отчёте через месяц. Меньше —
+    можно: остаток остаётся на статье самой операции.
+
+    Когда части заданы, `category_id` операции не отменяется: на нём остаётся
+    неразнесённый остаток, и отчёт складывает и то и то.
+    """
+    session.execute(
+        sa.delete(OperationCategory).where(OperationCategory.operation_id == operation.id)
+    )
+    if not splits:
+        return
+    total = Decimal("0")
+    for category_id, value in splits:
+        amount = Decimal(str(value))
+        if amount <= 0:
+            raise FinanceError("Часть платежа не может быть нулевой или отрицательной")
+        total += amount
+        session.add(
+            OperationCategory(
+                operation_id=operation.id, category_id=category_id, amount=amount
+            )
+        )
+    if total > Decimal(str(operation.amount)):
+        raise FinanceError(
+            f"Части по статьям ({total}) больше суммы операции ({operation.amount})"
+        )
+    session.flush()
+
+
 def create_operation(
     session: Session, workspace: Workspace, data: OperationInput, *, actor: str = ""
 ) -> Operation:
@@ -479,6 +544,8 @@ def create_operation(
         comment=data.comment or "",
         split_state=_split_state(amount, data.projects),
         source=data.source,
+        recurrence_id=data.recurrence_id,
+        integration_id=data.integration_id,
         external_key=data.external_key,
         import_batch_id=data.import_batch_id,
         raw=data.raw or {},
@@ -490,6 +557,7 @@ def create_operation(
         session.add(
             OperationProject(operation_id=operation.id, project_id=project_id, amount=Decimal(str(value)))
         )
+    _write_category_splits(session, operation, data.categories)
     for tag_id in data.tags:
         session.add(OperationTag(operation_id=operation.id, tag_id=tag_id))
     session.flush()
@@ -516,6 +584,7 @@ def update_operation(
         )
 
     projects = changes.pop("projects", None)
+    categories = changes.pop("categories", None)
     tags = changes.pop("tags", None)
     for key, value in changes.items():
         if not hasattr(operation, key):
@@ -533,6 +602,8 @@ def update_operation(
                 )
             )
         operation.split_state = _split_state(Decimal(str(operation.amount)), projects)
+    if categories is not None:
+        _write_category_splits(session, operation, categories)
     if tags is not None:
         session.execute(sa.delete(OperationTag).where(OperationTag.operation_id == operation.id))
         for tag_id in tags:

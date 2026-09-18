@@ -84,7 +84,9 @@ OPERATION_STATUSES = ("fact", "plan")
 #: Откуда взялась операция. Нужно не для истории, а для ответа на вопрос «кто
 #: это записал»: строка из импорта и строка, набранная руками, чинятся
 #: по-разному.
-OPERATION_SOURCES = ("app", "grid", "import", "api")
+#: Откуда операция взялась. Список важен не для порядка: по нему видно, что
+#: править руками, а что придёт снова (повторение, интеграция, счёт).
+OPERATION_SOURCES = ("app", "grid", "import", "api", "invoice", "recurrence", "integration")
 ACCOUNT_KINDS = ("bank", "cash", "card", "safe", "crypto", "other")
 CATEGORY_SIDES = ("income", "expense")
 #: Роль контрагента. Список повторяет тот, что сложился в отрасли: он определяет,
@@ -95,6 +97,20 @@ COUNTERPARTY_ROLES = ("client", "supplier", "staff", "owner", "creditor", "borro
 #: не считается при каждом чтении: отчёт по проектам обязан уметь сказать
 #: «здесь цифры неполные», не пересчитывая разнесение всех строк.
 SPLIT_STATES = ("none", "exact", "partial", "mismatch")
+#: Природа статьи для отчётности.
+#: `capital` — движение капитала: кредит получен или погашен, дивиденды,
+#: взнос собственника. Это не доход и не расход, в показатели не входит.
+CATEGORY_NATURES = (
+    "revenue", "cogs", "operating", "financial", "depreciation", "tax", "other", "capital"
+)
+#: Счёт-фактура: исходящая (нам должны) и входящая (мы должны).
+INVOICE_KINDS = ("out", "in")
+INVOICE_STATUSES = ("draft", "sent", "paid", "void")
+#: Как часто повторяется операция.
+RECURRENCE_PERIODS = ("week", "month", "quarter", "year")
+#: Что умеет интеграция.
+INTEGRATION_KINDS = ("api", "statement", "sheets")
+INTEGRATION_STATES = ("draft", "active", "off")
 IMPORT_STATUSES = ("preview", "applied", "cancelled")
 #: Что стало со строкой файла. `skipped` — строка не операция (шапка, «Итого»,
 #: пустая), `failed` — операция, но данных не хватило.
@@ -191,6 +207,7 @@ class Category(FinanceBase):
             "workspace_id", "side", "parent_id", "normalized_name", name="uq_categories_name"
         ),
         sa.Index("ix_categories_workspace_id_side", "workspace_id", "side"),
+        sa.CheckConstraint(_in("nature", CATEGORY_NATURES), name="category_nature"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=_uuid)
@@ -206,6 +223,14 @@ class Category(FinanceBase):
     #: Системный ключ для категорий, у которых особый смысл в отчётах: заём,
     #: погашение кредита, налоги, дивиденды. Пусто у обычных статей.
     system_key: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("''"))
+    #: Природа статьи — чем она является в отчётности, а не как называется.
+    #:
+    #: Без неё нельзя посчитать ни валовую прибыль, ни EBITDA: «Закуп товара» и
+    #: «Аренда» оба расходы, но первый — себестоимость, второй — операционный
+    #: расход, а проценты по кредиту и амортизация в EBITDA не входят вовсе.
+    #: Умолчание — `operating`: самая частая природа, и ошибка в эту сторону
+    #: занижает EBITDA, а не завышает её.
+    nature: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("'operating'"))
     position: Mapped[int] = mapped_column(sa.Integer, server_default=sa.text("0"))
     archived_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
 
@@ -346,6 +371,13 @@ class Operation(FinanceBase):
     split_state: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("'none'"))
 
     source: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("'app'"))
+    #: Откуда операция родилась, если не руками: повторение, счёт, интеграция.
+    recurrence_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("recurrences.id", ondelete="SET NULL")
+    )
+    integration_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("integrations.id", ondelete="SET NULL")
+    )
     external_key: Mapped[str | None] = mapped_column(sa.Text)
     import_batch_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.Uuid, sa.ForeignKey("import_batches.id", ondelete="SET NULL")
@@ -551,7 +583,259 @@ class ImportRow(FinanceBase):
     )
 
 
+class OperationCategory(FinanceBase):
+    """Дробление одного платежа по статьям.
+
+    Один платёж редко бывает про одно: перевод поставщику закрывает и товар, и
+    доставку, а зарплатная выплата — оклад и премию. Без дробления такой платёж
+    целиком падает в одну статью, и отчёт по статьям врёт на всю разницу, не
+    сообщая об этом.
+
+    Сумма части всегда положительная: знак задаёт вид операции, а не часть.
+    Сходимость частей с суммой операции хранится в `operations.split_state` —
+    расхождение не запрещается, но и не скрывается.
+    """
+
+    __tablename__ = "operation_categories"
+    __table_args__ = (
+        sa.UniqueConstraint("operation_id", "category_id", name="uq_operation_categories"),
+        sa.CheckConstraint("amount >= 0", name="operation_category_amount_sign"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=_uuid)
+    operation_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid, sa.ForeignKey("operations.id", ondelete="CASCADE"), index=True
+    )
+    category_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid, sa.ForeignKey("categories.id", ondelete="CASCADE"), index=True
+    )
+    amount: Mapped[Decimal] = mapped_column(MONEY)
+    comment: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("''"))
+
+
+class Invoice(FinanceBase):
+    """Счёт-фактура: обязательство до денег.
+
+    Это второй и главный источник долгов, кроме ручного ожидания. Выставили
+    счёт клиенту — появилась дебиторка, и появилась она в тот момент, когда
+    выставили, а не когда кто-то вспомнил отметить ожидание. Пришёл счёт от
+    поставщика — появилась кредиторка.
+
+    НДС хранится отдельно от суммы без налога, потому что в отчёт о прибыли
+    попадает сумма без НДС, а в дебиторку — сумма к оплате. Считать одно из
+    другого «когда понадобится» значит однажды посчитать иначе.
+
+    `operation_id` — ожидание, созданное этим счётом. Оплата закрывает счёт
+    через ту же операцию: двух источников истины по одному долгу не бывает.
+    """
+
+    __tablename__ = "invoices"
+    __table_args__ = (
+        sa.CheckConstraint(_in("kind", INVOICE_KINDS), name="invoice_kind"),
+        sa.CheckConstraint(_in("status", INVOICE_STATUSES), name="invoice_status"),
+        sa.CheckConstraint("amount_net >= 0 AND vat_amount >= 0", name="invoice_amount_sign"),
+        sa.Index("ix_invoices_workspace_due", "workspace_id", "due_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=_uuid)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid, sa.ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(sa.Text)
+    number: Mapped[str] = mapped_column(sa.Text)
+    status: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("'draft'"))
+    issued_at: Mapped[date] = mapped_column(sa.Date)
+    due_at: Mapped[date] = mapped_column(sa.Date)
+    counterparty_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("counterparties.id", ondelete="SET NULL")
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("projects.id", ondelete="SET NULL")
+    )
+    category_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("categories.id", ondelete="SET NULL")
+    )
+    currency: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("'KZT'"))
+    amount_net: Mapped[Decimal] = mapped_column(MONEY, server_default=sa.text("0"))
+    vat_rate: Mapped[Decimal] = mapped_column(RATE, server_default=sa.text("0"))
+    vat_amount: Mapped[Decimal] = mapped_column(MONEY, server_default=sa.text("0"))
+    amount_gross: Mapped[Decimal] = mapped_column(MONEY, server_default=sa.text("0"))
+    comment: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("''"))
+    operation_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("operations.id", ondelete="SET NULL")
+    )
+    created_by: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("''"))
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now()
+    )
+
+
+class InvoiceLine(FinanceBase):
+    """Строка счёта: что именно продано и на сколько."""
+
+    __tablename__ = "invoice_lines"
+
+    id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=_uuid)
+    invoice_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid, sa.ForeignKey("invoices.id", ondelete="CASCADE"), index=True
+    )
+    title: Mapped[str] = mapped_column(sa.Text)
+    quantity: Mapped[Decimal] = mapped_column(RATE, server_default=sa.text("1"))
+    price: Mapped[Decimal] = mapped_column(MONEY, server_default=sa.text("0"))
+    amount: Mapped[Decimal] = mapped_column(MONEY, server_default=sa.text("0"))
+    position: Mapped[int] = mapped_column(sa.Integer, server_default=sa.text("0"))
+
+
+class Recurrence(FinanceBase):
+    """Повторяющаяся операция: аренда, зарплата, подписка.
+
+    Раз в месяц одно и то же руками — это не учёт, а работа за программу.
+    Правило порождает **настоящие ожидания** на горизонт вперёд, а не рисует их
+    на экране: ожидание можно поправить, удалить и оплатить по одному, и в
+    календаре оно живёт наравне с остальными.
+
+    `next_at` — дата следующего ещё не созданного повторения. Продление
+    горизонта идёт от неё, поэтому пропусков и двойных начислений не бывает.
+    """
+
+    __tablename__ = "recurrences"
+    __table_args__ = (
+        sa.CheckConstraint(_in("period", RECURRENCE_PERIODS), name="recurrence_period"),
+        sa.CheckConstraint(_in("kind", OPERATION_KINDS), name="recurrence_kind"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=_uuid)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid, sa.ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    title: Mapped[str] = mapped_column(sa.Text)
+    active: Mapped[bool] = mapped_column(sa.Boolean, server_default=sa.text("true"))
+    kind: Mapped[str] = mapped_column(sa.Text)
+    period: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("'month'"))
+    #: День месяца (или день недели для недельного периода).
+    day: Mapped[int] = mapped_column(sa.Integer, server_default=sa.text("1"))
+    start_at: Mapped[date] = mapped_column(sa.Date)
+    until: Mapped[date | None] = mapped_column(sa.Date)
+    next_at: Mapped[date] = mapped_column(sa.Date)
+    amount: Mapped[Decimal] = mapped_column(MONEY)
+    currency: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("'KZT'"))
+    account_from_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("accounts.id", ondelete="SET NULL")
+    )
+    account_to_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("accounts.id", ondelete="SET NULL")
+    )
+    category_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("categories.id", ondelete="SET NULL")
+    )
+    counterparty_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("counterparties.id", ondelete="SET NULL")
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("projects.id", ondelete="SET NULL")
+    )
+    comment: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("''"))
+    created_by: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("''"))
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now()
+    )
+
+
+class ActionLog(FinanceBase):
+    """История действий с возможностью отмены.
+
+    Учёт ведут несколько человек, и вопрос «кто убрал эту операцию» возникает
+    раньше, чем вопрос «сколько денег». Запись хранит состояние **до** и
+    **после**, поэтому отмена — это не «обратная операция на глазок», а возврат
+    ровно того, что было.
+
+    `undone_at` не даёт отменить дважды: вторая отмена вернула бы уже
+    отменённое и выглядела бы как новая правка.
+    """
+
+    __tablename__ = "action_log"
+    __table_args__ = (sa.Index("ix_action_log_workspace_at", "workspace_id", "at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=_uuid)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid, sa.ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now()
+    )
+    actor: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("''"))
+    #: `operation.create`, `operation.update`, `operation.delete`, `invoice.create`…
+    kind: Mapped[str] = mapped_column(sa.Text)
+    entity: Mapped[str] = mapped_column(sa.Text)
+    entity_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid)
+    title: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("''"))
+    before: Mapped[dict] = mapped_column(JSONB, server_default=sa.text("'{}'"))
+    after: Mapped[dict] = mapped_column(JSONB, server_default=sa.text("'{}'"))
+    undone_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+
+
+class Integration(FinanceBase):
+    """Подключение банка или другого источника операций.
+
+    Три вида, и они честно разные:
+
+    * `statement` — выписка файлом. Работает со всеми банками, потому что
+      выписку выдаёт любой; это то, что уже умеет раздел.
+    * `sheets` — книга Google, которую ведут руками: читается по расписанию.
+    * `api` — приём операций по нашему адресу. Публичного API у банков
+      Казахстана для малого бизнеса нет, поэтому сторону банка закрывает либо
+      его же выгрузка, либо скрипт клиента: он присылает операции на наш адрес
+      с токеном этой интеграции. Обещать «подключим Kaspi по API» было бы
+      ложью, а принять то, что клиент может прислать, — нет.
+
+    Токен хранится хешем: в базе его нет, показывается он один раз при
+    создании. Иначе утечка базы означала бы право писать в учёт.
+    """
+
+    __tablename__ = "integrations"
+    __table_args__ = (
+        sa.CheckConstraint(_in("kind", INTEGRATION_KINDS), name="integration_kind"),
+        sa.CheckConstraint(_in("state", INTEGRATION_STATES), name="integration_state"),
+        sa.UniqueConstraint("token_hash", name="uq_integrations_token"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=_uuid)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid, sa.ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    #: Ключ банка из справочника подключений: `kaspi`, `halyk`, `jusan`…
+    slug: Mapped[str] = mapped_column(sa.Text)
+    title: Mapped[str] = mapped_column(sa.Text)
+    kind: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("'statement'"))
+    state: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("'draft'"))
+    account_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("accounts.id", ondelete="SET NULL")
+    )
+    token_hash: Mapped[str | None] = mapped_column(sa.Text)
+    settings: Mapped[dict] = mapped_column(JSONB, server_default=sa.text("'{}'"))
+    last_seen_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    #: Сколько операций пришло через это подключение — чтобы «подключено» не
+    #: означало «работает».
+    received: Mapped[int] = mapped_column(sa.Integer, server_default=sa.text("0"))
+    created_by: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("''"))
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now()
+    )
+
+
 __all__ = [
+    "Recurrence",
+    "RECURRENCE_PERIODS",
+    "OperationCategory",
+    "InvoiceLine",
+    "Invoice",
+    "Integration",
+    "INVOICE_STATUSES",
+    "INVOICE_KINDS",
+    "INTEGRATION_STATES",
+    "INTEGRATION_KINDS",
+    "CATEGORY_NATURES",
+    "ActionLog",
     "ACCOUNT_KINDS",
     "Account",
     "CATEGORY_SIDES",

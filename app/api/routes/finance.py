@@ -28,10 +28,31 @@ from typing import Any
 from uuid import UUID
 
 import sqlalchemy as sa
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 from pydantic import BaseModel, Field
 
-from app.finance import auth, grid as grid_module, reports, rules, service, sheets
+from app.finance import (
+    auth,
+    grid as grid_module,
+    history,
+    integrations as integrations_module,
+    invoices as invoices_module,
+    recurring,
+    reports,
+    rules,
+    service,
+    sheets,
+)
 from app.finance.auth import AuthError, Member
 from app.finance.config import finance_settings
 from app.finance.db import finance_session
@@ -501,7 +522,13 @@ def dictionaries(member: Member = Depends(current_member)) -> dict[str, Any]:
                 for item in service.list_accounts(session, workspace.id)
             ],
             "categories": [
-                {"id": str(item.id), "name": item.name, "side": item.side, "system_key": item.system_key}
+                {
+                    "id": str(item.id),
+                    "name": item.name,
+                    "side": item.side,
+                    "system_key": item.system_key,
+                    "nature": item.nature,
+                }
                 for item in service.list_categories(session, workspace.id)
             ],
             "counterparties": [
@@ -598,6 +625,30 @@ def archive_entry(kind: str, item_id: UUID, member: Member = Depends(require_abi
         except FinanceError as exc:
             raise _fail(exc) from exc
         return {"ok": True}
+
+
+class NatureIn(BaseModel):
+    nature: str = Field(pattern="^(revenue|cogs|operating|financial|depreciation|tax|other)$")
+
+
+@router.patch("/dictionaries/categories/{item_id}/nature")
+def set_category_nature(
+    item_id: UUID, body: NatureIn, member: Member = Depends(require_ability("accounts"))
+) -> dict[str, Any]:
+    """Природа статьи: себестоимость, операционный расход, проценты, амортизация…
+
+    От неё зависят показатели: без неё «Закуп товара» и «Аренда» — просто два
+    расхода, и валовую прибыль с EBITDA посчитать нечем.
+    """
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        category = session.get(Category, item_id)
+        if category is None or category.workspace_id != workspace.id:
+            raise HTTPException(status_code=404, detail="Статья не найдена")
+        category.nature = body.nature
+        session.flush()
+        return {"id": str(category.id), "nature": category.nature}
 
 
 # ── Журнал ───────────────────────────────────────────────────────────────────
@@ -739,6 +790,13 @@ class ProjectSplitIn(BaseModel):
     amount: str
 
 
+class CategorySplitIn(BaseModel):
+    """Часть платежа, отнесённая к статье."""
+
+    category_id: UUID
+    amount: str
+
+
 class OperationIn(BaseModel):
     kind: str = Field(pattern="^(income|expense|transfer)$")
     status: str = Field(default="fact", pattern="^(fact|plan)$")
@@ -755,6 +813,7 @@ class OperationIn(BaseModel):
     counterparty_id: UUID | None = None
     comment: str = ""
     projects: list[ProjectSplitIn] = Field(default_factory=list)
+    categories: list[CategorySplitIn] = Field(default_factory=list)
     tags: list[UUID] = Field(default_factory=list)
 
 
@@ -782,6 +841,9 @@ def create_operation(body: OperationIn, member: Member = Depends(require_ability
             counterparty_id=body.counterparty_id,
             comment=body.comment,
             projects=[(item.project_id, _money(item.amount, field="projects")) for item in body.projects],
+            categories=[
+                (item.category_id, _money(item.amount, field="categories")) for item in body.categories
+            ],
             tags=list(body.tags),
             source="app",
         )
@@ -789,6 +851,15 @@ def create_operation(body: OperationIn, member: Member = Depends(require_ability
             operation = service.create_operation(session, workspace, data, actor=_actor(member))
         except FinanceError as exc:
             raise _fail(exc) from exc
+        history.write(
+            session,
+            workspace,
+            kind="operation.create",
+            entity="operation",
+            entity_id=operation.id,
+            after=history.snapshot(operation),
+            actor=_actor(member),
+        )
         names = _names(session, workspace.id)
         splits = service.operation_projects(session, [operation.id])
         return _operation_out(operation, names=names, splits=splits, tags={})
@@ -806,6 +877,7 @@ class OperationPatch(BaseModel):
     counterparty_id: UUID | None = None
     comment: str | None = None
     projects: list[ProjectSplitIn] | None = None
+    categories: list[CategorySplitIn] | None = None
     tags: list[UUID] | None = None
 
 
@@ -831,6 +903,10 @@ def patch_operation(
         changes["comment"] = body.comment
     if body.projects is not None:
         changes["projects"] = [(item.project_id, _money(item.amount, field="projects")) for item in body.projects]
+    if body.categories is not None:
+        changes["categories"] = [
+            (item.category_id, _money(item.amount, field="categories")) for item in body.categories
+        ]
     if body.tags is not None:
         changes["tags"] = list(body.tags)
     if not changes:
@@ -838,12 +914,24 @@ def patch_operation(
 
     with finance_session() as session:
         workspace = _workspace(session, member)
+        existing = session.get(Operation, operation_id)
+        before = history.snapshot(existing) if existing is not None else {}
         try:
             operation = service.update_operation(
                 session, workspace, operation_id, changes, version=body.version, actor=_actor(member)
             )
         except FinanceError as exc:
             raise _fail(exc) from exc
+        history.write(
+            session,
+            workspace,
+            kind="operation.settle" if changes.get("status") == "fact" else "operation.update",
+            entity="operation",
+            entity_id=operation.id,
+            before=before,
+            after=history.snapshot(operation),
+            actor=_actor(member),
+        )
         names = _names(session, workspace.id)
         splits = service.operation_projects(session, [operation.id])
         tags = service.operation_tags(session, [operation.id])
@@ -855,10 +943,21 @@ def delete_operation(operation_id: UUID, member: Member = Depends(require_abilit
     _guard()
     with finance_session() as session:
         workspace = _workspace(session, member)
+        existing = session.get(Operation, operation_id)
+        before = history.snapshot(existing) if existing is not None else {}
         try:
             service.delete_operation(session, workspace, operation_id, actor=_actor(member))
         except FinanceError as exc:
             raise _fail(exc) from exc
+        history.write(
+            session,
+            workspace,
+            kind="operation.delete",
+            entity="operation",
+            entity_id=operation_id,
+            before=before,
+            actor=_actor(member),
+        )
         return {"ok": True}
 
 
@@ -1300,6 +1399,524 @@ def _preview_response(
             for row in preview.rows
         ],
     }
+
+
+# ── Счета-фактуры ───────────────────────────────────────────────────────────
+
+
+class InvoiceLineIn(BaseModel):
+    title: str = ""
+    quantity: str = "1"
+    price: str = "0"
+
+
+class InvoiceIn(BaseModel):
+    kind: str = Field(default="out", pattern="^(out|in)$")
+    number: str = ""
+    issued_at: str
+    due_at: str
+    vat_rate: str = "0"
+    counterparty_id: UUID | None = None
+    project_id: UUID | None = None
+    category_id: UUID | None = None
+    account_id: UUID | None = None
+    comment: str = ""
+    lines: list[InvoiceLineIn] = Field(default_factory=list)
+
+
+@router.get("/invoices")
+def list_invoices(
+    member: Member = Depends(current_member),
+    kind: str | None = Query(default=None, pattern="^(out|in)$"),
+) -> dict[str, Any]:
+    """Счета и их сводка: сколько выставлено, сколько не оплачено, сколько просрочено."""
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        return {
+            "items": invoices_module.list_invoices(session, workspace.id, kind=kind),
+            "summary": invoices_module.summary(session, workspace.id),
+        }
+
+
+@router.post("/invoices", status_code=201)
+def create_invoice(body: InvoiceIn, member: Member = Depends(require_ability("write"))) -> dict[str, Any]:
+    """Выставить счёт. Ожидание по нему появляется сразу — это и есть долг."""
+    _guard()
+    issued_at = _parse_date(body.issued_at, field="issued_at")
+    due_at = _parse_date(body.due_at, field="due_at")
+    if issued_at is None or due_at is None:
+        raise HTTPException(status_code=422, detail="Нужны дата счёта и срок оплаты")
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        try:
+            invoice = invoices_module.create(
+                session,
+                workspace,
+                kind=body.kind,
+                issued_at=issued_at,
+                due_at=due_at,
+                lines=[line.model_dump() for line in body.lines],
+                vat_rate=body.vat_rate or "0",
+                number=body.number,
+                counterparty_id=body.counterparty_id,
+                project_id=body.project_id,
+                category_id=body.category_id,
+                account_id=body.account_id,
+                comment=body.comment,
+                actor=_actor(member),
+            )
+        except FinanceError as exc:
+            raise _fail(exc) from exc
+        history.write(
+            session,
+            workspace,
+            kind="invoice.create",
+            entity="invoice",
+            entity_id=invoice.id,
+            title=f"счёт {invoice.number} на {invoice.amount_gross}",
+            after={"number": invoice.number, "amount": str(invoice.amount_gross)},
+            actor=_actor(member),
+        )
+        return invoices_module.read(session, workspace.id, invoice.id)
+
+
+@router.get("/invoices/{invoice_id}")
+def read_invoice(invoice_id: UUID, member: Member = Depends(current_member)) -> dict[str, Any]:
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        try:
+            return invoices_module.read(session, workspace.id, invoice_id)
+        except FinanceError as exc:
+            raise _fail(exc) from exc
+
+
+@router.post("/invoices/{invoice_id}/void")
+def void_invoice(invoice_id: UUID, member: Member = Depends(require_ability("write"))) -> dict[str, Any]:
+    """Отменить счёт вместе с его ожиданием."""
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        try:
+            invoice = invoices_module.void(session, workspace.id, invoice_id)
+        except FinanceError as exc:
+            raise _fail(exc) from exc
+        history.write(
+            session,
+            workspace,
+            kind="invoice.void",
+            entity="invoice",
+            entity_id=invoice.id,
+            title=f"счёт {invoice.number} отменён",
+            actor=_actor(member),
+        )
+        return {"ok": True}
+
+
+# ── Повторяющиеся операции ──────────────────────────────────────────────────
+
+
+class RecurrenceIn(BaseModel):
+    title: str
+    kind: str = Field(pattern="^(income|expense|transfer)$")
+    amount: str
+    period: str = Field(default="month", pattern="^(week|month|quarter|year)$")
+    day: int = 1
+    start_at: str
+    until: str | None = None
+    account_from_id: UUID | None = None
+    account_to_id: UUID | None = None
+    category_id: UUID | None = None
+    counterparty_id: UUID | None = None
+    project_id: UUID | None = None
+    comment: str = ""
+
+
+@router.get("/recurrences")
+def list_recurrences(member: Member = Depends(current_member)) -> dict[str, Any]:
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        return {"items": recurring.list_recurrences(session, workspace.id), "horizon_days": recurring.HORIZON_DAYS}
+
+
+@router.post("/recurrences", status_code=201)
+def create_recurrence(
+    body: RecurrenceIn, member: Member = Depends(require_ability("write"))
+) -> dict[str, Any]:
+    """Создать повторение и сразу разложить ожидания на горизонт вперёд."""
+    _guard()
+    start_at = _parse_date(body.start_at, field="start_at")
+    if start_at is None:
+        raise HTTPException(status_code=422, detail="Нужна дата начала")
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        try:
+            rule = recurring.create(
+                session,
+                workspace,
+                title=body.title,
+                kind=body.kind,
+                amount=_money(body.amount, field="amount"),
+                period=body.period,
+                day=body.day,
+                start_at=start_at,
+                until=_parse_date(body.until, field="until"),
+                account_from_id=body.account_from_id,
+                account_to_id=body.account_to_id,
+                category_id=body.category_id,
+                counterparty_id=body.counterparty_id,
+                project_id=body.project_id,
+                comment=body.comment,
+                actor=_actor(member),
+            )
+            created = recurring.materialize(session, workspace, actor=_actor(member))
+        except FinanceError as exc:
+            raise _fail(exc) from exc
+        history.write(
+            session,
+            workspace,
+            kind="recurrence.create",
+            entity="recurrence",
+            entity_id=rule.id,
+            title=f"повторение «{rule.title}», ожиданий создано {created}",
+            actor=_actor(member),
+        )
+        return {"id": str(rule.id), "created": created}
+
+
+@router.post("/recurrences/materialize")
+def materialize_recurrences(member: Member = Depends(require_ability("write"))) -> dict[str, Any]:
+    """Продлить горизонт ожиданий. Повторный вызов ничего не удваивает."""
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        created = recurring.materialize(session, workspace, actor=_actor(member))
+        return {"created": created}
+
+
+@router.patch("/recurrences/{recurrence_id}")
+def toggle_recurrence(
+    recurrence_id: UUID,
+    active: bool = Query(...),
+    member: Member = Depends(require_ability("write")),
+) -> dict[str, Any]:
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        try:
+            rule = recurring.set_active(session, workspace.id, recurrence_id, active)
+        except FinanceError as exc:
+            raise _fail(exc) from exc
+        return {"id": str(rule.id), "active": rule.active}
+
+
+@router.delete("/recurrences/{recurrence_id}")
+def delete_recurrence(
+    recurrence_id: UUID,
+    with_future: bool = Query(default=True),
+    member: Member = Depends(require_ability("write")),
+) -> dict[str, Any]:
+    """Удалить повторение. Будущие неоплаченные ожидания уходят вместе с ним."""
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        try:
+            removed = recurring.remove(session, workspace.id, recurrence_id, with_future=with_future)
+        except FinanceError as exc:
+            raise _fail(exc) from exc
+        history.write(
+            session,
+            workspace,
+            kind="recurrence.remove",
+            entity="recurrence",
+            entity_id=recurrence_id,
+            title=f"повторение удалено, снято ожиданий {removed}",
+            actor=_actor(member),
+        )
+        return {"removed": removed}
+
+
+# ── История действий ────────────────────────────────────────────────────────
+
+
+@router.get("/history")
+def read_history(
+    member: Member = Depends(current_member), limit: int = Query(default=100, ge=1, le=500)
+) -> dict[str, Any]:
+    """Кто и что менял. Отменяемые записи помечены `can_undo`."""
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        return {"items": history.listing(session, workspace.id, limit=limit)}
+
+
+@router.post("/history/{entry_id}/undo")
+def undo_action(entry_id: UUID, member: Member = Depends(require_ability("write"))) -> dict[str, Any]:
+    """Отменить действие — вернуть состояние «до», а не сделать обратное."""
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        try:
+            return history.undo(session, workspace, entry_id, actor=_actor(member))
+        except FinanceError as exc:
+            raise _fail(exc) from exc
+
+
+# ── Интеграции ──────────────────────────────────────────────────────────────
+
+
+class IntegrationIn(BaseModel):
+    slug: str
+    kind: str = Field(pattern="^(api|statement|sheets)$")
+    title: str = ""
+    account_id: UUID | None = None
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+
+@router.get("/integrations")
+def list_integrations(member: Member = Depends(current_member)) -> dict[str, Any]:
+    """Подключения компании и справочник банков с логотипами."""
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        accounts = {
+            str(account.id): account.name
+            for account in service.list_accounts(session, workspace.id)
+        }
+        items = [
+            integrations_module.to_dict(
+                item, account_name=accounts.get(str(item.account_id), "") if item.account_id else ""
+            )
+            for item in integrations_module.list_integrations(session, workspace.id)
+        ]
+        return {"items": items, "catalog": integrations_module.catalog()}
+
+
+@router.post("/integrations", status_code=201)
+def create_integration(
+    body: IntegrationIn, member: Member = Depends(require_ability("accounts"))
+) -> dict[str, Any]:
+    """Подключить источник. Для приёма по адресу токен возвращается один раз."""
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        try:
+            integration, token = integrations_module.create(
+                session,
+                workspace,
+                slug=body.slug,
+                kind=body.kind,
+                title=body.title,
+                account_id=body.account_id,
+                settings=body.settings,
+                actor=_actor(member),
+            )
+        except FinanceError as exc:
+            raise _fail(exc) from exc
+        history.write(
+            session,
+            workspace,
+            kind="integration.create",
+            entity="integration",
+            entity_id=integration.id,
+            title=f"подключение «{integration.title}» ({integration.kind})",
+            actor=_actor(member),
+        )
+        out = integrations_module.to_dict(integration)
+        # Токен показывается ровно здесь и больше никогда: в базе он хешем.
+        out["token"] = token
+        out["inbox_url"] = f"/api/v1/finance/integrations/inbox"
+        return out
+
+
+@router.post("/integrations/{integration_id}/token")
+def rotate_integration_token(
+    integration_id: UUID, member: Member = Depends(require_ability("accounts"))
+) -> dict[str, Any]:
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        try:
+            token = integrations_module.rotate_token(session, workspace.id, integration_id)
+        except FinanceError as exc:
+            raise _fail(exc) from exc
+        return {"token": token}
+
+
+@router.patch("/integrations/{integration_id}")
+def set_integration_state(
+    integration_id: UUID,
+    state: str = Query(pattern="^(active|off)$"),
+    member: Member = Depends(require_ability("accounts")),
+) -> dict[str, Any]:
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        try:
+            integration = integrations_module.set_state(session, workspace.id, integration_id, state)
+        except FinanceError as exc:
+            raise _fail(exc) from exc
+        return integrations_module.to_dict(integration)
+
+
+@router.delete("/integrations/{integration_id}")
+def delete_integration(
+    integration_id: UUID, member: Member = Depends(require_ability("accounts"))
+) -> dict[str, bool]:
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        try:
+            integrations_module.remove(session, workspace.id, integration_id)
+        except FinanceError as exc:
+            raise _fail(exc) from exc
+        return {"ok": True}
+
+
+class InboxIn(BaseModel):
+    """Пачка операций от подключения."""
+
+    operations: list[dict[str, Any]] = Field(default_factory=list)
+    #: Разобрать и показать, ничего не записывая.
+    dry_run: bool = False
+
+
+@router.post("/integrations/inbox")
+def integration_inbox(
+    body: InboxIn,
+    request: Request,
+    x_finance_token: str = Header(default=""),
+) -> dict[str, Any]:
+    """Приём операций по адресу — вход для банков и чужих систем.
+
+    Охраняется не учёткой человека, а токеном подключения: присылающая сторона
+    — это скрипт, а не человек в браузере. Поэтому здесь нет `current_member`, и
+    компания берётся из токена.
+
+    Записываем через тот же разбор, что и файл: строка с минусом — расход,
+    неизвестный счёт — отказ строке, а не подстановка наугад.
+    """
+    _guard()
+    if not body.operations:
+        raise HTTPException(status_code=422, detail="Пустая пачка: присылать нечего")
+    if len(body.operations) > 5000:
+        raise HTTPException(status_code=413, detail="За раз принимаем не больше 5000 операций")
+
+    with finance_session() as session:
+        try:
+            integration = integrations_module.resolve_token(session, x_finance_token)
+        except FinanceError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        workspace = service.get_workspace(session, integration.workspace_id)
+        rows = integrations_module.rows_of(body.operations)
+
+        accounts = {account.name: account for account in service.list_accounts(session, workspace.id)}
+        default_account = (
+            session.get(Account, integration.account_id) if integration.account_id else None
+        )
+        categories = {item.name: item for item in service.list_categories(session, workspace.id)}
+
+        accepted = 0
+        rejected: list[dict[str, Any]] = []
+        for index, row in enumerate(rows, start=1):
+            account = accounts.get(row["account"] or "") or default_account
+            if account is None:
+                rejected.append({"line": index, "problem": "счёт не указан и у подключения его нет"})
+                continue
+            if row["kind"] == "income":
+                account_to, account_from = account.id, None
+            else:
+                account_to, account_from = None, account.id
+            data = service.OperationInput(
+                kind=row["kind"],
+                paid_at=row["paid_at"],
+                amount=row["amount"],
+                account_from_id=account_from,
+                account_to_id=account_to,
+                category_id=(
+                    categories[row["category"]].id
+                    if row["category"] and row["category"] in categories
+                    else None
+                ),
+                comment=row["comment"],
+                source="integration",
+                external_key=row["external_key"],
+                integration_id=integration.id,
+            )
+            if body.dry_run:
+                accepted += 1
+                continue
+            try:
+                service.create_operation(session, workspace, data, actor=f"интеграция «{integration.title}»")
+                accepted += 1
+            except FinanceError as exc:
+                rejected.append({"line": index, "problem": str(exc)})
+
+        if not body.dry_run and accepted:
+            integrations_module.mark_received(session, integration, accepted)
+            history.write(
+                session,
+                workspace,
+                kind="integration.receive",
+                entity="integration",
+                entity_id=integration.id,
+                title=f"из «{integration.title}» пришло операций: {accepted}",
+                actor=f"интеграция «{integration.title}»",
+            )
+        return {
+            "accepted": accepted,
+            "rejected": rejected,
+            "dry_run": body.dry_run,
+            "integration": integration.title,
+        }
+
+
+# ── Баланс, показатели, выписка по счёту ────────────────────────────────────
+
+
+@router.get("/reports/balance")
+def report_balance(
+    member: Member = Depends(current_member), as_of: str | None = None
+) -> dict[str, Any]:
+    """Чем компания владеет и что должна — на дату."""
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        return reports.balance(session, workspace.id, as_of=_parse_date(as_of, field="as_of"))
+
+
+@router.get("/reports/indicators")
+def report_indicators(
+    member: Member = Depends(current_member),
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    """EBITDA, валовая прибыль, маржа — по природе статей."""
+    _guard()
+    start, end = _period(date_from, date_to)
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        return reports.indicators(session, workspace.id, start, end)
+
+
+@router.get("/reports/statement")
+def report_account_statement(
+    account_id: UUID,
+    member: Member = Depends(current_member),
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    """Выписка по счёту для сверки с банком."""
+    _guard()
+    start, end = _period(date_from, date_to)
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        try:
+            return reports.account_statement(session, workspace.id, account_id, start, end)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 # ── Книги Google ────────────────────────────────────────────────────────────
