@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     app_host: str = Field(default="0.0.0.0", validation_alias=AliasChoices("APP_HOST"))
     app_port: int = Field(default=8080, validation_alias=AliasChoices("PORT", "APP_PORT"))
+    # Перезапуск uvicorn по правке файлов. Не задано — по окружению: development
+    # ⇒ да. В контейнере его выключают явно: исходников снаружи там нет, а
+    # перезапуск стоит двух лишних процессов и постоянной слежки за файлами.
+    app_reload: bool | None = Field(default=None, validation_alias=AliasChoices("APP_RELOAD"))
     allowed_origins: Annotated[str, NoDecode] = Field(
         default="http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001",
         validation_alias=AliasChoices("ALLOWED_ORIGINS"),

@@ -19,6 +19,7 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Callable
 from functools import lru_cache
 from typing import Any
 
@@ -82,19 +83,66 @@ def _client() -> gspread.Client:
 # Квота Google — 60 чтений в минуту на весь сервисный аккаунт, и этот же аккаунт
 # обслуживает дашборд. Импорт книги с гридом — тяжёлый вызов; повторное открытие
 # той же вкладки не должно ходить в Google заново.
+#
+# Кэшируется готовый ответ вкладки байтами, а не сырой ответ Google. Раньше
+# было наоборот, и это была главная утечка процесса: грид «Журнала» с
+# оформлением — 240 МБ объектов Python, готовый ответ из него — 2 МБ JSON. К
+# тому же записи только добавлялись: просроченная лежала до следующего чтения
+# той же вкладки, то есть обычно до перезапуска. Три журнала одной книги —
+# гигабайт, пока процесс не перезапустят.
+#
+# Почему байты, а не та же вкладка объектами (16 МБ). Замер на «Журнале»:
+# объекты создаются, пока сырой грид ещё жив, и ложатся на те же страницы
+# памяти. Грид освобождён, но страницы вернуть системе нельзя — на каждой
+# осталось по несколько живых объектов кэша. Итог: 480 МБ процесса против
+# 185 МБ, когда в кэше лежит одна строка байт.
 
 _files_cache: tuple[float, list[dict[str, Any]]] | None = None
 _meta_cache: dict[str, tuple[float, dict[str, Any]]] = {}
-_grid_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+#: Готовые ответы вкладок — ровно те байты, что уходят на фронт. См. `cached_tab`.
+_tab_cache: dict[tuple[str, str], tuple[float, bytes]] = {}
 #: Значения вкладки строками — для переноса книги в учёт.
 _values_cache: dict[tuple[str, str], tuple[float, list[list[str]]]] = {}
 #: Справочники выпадающих списков: диапазон → его значения.
 _ref_cache: dict[tuple[str, str], tuple[float, list[str]]] = {}
 _lock = threading.Lock()
 
+#: Потолок кэша готовых вкладок в байтах. Считается по объёму, а не по числу
+#: вкладок: «Справочник» и «Журнал» различаются в двадцать раз. Большая вкладка —
+#: около 2 МБ, так что книга целиком помещается с запасом.
+_TAB_CACHE_MAX_BYTES = 32 * 1024 * 1024
+#: Потолок записей для остальных кэшей: там не гриды с оформлением, а строки.
+_MAX_ENTRIES = 32
+
 
 def _fresh(stamp: float) -> bool:
     return (time.monotonic() - stamp) < webexcel_settings.cache_ttl_seconds
+
+
+def _remember(
+    cache: dict[Any, tuple[float, Any]],
+    key: Any,
+    value: Any,
+    *,
+    weight: Callable[[Any], int] = lambda _: 1,
+    limit: int | None = None,
+) -> None:
+    """Положить в кэш, заодно выбросив просроченное и лишнее. Под `_lock`.
+
+    Лишнее — самое старое сверх `limit` (по умолчанию `_MAX_ENTRIES`), считая
+    по `weight` (по умолчанию — просто записи). Последняя положенная запись
+    остаётся всегда.
+    """
+    limit = _MAX_ENTRIES if limit is None else limit
+    now = time.monotonic()
+    ttl = webexcel_settings.cache_ttl_seconds
+    for stale in [k for k, (stamp, _) in cache.items() if now - stamp >= ttl]:
+        del cache[stale]
+    cache.pop(key, None)  # переложить в конец: порядок словаря — порядок записи
+    cache[key] = (now, value)
+    total = sum(weight(held) for _, held in cache.values())
+    while total > limit and len(cache) > 1:
+        total -= weight(cache.pop(next(iter(cache)))[1])
 
 
 def invalidate_cache() -> None:
@@ -102,7 +150,7 @@ def invalidate_cache() -> None:
     with _lock:
         _files_cache = None
         _meta_cache.clear()
-        _grid_cache.clear()
+        _tab_cache.clear()
         _values_cache.clear()
         _ref_cache.clear()
 
@@ -185,7 +233,7 @@ def spreadsheet_meta(spreadsheet_id: str) -> dict[str, Any]:
         "tabs": tabs,
     }
     with _lock:
-        _meta_cache[spreadsheet_id] = (time.monotonic(), meta)
+        _remember(_meta_cache, spreadsheet_id, meta)
     return meta
 
 
@@ -244,13 +292,10 @@ def fetch_tab_grid(spreadsheet_id: str, tab_title: str) -> dict[str, Any]:
     Возвращает сырой ответ Google (один элемент `sheets`), приведённый к
     словарю с ключами `properties`, `merges`, `data`. Разбор — в `univer.py`:
     здесь сеть, там формат.
-    """
-    key = (spreadsheet_id, tab_title)
-    with _lock:
-        hit = _grid_cache.get(key)
-        if hit and _fresh(hit[0]):
-            return hit[1]
 
+    Не кэшируется намеренно: ответ огромен и нужен ровно на время разбора.
+    Повторное открытие вкладки обслуживает `cached_tab` — готовой вкладкой.
+    """
     meta = spreadsheet_meta(spreadsheet_id)
     tab = next((t for t in meta["tabs"] if t["title"] == tab_title), None)
     if tab is None:
@@ -273,7 +318,7 @@ def fetch_tab_grid(spreadsheet_id: str, tab_title: str) -> dict[str, Any]:
     if not sheets:
         raise WebExcelError(f"Google вернул пустой ответ для вкладки «{tab_title}»")
 
-    result = {
+    return {
         "spreadsheet_title": raw.get("properties", {}).get("title", meta["title"]),
         "spreadsheet_locale": raw.get("properties", {}).get("locale", ""),
         "sheet": sheets[0],
@@ -282,9 +327,31 @@ def fetch_tab_grid(spreadsheet_id: str, tab_title: str) -> dict[str, Any]:
         "source_rows": int(tab["rows"] or 0),
         "source_cols": int(tab["cols"] or 0),
     }
+
+
+def cached_tab(
+    spreadsheet_id: str,
+    tab_title: str,
+    build: Callable[[dict[str, Any]], bytes],
+) -> bytes:
+    """Готовый ответ вкладки: из кэша, иначе грид из Google → `build` → в кэш.
+
+    Сырой грид живёт ровно столько, сколько `build` его разбирает, и в кэш не
+    попадает. `build` возвращает готовые байты ответа — почему байты, а не
+    объекты, см. комментарий у `_tab_cache`. Отказ Google не кэшируется:
+    исключение просто уходит наружу.
+    """
+    key = (spreadsheet_id, tab_title)
     with _lock:
-        _grid_cache[key] = (time.monotonic(), result)
-    return result
+        hit = _tab_cache.get(key)
+        if hit and _fresh(hit[0]):
+            return hit[1]
+
+    body = build(fetch_tab_grid(spreadsheet_id, tab_title))
+
+    with _lock:
+        _remember(_tab_cache, key, body, weight=len, limit=_TAB_CACHE_MAX_BYTES)
+    return body
 
 
 #: Потолок на справочник выпадающего списка. Список в тысячу строк — это уже не
@@ -333,7 +400,7 @@ def values_of_ref(spreadsheet_id: str, ref: str) -> list[str]:
             break
 
     with _lock:
-        _ref_cache[key] = (time.monotonic(), seen)
+        _remember(_ref_cache, key, seen)
     return seen
 
 
@@ -379,12 +446,13 @@ def fetch_tab_values(spreadsheet_id: str, tab_title: str) -> list[list[str]]:
 
     values = [[str(cell) for cell in row] for row in raw.get("values", [])]
     with _lock:
-        _values_cache[key] = (time.monotonic(), values)
+        _remember(_values_cache, key, values)
     return values
 
 
 __all__ = [
     "WebExcelError",
+    "cached_tab",
     "fetch_tab_grid",
     "fetch_tab_values",
     "humanize",

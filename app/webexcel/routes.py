@@ -11,11 +11,14 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from app.webexcel.config import webexcel_settings
 from app.webexcel.google import (
     WebExcelError,
+    cached_tab,
     fetch_tab_grid,
     invalidate_cache,
     list_spreadsheets,
@@ -63,32 +66,40 @@ def get_source_meta(spreadsheet_id: str) -> dict[str, Any]:
 
 
 @router.get("/sources/{spreadsheet_id}/tab")
-def get_source_tab(spreadsheet_id: str, title: str = Query(...)) -> dict[str, Any]:
+def get_source_tab(spreadsheet_id: str, title: str = Query(...)) -> Response:
     """Одна вкладка как лист Univer — со всем оформлением.
 
     Вкладка отдаётся по одной намеренно. Ответ Google с оформлением для «Журнала»
     весит 46 МБ на вкладку; тянуть восемь вкладок разом означало бы держать
-    треть гигабайта в памяти контейнера ради одного открытия книги.
+    треть гигабайта в памяти контейнера ради одного открытия книги. По той же
+    причине в кэш кладутся готовые байты ответа, а не сырой грид — см.
+    `cached_tab`.
     """
     _guard()
-    try:
-        raw = fetch_tab_grid(spreadsheet_id, title)
+
+    def build(raw: dict[str, Any]) -> bytes:
         # Справочники выпадающих списков разрешаются здесь: в разборе вкладки
         # сети нет намеренно, иначе его нельзя было бы проверить без кредов.
         converted = convert_tab(raw, lambda ref: values_of_ref(spreadsheet_id, ref))
+        payload = {
+            "spreadsheet_id": spreadsheet_id,
+            "spreadsheet_title": raw["spreadsheet_title"],
+            "sheet": converted["sheet"],
+            "styles": converted["styles"],
+            "stats": converted["stats"],
+            "fonts": converted["fonts"],
+            "checkboxes": converted["checkboxes"],
+            "lists": converted["lists"],
+        }
+        # Тот же рендер, которым FastAPI отдаёт возвращённый словарь, — байты
+        # ответа совпадают с прежними до последнего.
+        return JSONResponse(jsonable_encoder(payload)).body
+
+    try:
+        body = cached_tab(spreadsheet_id, title, build)
     except WebExcelError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    return {
-        "spreadsheet_id": spreadsheet_id,
-        "spreadsheet_title": raw["spreadsheet_title"],
-        "sheet": converted["sheet"],
-        "styles": converted["styles"],
-        "stats": converted["stats"],
-        "fonts": converted["fonts"],
-        "checkboxes": converted["checkboxes"],
-        "lists": converted["lists"],
-    }
+    return Response(content=body, media_type="application/json")
 
 
 @router.post("/sources/refresh")

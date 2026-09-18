@@ -178,6 +178,16 @@ _cache: dict[tuple[str, str], tuple[float, list[list[str]]]] = {}
 _cache_lock = threading.Lock()
 
 
+def _drop_stale(cache: dict[Any, tuple[float, Any]], now: float, ttl: float) -> None:
+    """Выбросить просроченное. Под `_cache_lock`.
+
+    Без этого запись жила до следующего чтения того же листа, а лист «Отчет …»
+    каждый месяц новый: прошломесячный лежал в памяти до перезапуска.
+    """
+    for key in [k for k, (stamp, _) in cache.items() if now - stamp >= ttl]:
+        del cache[key]
+
+
 def read_cached(name: str | None, spreadsheet_id: str | None) -> list[list[str]]:
     """Чтение с коротким кэшем в памяти. Для всего, кроме мастер-таблицы."""
     ttl = max(0.0, bbc_settings.cache_ttl_seconds)
@@ -194,6 +204,7 @@ def read_cached(name: str | None, spreadsheet_id: str | None) -> list[list[str]]
 
     if ttl > 0:
         with _cache_lock:
+            _drop_stale(_cache, now, ttl)
             _cache[key] = (now, values)
     return values
 
@@ -228,6 +239,7 @@ def list_worksheets_cached(spreadsheet_id: str | None = None) -> list[dict[str, 
 
     if ttl > 0:
         with _cache_lock:
+            _drop_stale(_tabs_cache, now, ttl)
             _tabs_cache[key] = (now, tabs)
     return tabs
 

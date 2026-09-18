@@ -80,9 +80,28 @@ _meta_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _files_cache: tuple[float, list[dict[str, Any]]] | None = None
 _lock = threading.Lock()
 
+#: Сетка читается целиком, без потолка строк: «Тех.Журнал» — 11 409 строк на
+#: 37 колонок, десятки мегабайт строк. Раньше каждая прочитанная вкладка
+#: оставалась в памяти до перезапуска, даже просроченная. TTL здесь минута —
+#: кэш нужен на один разговор, и восьми вкладок на него хватает.
+_GRID_CACHE_MAX_ENTRIES = 8
+_META_CACHE_MAX_ENTRIES = 64
+
 
 def _fresh(stamp: float) -> bool:
     return (time.monotonic() - stamp) < mcp_settings.cache_ttl_seconds
+
+
+def _remember(cache: dict[Any, tuple[float, Any]], key: Any, value: Any, limit: int) -> None:
+    """Положить в кэш, выбросив просроченное и самое старое сверх `limit`. Под `_lock`."""
+    now = time.monotonic()
+    ttl = mcp_settings.cache_ttl_seconds
+    for stale in [k for k, (stamp, _) in cache.items() if now - stamp >= ttl]:
+        del cache[stale]
+    cache.pop(key, None)  # переложить в конец: порядок словаря — порядок записи
+    cache[key] = (now, value)
+    while len(cache) > limit:
+        del cache[next(iter(cache))]
 
 
 def invalidate_cache() -> None:
@@ -224,7 +243,7 @@ def spreadsheet_meta(spreadsheet_id: str) -> dict[str, Any]:
         raise McpError(humanize(exc)) from exc
 
     with _lock:
-        _meta_cache[spreadsheet_id] = (time.monotonic(), meta)
+        _remember(_meta_cache, spreadsheet_id, meta, _META_CACHE_MAX_ENTRIES)
     return meta
 
 
@@ -271,7 +290,7 @@ def read_grid(spreadsheet_id: str, tab: str) -> list[list[str]]:
         raise McpError(humanize(exc)) from exc
 
     with _lock:
-        _grid_cache[key] = (time.monotonic(), grid)
+        _remember(_grid_cache, key, grid, _GRID_CACHE_MAX_ENTRIES)
     return grid
 
 

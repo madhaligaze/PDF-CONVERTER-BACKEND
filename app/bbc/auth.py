@@ -200,6 +200,10 @@ LOGIN_LOCKOUT_SECONDS = 60.0
 
 _failures: dict[str, list[float]] = {}
 _failures_lock = threading.Lock()
+#: С какого размера словаря выбрасывать остывшие ключи. Перебор по списку имён —
+#: новый ключ на каждую попытку, и назад его никто не спросит: без чистки словарь
+#: рос бы, пока жив процесс.
+_FAILURES_SWEEP_AT = 1024
 
 
 def _login_keys(username: str, ip: str | None) -> list[str]:
@@ -227,6 +231,14 @@ def _assert_not_throttled(username: str, ip: str | None) -> None:
 def _record_failure(username: str, ip: str | None) -> None:
     now = time.monotonic()
     with _failures_lock:
+        if len(_failures) >= _FAILURES_SWEEP_AT:
+            cold = [
+                key
+                for key, stamps in _failures.items()
+                if all(now - at >= LOGIN_LOCKOUT_SECONDS for at in stamps)
+            ]
+            for key in cold:
+                del _failures[key]
         for key in _login_keys(username, ip):
             recent = [at for at in _failures.get(key, ()) if now - at < LOGIN_LOCKOUT_SECONDS]
             recent.append(now)

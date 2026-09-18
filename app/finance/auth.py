@@ -102,19 +102,31 @@ _ATTEMPTS: dict[str, list[float]] = {}
 _ATTEMPTS_LOCK = threading.Lock()
 _MAX_ATTEMPTS = 5
 _WINDOW = 60.0
+#: С какого размера словаря выбрасывать остывшие ключи. Перебор по списку
+#: адресов — это новый ключ на каждую попытку, и назад его никто не спросит.
+_SWEEP_AT = 1024
 
 
 def _too_many_attempts(key: str) -> bool:
     now = time.monotonic()
     with _ATTEMPTS_LOCK:
         hits = [stamp for stamp in _ATTEMPTS.get(key, []) if now - stamp < _WINDOW]
-        _ATTEMPTS[key] = hits
+        # Пустой список не храним: проверка идёт на каждом входе, и каждый
+        # когда-либо введённый адрес оставался бы в словаре навсегда.
+        if hits:
+            _ATTEMPTS[key] = hits
+        else:
+            _ATTEMPTS.pop(key, None)
         return len(hits) >= _MAX_ATTEMPTS
 
 
 def _note_failure(key: str) -> None:
     now = time.monotonic()
     with _ATTEMPTS_LOCK:
+        if len(_ATTEMPTS) >= _SWEEP_AT:
+            cold = [k for k, hits in _ATTEMPTS.items() if all(now - s >= _WINDOW for s in hits)]
+            for stale in cold:
+                del _ATTEMPTS[stale]
         _ATTEMPTS.setdefault(key, []).append(now)
 
 

@@ -185,13 +185,19 @@ async def lifespan(_: FastAPI):
         log.warning("smart_correction_service warmup skipped: %s", exc)
 
     # Start the Telegram bot in-process (only if TELEGRAM_BOT_TOKEN is set).
+    #
+    # Токен проверяется до импорта, а не после. aiogram при импорте строит все
+    # 635 моделей Telegram разом — 125 МБ памяти и четыре секунды старта, — и
+    # раньше эту цену платили даже без токена: проверка жила внутри модуля бота,
+    # то есть срабатывала, когда aiogram уже был загружен.
     bot_task: asyncio.Task | None = None
-    try:
-        from app.telegram import bot as telegram_bot
-        if telegram_bot.is_enabled():
+    if settings.telegram_bot_token:
+        try:
+            from app.telegram import bot as telegram_bot
+
             bot_task = asyncio.create_task(telegram_bot.start_polling())
-    except Exception as exc:
-        log.warning("Telegram bot failed to start: %s", exc)
+        except Exception as exc:
+            log.warning("Telegram bot failed to start: %s", exc)
 
     # Start the daily AutoCall.kz → Google Sheets sync (only when enabled + configured).
     autocall_task: asyncio.Task | None = None
