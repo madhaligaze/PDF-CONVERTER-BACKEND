@@ -444,6 +444,46 @@ class Plan(FinanceBase):
     )
 
 
+class Rule(FinanceBase):
+    """Автоправило разметки: условия по строке → статья, контрагент, проект, теги.
+
+    Живёт рядом с операциями, а не в настройках, потому что это часть учёта:
+    по правилу видно, почему операция оказалась в статье «Продукты», и это
+    объяснение должно переживать смену настроек интерфейса.
+
+    `position` — порядок применения. Первое сработавшее правило ставит
+    значение, следующие его не перетирают: иначе результат зависел бы от
+    порядка строк в таблице, а не от порядка правил.
+    """
+
+    __tablename__ = "rules"
+    __table_args__ = (
+        sa.CheckConstraint("match IN ('all', 'any')", name="rule_match"),
+        sa.Index("ix_rules_workspace_id_position", "workspace_id", "position"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=_uuid)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid, sa.ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(sa.Text)
+    active: Mapped[bool] = mapped_column(sa.Boolean, server_default=sa.text("true"))
+    #: `all` — все условия сразу, `any` — хотя бы одно.
+    match: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("'all'"))
+    #: [{"field": "comment", "op": "contains", "value": "Magnum"}]
+    conditions: Mapped[list] = mapped_column(JSONB, server_default=sa.text("'[]'"))
+    #: {"category": "Продукты", "project": "Розница"}
+    actions: Mapped[dict] = mapped_column(JSONB, server_default=sa.text("'{}'"))
+    position: Mapped[int] = mapped_column(sa.Integer, server_default=sa.text("0"))
+    #: Сколько операций правило уже разметило — чтобы было видно, работает ли
+    #: оно вообще, или условие написано так, что не совпадает никогда.
+    applied_count: Mapped[int] = mapped_column(sa.Integer, server_default=sa.text("0"))
+    created_by: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("''"))
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now()
+    )
+
+
 class ImportBatch(FinanceBase):
     """Один импорт файла: что за файл, как разобрали, чем закончилось.
 
@@ -533,6 +573,7 @@ __all__ = [
     "POSITION_STEP",
     "Plan",
     "Project",
+    "Rule",
     "SPLIT_STATES",
     "Tag",
     "Workspace",

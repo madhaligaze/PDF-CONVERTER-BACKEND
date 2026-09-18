@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -86,8 +87,61 @@ SEED_CATEGORIES: tuple[tuple[str, str, str], ...] = (
 )
 
 
+def create_workspace(session: Session, *, title: str) -> Workspace:
+    """Новая компания с начальными справочниками.
+
+    Зовётся из регистрации и из «добавить ещё одну компанию». Пустая компания
+    без счетов не даёт сделать ни одного действия — ни записать операцию, ни
+    загрузить выписку, — поэтому счета и статьи заводятся сразу.
+
+    `slug` собирается из названия и номера: он нужен только как человекочитаемый
+    ключ в адресах и логах, уникальность держится счётчиком, а не транслитом.
+    """
+    clean = (title or "").strip() or "Компания"
+    base = re.sub(r"[^a-z0-9]+", "-", clean.lower()).strip("-") or "company"
+    slug = base
+    suffix = 2
+    while session.scalar(sa.select(Workspace.id).where(Workspace.slug == slug)) is not None:
+        slug = f"{base}-{suffix}"
+        suffix += 1
+
+    workspace = Workspace(
+        slug=slug, title=clean, base_currency=finance_settings.base_currency
+    )
+    session.add(workspace)
+    session.flush()
+    _seed(session, workspace)
+    log.info("finance: создана компания «%s» (%s)", clean, slug)
+    return workspace
+
+
+def get_workspace(session: Session, workspace_id: uuid.UUID) -> Workspace:
+    workspace = session.get(Workspace, workspace_id)
+    if workspace is None:
+        raise FinanceError("Компания не найдена")
+    return workspace
+
+
+def rename_workspace(session: Session, workspace: Workspace, *, title: str) -> Workspace:
+    clean = (title or "").strip()
+    if len(clean) < 2:
+        raise FinanceError("У компании должно быть название")
+    workspace.title = clean
+    session.flush()
+    return workspace
+
+
 def ensure_workspace(session: Session, *, slug: str = DEFAULT_SLUG) -> Workspace:
-    """Пространство компании; при первом обращении создаётся с наполнением.
+    """Компания по умолчанию — для тестов и для данных, заведённых до учёток.
+
+    Осталась намеренно, хотя компаний теперь много. Во-первых, на ней стоят
+    полсотни тестов, и переписывать их на регистрацию значило бы проверять
+    авторизацию там, где проверяют отчёты. Во-вторых, данные, заведённые до
+    появления учёток, лежат именно в компании `default`, и путь к ним должен
+    остаться.
+
+    В маршрутах этой функции быть не должно: там компания берётся из сессии.
+    Это проверяется тестом `test_finance_routes_take_company_from_session`.
 
     Про гонку на первом открытии
     ────────────────────────────
@@ -124,6 +178,13 @@ def ensure_workspace(session: Session, *, slug: str = DEFAULT_SLUG) -> Workspace
         log.info("finance: пространство «%s» создал параллельный запрос", slug)
         return existing
 
+    _seed(session, workspace)
+    log.info("finance: создано пространство «%s» с начальными справочниками", slug)
+    return workspace
+
+
+def _seed(session: Session, workspace: Workspace) -> None:
+    """Начальные счета и статьи новой компании."""
     for position, (name, kind) in enumerate(SEED_ACCOUNTS):
         session.add(
             Account(
@@ -148,8 +209,6 @@ def ensure_workspace(session: Session, *, slug: str = DEFAULT_SLUG) -> Workspace
             )
         )
     session.flush()
-    log.info("finance: создано пространство «%s» с начальными справочниками", slug)
-    return workspace
 
 
 # ── Справочники ──────────────────────────────────────────────────────────────
@@ -891,6 +950,9 @@ _FIXABLE = frozenset(
 
 __all__ = [
     "DEFAULT_SLUG",
+    "create_workspace",
+    "get_workspace",
+    "rename_workspace",
     "FinanceError",
     "OperationFilter",
     "OperationInput",

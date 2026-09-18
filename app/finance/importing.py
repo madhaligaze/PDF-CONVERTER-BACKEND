@@ -28,6 +28,12 @@
    датам сразу, а если однозначного ответа нет — парсер не угадывает, а
    спрашивает (`Preview.question`).
 
+5. **Выписку из банка он читает только в своём формате.** Настоящая выписка
+   приходит PDF-ом, и её надо разбирать, а не просить человека переложить
+   двести строк в шаблон. Здесь PDF уходит в разбор выписок продукта
+   (`app.finance.statements` → `app.services.document_service`), тот же, что
+   работает в разделе «Анализ выписок».
+
 Правило, из которого всё выведено: **не угадывать там, где ошибка тихая.**
 Громкий отказ дороже одной минуты человека. Тихо неверная цифра стоит доверия
 ко всему отчёту, и найти её нельзя — она выглядит как цифра.
@@ -46,6 +52,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Sequence
 
 from app.books.layout import Column, norm, squash
+from app.finance.statements import StatementError, is_statement, read_statement
 
 log = logging.getLogger(__name__)
 
@@ -770,7 +777,35 @@ def analyze(
     выписке» для него недопустимо. Категории, контрагенты, проекты и теги,
     наоборот, создаются: их появление — нормальная работа, а не риск.
     """
-    rows = read_rows(data, file_name)
+    if is_statement(file_name):
+        return _analyze_statement(
+            data, file_name, known_accounts, default_account=default_account
+        )
+
+    return analyze_rows(
+        read_rows(data, file_name),
+        file_name,
+        known_accounts,
+        date_order=date_order,
+        default_account=default_account,
+    )
+
+
+def analyze_rows(
+    rows: list[list[Any]],
+    file_name: str,
+    known_accounts: Sequence[str],
+    *,
+    date_order: str | None = None,
+    default_account: str | None = None,
+) -> Preview:
+    """Разобрать уже прочитанные строки.
+
+    Отделено от `analyze` ради одного: строки приходят не только из файла. Лист
+    Google Sheets читается своим клиентом и даёт ровно такие же строки — и он
+    обязан пройти тот же разбор, те же замечания и ту же частичную заводку.
+    Отдельный разбор «для Google» разъехался бы с этим на первой же правке.
+    """
     header_index = _guess_header_index(rows)
     header = [str(cell or "") for cell in rows[header_index]]
     layout = resolve_columns(header)
@@ -829,6 +864,8 @@ def analyze(
         _parse_row(row, cells, layout, reading, accounts_by_name, default_account, missing_accounts)
         parsed.append(row)
 
+    _number_duplicates(parsed)
+
     question = None
     if reading.ambiguous and any(row.values.get("paid_at") for row in parsed):
         question = {
@@ -859,6 +896,117 @@ def analyze(
         accounts_missing=sorted(missing_accounts),
     )
 
+
+def _analyze_statement(
+    data: bytes,
+    file_name: str,
+    known_accounts: Sequence[str],
+    *,
+    default_account: str | None,
+) -> Preview:
+    """Банковская выписка (PDF) → те же строки предпросмотра, что у таблицы.
+
+    Отличие от таблицы одно: счёт в выписке не написан — файл сам и есть счёт.
+    Поэтому, пока счёт не выбран, мы не заводим строки «как-нибудь», а
+    спрашиваем, на какой счёт их положить. Это тот же механизм `question`, что
+    и у порядка дат: спрашиваем один раз на файл и только то, чего в данных
+    действительно нет.
+    """
+    accounts_by_name = {norm(name): name for name in known_accounts}
+    chosen = None
+    if default_account:
+        chosen = accounts_by_name.get(norm(default_account))
+        if chosen is None:
+            raise ImportError_(
+                f"Счёта «{default_account}» нет в справочнике. "
+                "Заведите его в «Справочниках» — импорт счета не создаёт."
+            )
+
+    try:
+        parsed = read_statement(data, file_name, account=chosen)
+    except StatementError as exc:
+        raise ImportError_(str(exc)) from exc
+
+    rows: list[ParsedRow] = []
+    for item in parsed["rows"]:
+        values = dict(item["values"])
+        row = ParsedRow(line=int(item["line"]), raw=dict(item["raw"]), state="imported")
+        if not values.get("paid_at"):
+            row.state = "failed"
+            row.problem("paid_at", "в строке выписки не разобралась дата")
+        if not values.get("amount"):
+            row.state = "failed"
+            row.problem("amount", "в строке выписки не разобралась сумма")
+        if chosen is None:
+            row.state = "failed"
+            row.problem("account_to", "не выбран счёт, на который лечь операциям")
+        values["external_key"] = fingerprint(values)
+        row.values = values
+        rows.append(row)
+
+    _number_duplicates(rows)
+
+    question = None
+    if chosen is None:
+        question = {
+            "kind": "account",
+            "title": "На какой счёт лягут эти операции?",
+            "text": (
+                f"Прочитали {parsed['count']} операций шаблоном «{parsed['parser_key']}». "
+                "В выписке название счёта не указано — файл сам и есть счёт, "
+                "поэтому его надо выбрать один раз на всю загрузку."
+            ),
+            "samples": [],
+            "options": [
+                {"value": name, "label": name, "example": ""} for name in known_accounts
+            ],
+        }
+
+    return Preview(
+        file_name=file_name,
+        header_line=0,
+        mapping={
+            "columns": {
+                "paid_at": {"index": 0, "header": "Дата", "how": "statement"},
+                "amount": {"index": 1, "header": "Сумма", "how": "statement"},
+                "kind": {"index": 2, "header": "Операция", "how": "statement"},
+                "comment": {"index": 3, "header": "Детали", "how": "statement"},
+            },
+            "width": 4,
+            "parser": parsed["parser_key"],
+        },
+        unused_columns=[],
+        rows=rows,
+        date_reading=DateReading("dmy", f"выписка прочитана шаблоном «{parsed['parser_key']}»"),
+        question=question,
+        accounts_missing=[] if chosen else list(known_accounts),
+    )
+
+def _number_duplicates(rows: list[ParsedRow]) -> None:
+    """Различить одинаковые строки ВНУТРИ одного файла.
+
+    Отпечаток считается по смыслу строки (дата, сумма, счета, комментарий), и
+    это правильно: в перезакачанной выписке та же операция получает тот же
+    отпечаток, и повторная загрузка не заводит вторую копию.
+
+    Но две одинаковые операции в один день — обычное дело: два раза по 77 ₸ в
+    Magnum. В выписке Kaspi Gold за год таких пар оказалось 219 из 2050, и все
+    они молча не завелись как «уже есть». Деньги пропали из учёта, а сообщение
+    выглядело буднично: «повторов 219».
+
+    Поэтому к отпечатку добавляется номер вхождения в этом файле. Повторная
+    загрузка того же файла даёт ту же последовательность, значит дедупликация
+    между файлами продолжает работать; а два одинаковых платежа внутри файла
+    получают разные отпечатки и заводятся оба.
+    """
+    seen: Counter[str] = Counter()
+    for row in rows:
+        key = row.values.get("external_key")
+        if not key:
+            continue
+        seen[key] += 1
+        if seen[key] > 1:
+            row.values["external_key"] = f"{key}#{seen[key]}"
 
 def _sample_as(samples: Sequence[str], order: str) -> str:
     """Как будет прочитан первый пример при выбранном порядке."""

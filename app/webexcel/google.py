@@ -279,9 +279,56 @@ def fetch_tab_grid(spreadsheet_id: str, tab_title: str) -> dict[str, Any]:
     return result
 
 
+def fetch_tab_values(spreadsheet_id: str, tab_title: str) -> list[list[str]]:
+    """Значения вкладки строками — без оформления, как их видит человек.
+
+    Отдельно от `fetch_tab_grid` по цене: грид стоит примерно килобайт на
+    ячейку, потому что несёт цвета, рамки и шрифты. Тому, кто переносит книгу в
+    учёт, оформление не нужно — нужны дата, сумма и комментарий.
+
+    Значения запрашиваются **форматированные**: «18.09.2026» и «95 323,00», а не
+    46 271 и 95323. Разбор в «Финансах» читает человеческий текст — он для того и
+    написан, чтобы понимать выписки. Сырые значения пришлось бы переводить
+    обратно через эпоху дат, и на этом переводе теряется день.
+    """
+    key = (spreadsheet_id, tab_title)
+    with _lock:
+        hit = _values_cache.get(key)
+        if hit and _fresh(hit[0]):
+            return hit[1]
+
+    meta = spreadsheet_meta(spreadsheet_id)
+    tab = next((t for t in meta["tabs"] if t["title"] == tab_title), None)
+    if tab is None:
+        known = ", ".join(f"«{t['title']}»" for t in meta["tabs"]) or "ни одной"
+        raise WebExcelError(f"Вкладка «{tab_title}» не найдена. Есть: {known}")
+
+    rows = max(1, min(int(tab["rows"] or 1), webexcel_settings.max_rows))
+    cols = max(1, min(int(tab["cols"] or 1), webexcel_settings.max_cols))
+    a1 = f"{_quote_tab(tab_title)}!A1:{_a1_col(cols - 1)}{rows}"
+
+    spreadsheet = _open(spreadsheet_id)
+    try:
+        raw = spreadsheet.values_get(
+            a1,
+            params={
+                "valueRenderOption": "FORMATTED_VALUE",
+                "dateTimeRenderOption": "FORMATTED_STRING",
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise WebExcelError(humanize(exc)) from exc
+
+    values = [[str(cell) for cell in row] for row in raw.get("values", [])]
+    with _lock:
+        _values_cache[key] = (time.monotonic(), values)
+    return values
+
+
 __all__ = [
     "WebExcelError",
     "fetch_tab_grid",
+    "fetch_tab_values",
     "humanize",
     "invalidate_cache",
     "list_spreadsheets",

@@ -28,6 +28,7 @@ import app.books.models  # noqa: F401 — раздел «Книги» (удал�
 
 from app.finance.db import FinanceBase  # Раздел «Финансы» (удаляемый модуль)
 import app.finance.models  # noqa: F401 — раздел «Финансы» (удаляемый модуль)
+import app.finance.accounts_model  # noqa: F401 — учётки раздела «Финансы»
 
 #: Конвертер в `public`, BBC в `bbc`, «Таблицы» в `webexcel`, «Книги» в `books`,
 #: «Финансы» в `finance`.

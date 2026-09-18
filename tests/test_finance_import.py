@@ -362,3 +362,36 @@ def test_csv_s_tochkoy_s_zapyatoy_i_cp1251(workspace):
     preview = analyze(text.encode("cp1251"), "выгрузка.csv", ACCOUNTS)
     assert preview.counts["ready"] == 1
     assert preview.rows[0].values["amount"] == "120500.45"
+
+def test_dva_odinakovyh_platezha_v_odin_den_zavodyatsya_oba(workspace):
+    """Повтор внутри файла — не дубль.
+
+    Два раза по 77 ₸ в одном магазине за день — обычное дело. Первая версия
+    считала их одной операцией: в выписке Kaspi Gold за год так молча потерялись
+    219 строк из 2050, а сообщение выглядело буднично — «повторов 219».
+    """
+    rows = [row(3, 77, comment="Magnum"), row(3, 77, comment="Magnum")]
+    with finance_session() as session:
+        space = service.ensure_workspace(session)
+        names = [a.name for a in service.list_accounts(session, space.id)]
+        batch = service.save_preview(session, space, analyze(book(rows), "в.xlsx", names))
+        result = service.apply_batch(session, space, batch.id)
+        _ops, total = service.list_operations(session, space.id, limit=10)
+    assert result["imported"] == 2, result
+    assert total == 2
+
+
+def test_povtornaya_zagruzka_faila_s_odinakovymi_strokami_ne_dvoit(workspace):
+    """Но тот же файл, загруженный дважды, по-прежнему не заводит копий."""
+    data = book([row(3, 77, comment="Magnum"), row(3, 77, comment="Magnum")])
+    with finance_session() as session:
+        space = service.ensure_workspace(session)
+        names = [a.name for a in service.list_accounts(session, space.id)]
+        first = service.save_preview(session, space, analyze(data, "в.xlsx", names))
+        service.apply_batch(session, space, first.id)
+        second = service.save_preview(session, space, analyze(data, "в.xlsx", names))
+        again = service.apply_batch(session, space, second.id)
+        _ops, total = service.list_operations(session, space.id, limit=10)
+    assert again["imported"] == 0
+    assert again["duplicate"] == 2
+    assert total == 2
