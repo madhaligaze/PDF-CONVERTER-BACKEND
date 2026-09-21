@@ -61,6 +61,7 @@ TITLES = {
     "integration.create": "подключение создано",
     "integration.receive": "операции пришли из подключения",
     "account.balance": "начальный остаток счёта изменён",
+    "autotag.apply": "авторазметка статей",
 }
 
 
@@ -117,6 +118,12 @@ def listing(
     )
     out: list[dict[str, Any]] = []
     for entry in rows:
+        before, after = entry.before or {}, entry.after or {}
+        if entry.kind == "autotag.apply":
+            # Разметка хранит пары «операция → статья» на все тысячи строк; в
+            # список истории они не нужны — только сколько.
+            before = {"operations": len(before.get("items", []))} if "items" in before else before
+            after = {"operations": len(after.get("items", []))} if "items" in after else after
         out.append(
             {
                 "id": str(entry.id),
@@ -126,14 +133,28 @@ def listing(
                 "entity": entry.entity,
                 "entity_id": str(entry.entity_id) if entry.entity_id else None,
                 "title": entry.title,
-                "before": entry.before or {},
-                "after": entry.after or {},
+                "before": before,
+                "after": after,
                 "undone_at": entry.undone_at.isoformat() if entry.undone_at else None,
-                # Отменить можно только то, что умеем вернуть: операции.
-                "can_undo": entry.undone_at is None and entry.entity == "operation" and bool(entry.entity_id),
+                "can_undo": entry.undone_at is None and _undoable(entry),
             }
         )
     return out
+
+
+def _undoable(entry: ActionLog) -> bool:
+    """Отменить можно только то, что `undo` умеет вернуть.
+
+    Раньше здесь стояли одни операции, и отмена начального остатка счёта,
+    которую `undo` умеет, с экрана была недоступна: кнопки не было.
+    """
+    if entry.entity == "operation" and entry.entity_id:
+        return True
+    if entry.kind == "account.balance" and entry.entity == "account" and entry.entity_id:
+        return not str(entry.title).startswith("отменено")
+    if entry.kind == "autotag.apply":
+        return "items" in (entry.after or {})
+    return False
 
 
 def _restore(operation: Operation, state: dict[str, Any]) -> None:
@@ -186,6 +207,32 @@ def undo(
             after={"starting_balance": str(previous)}, actor=actor,
         )
         return {"ok": True, "account_id": str(account.id)}
+    if entry.kind == "autotag.apply":
+        # Авторазметка отменяется целиком: снимаем статью только там, где она
+        # всё ещё та, что поставила разметка. Статью, которую человек потом
+        # поправил руками, отмена не трогает — иначе она стёрла бы его работу.
+        cleared = 0
+        for operation_id, category_id in (entry.after or {}).get("items", []):
+            operation = session.get(Operation, uuid.UUID(operation_id))
+            if (
+                operation is None
+                or operation.workspace_id != workspace.id
+                or str(operation.category_id) != category_id
+            ):
+                continue
+            operation.category_id = None
+            operation.version += 1
+            cleared += 1
+        entry.undone_at = datetime.now(timezone.utc)
+        session.flush()
+        write(
+            session, workspace, kind="autotag.apply", entity="operations",
+            title=f"отменено: {entry.title}",
+            before={"operations": len((entry.after or {}).get("items", []))},
+            after={"cleared": cleared},
+            actor=actor,
+        )
+        return {"ok": True, "cleared": cleared}
     if entry.entity != "operation" or not entry.entity_id:
         raise FinanceError("Отмена пока умеет только операции и начальный остаток счёта")
 

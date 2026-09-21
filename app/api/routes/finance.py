@@ -44,6 +44,7 @@ from pydantic import BaseModel, Field
 
 from app.finance import (
     auth,
+    autotag,
     grid as grid_module,
     history,
     integrations as integrations_module,
@@ -1443,6 +1444,50 @@ def suggest_rules(member: Member = Depends(current_member)) -> dict[str, Any]:
     with finance_session() as session:
         workspace = _workspace(session, member)
         return {"items": rules.suggest(session, workspace.id)}
+
+
+# ── Авторазметка ─────────────────────────────────────────────────────────────
+
+
+@router.get("/autotag")
+def autotag_preview(member: Member = Depends(current_member)) -> dict[str, Any]:
+    """Что разметится по тексту операций — группами, ничего не записывая."""
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        return autotag.preview(session, workspace)
+
+
+class AutotagGroupIn(BaseModel):
+    side: str = Field(pattern="^(income|expense)$")
+    category: str
+
+
+class AutotagIn(BaseModel):
+    groups: list[AutotagGroupIn]
+
+
+@router.post("/autotag")
+def autotag_apply(body: AutotagIn, member: Member = Depends(require_ability("write"))) -> dict[str, Any]:
+    """Разметить выбранные группы. Одна запись в истории — одна отмена на всё."""
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        try:
+            done = autotag.apply(session, workspace, [(item.side, item.category) for item in body.groups])
+        except FinanceError as exc:
+            raise _fail(exc) from exc
+        if done["updated"]:
+            history.write(
+                session,
+                workspace,
+                kind="autotag.apply",
+                entity="operations",
+                title=f"авторазметка: {done['updated']} операций",
+                after={"items": done["items"]},
+                actor=_actor(member),
+            )
+        return {"updated": done["updated"], "by_category": done["by_category"]}
 
 
 # ── Импорт ───────────────────────────────────────────────────────────────────
