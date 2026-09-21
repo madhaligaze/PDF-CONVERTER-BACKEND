@@ -46,13 +46,20 @@ from app.finance.models import (
     Project,
     Workspace,
 )
-from app.finance.service import FinanceError, OperationInput, create_operation
+from app.finance.service import FinanceError, OperationInput, check_money, create_operation
 
 CENT = Decimal("0.01")
 
 
-def _money(value: Any) -> Decimal:
-    return Decimal(str(value or 0)).quantize(CENT)
+def _money(value: Any, *, field: str = "Сумма") -> Decimal:
+    """Деньги счёта проверяются тем же правилом, что и деньги операции.
+
+    Иначе цена позиции в двадцать пять знаков доходила до Postgres как есть и
+    возвращалась пятисотой ошибкой: столбец `numeric(18, 2)` переполнялся уже
+    после того, как запрос ушёл. Человек при этом набирал не двадцать пять
+    знаков, а залипшую клавишу.
+    """
+    return check_money(value or 0, field=field)
 
 
 def totals(lines: Sequence[dict[str, Any]], vat_rate: Decimal) -> tuple[Decimal, Decimal, Decimal]:
@@ -62,15 +69,26 @@ def totals(lines: Sequence[dict[str, Any]], vat_rate: Decimal) -> tuple[Decimal,
     набранный руками, однажды не совпадёт с позициями — и спорить будут с
     клиентом, а не с программой.
     """
-    net = sum((_money(line.get("amount")) for line in lines), Decimal("0"))
-    vat = (net * Decimal(str(vat_rate or 0)) / Decimal("100")).quantize(CENT)
-    return net.quantize(CENT), vat, (net + vat).quantize(CENT)
+    net = _money(sum((_money(line.get("amount")) for line in lines), Decimal("0")), field="Сумма счёта")
+    vat = _money(net * _number(vat_rate or 0, field="Ставка НДС") / Decimal("100"), field="НДС")
+    return net, vat, _money(net + vat, field="Сумма счёта к оплате")
+
+
+def _number(value: Any, *, field: str) -> Decimal:
+    """Не деньги, но число: количество, ставка НДС. Мусор — отказ, не 500."""
+    try:
+        parsed = Decimal(str(value))
+    except (ArithmeticError, TypeError, ValueError) as exc:
+        raise FinanceError(f"{field}: это не число") from exc
+    if not parsed.is_finite():
+        raise FinanceError(f"{field}: это не число")
+    return parsed
 
 
 def line_amount(line: dict[str, Any]) -> Decimal:
-    quantity = Decimal(str(line.get("quantity") or 1))
-    price = _money(line.get("price"))
-    return (quantity * price).quantize(CENT)
+    quantity = _number(line.get("quantity") or 1, field="Количество")
+    price = _money(line.get("price"), field="Цена позиции")
+    return _money(quantity * price, field="Сумма позиции")
 
 
 def next_number(session: Session, workspace_id: uuid.UUID, kind: str) -> str:
@@ -116,7 +134,7 @@ def create(
     prepared = [
         {
             "title": str(line.get("title") or "").strip() or "Без названия",
-            "quantity": Decimal(str(line.get("quantity") or 1)),
+            "quantity": _number(line.get("quantity") or 1, field="Количество"),
             "price": _money(line.get("price")),
             "amount": line_amount(line),
         }
@@ -124,7 +142,7 @@ def create(
     ]
     if not prepared:
         raise FinanceError("В счёте нет ни одной позиции")
-    net, vat, gross = totals(prepared, Decimal(str(vat_rate or 0)))
+    net, vat, gross = totals(prepared, _number(vat_rate or 0, field="Ставка НДС"))
     if gross <= 0:
         raise FinanceError("Сумма счёта должна быть больше нуля")
     if due_at < issued_at:
@@ -142,7 +160,7 @@ def create(
         category_id=category_id,
         currency=workspace.base_currency,
         amount_net=net,
-        vat_rate=Decimal(str(vat_rate or 0)),
+        vat_rate=_number(vat_rate or 0, field="Ставка НДС"),
         vat_amount=vat,
         amount_gross=gross,
         comment=comment.strip(),

@@ -25,8 +25,8 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
-from app.finance.models import ActionLog, Operation, Workspace
-from app.finance.service import FinanceError
+from app.finance.models import Account, ActionLog, Operation, Workspace
+from app.finance.service import FinanceError, check_money
 
 #: Поля операции, которые история хранит и умеет вернуть. Список закрытый: то,
 #: что в него не входит, отменой не восстановится, и лучше знать это заранее,
@@ -60,6 +60,7 @@ TITLES = {
     "recurrence.remove": "повторение удалено",
     "integration.create": "подключение создано",
     "integration.receive": "операции пришли из подключения",
+    "account.balance": "начальный остаток счёта изменён",
 }
 
 
@@ -166,8 +167,27 @@ def undo(
         raise FinanceError("Запись истории не найдена")
     if entry.undone_at is not None:
         raise FinanceError("Это действие уже отменено")
+    if entry.entity == "account" and entry.kind == "account.balance" and entry.entity_id:
+        # Начальный остаток меняет остаток счёта во всех отчётах задним числом —
+        # ошибку в нём обязаны уметь вернуть так же, как правку операции.
+        account = session.get(Account, entry.entity_id)
+        if account is None or account.workspace_id != workspace.id:
+            raise FinanceError("Счёта больше нет — отменять нечего")
+        previous = (entry.before or {}).get("starting_balance")
+        if previous is None:
+            raise FinanceError("В записи нет состояния «до»")
+        now = str(account.starting_balance)
+        account.starting_balance = Decimal(str(previous))
+        entry.undone_at = datetime.now(timezone.utc)
+        session.flush()
+        write(
+            session, workspace, kind="account.balance", entity="account", entity_id=account.id,
+            title=f"отменено: {entry.title}", before={"starting_balance": now},
+            after={"starting_balance": str(previous)}, actor=actor,
+        )
+        return {"ok": True, "account_id": str(account.id)}
     if entry.entity != "operation" or not entry.entity_id:
-        raise FinanceError("Отмена пока умеет только операции")
+        raise FinanceError("Отмена пока умеет только операции и начальный остаток счёта")
 
     operation = session.get(Operation, entry.entity_id)
     if operation is None:
@@ -180,9 +200,12 @@ def undo(
             raise FinanceError("В записи нет состояния «до»")
         _restore(operation, entry.before)
 
-    operation.amount_base = (
-        Decimal(str(operation.amount)) * Decimal(str(operation.rate))
-    ).quantize(Decimal("0.01"))
+    # Тем же правилом округления, что при записи (`check_money`): иначе
+    # отменённая правка валютной операции возвращала бы сумму в валюте
+    # компании на копейку другой.
+    operation.amount_base = check_money(
+        Decimal(str(operation.amount)) * Decimal(str(operation.rate)), field="Сумма в валюте компании"
+    )
     operation.version += 1
     entry.undone_at = datetime.now(timezone.utc)
     session.flush()

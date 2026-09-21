@@ -69,6 +69,17 @@ def _parse_date(value: str) -> date | None:
     return None
 
 
+def _iso(value: str | None) -> str | None:
+    parsed = _parse_date(value or "")
+    return parsed.isoformat() if parsed else None
+
+
+def _money_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(Decimal(str(value)).quantize(Decimal("0.01")))
+
+
 def read_statement(data: bytes, file_name: str, *, account: str | None) -> dict[str, Any]:
     """Разобрать выписку и вернуть строки в том же виде, что табличный импорт.
 
@@ -144,7 +155,20 @@ def read_statement(data: bytes, file_name: str, *, account: str | None) -> dict[
             raw["Документ"] = tx.document_number
         rows.append({"line": index + 2, "values": values, "raw": raw})
 
+    meta = statement.metadata
+    # Что напечатал сам банк: остатки на начало и конец периода. По ним
+    # предпросмотр сверяет разобранные операции с банком, а начальный остаток
+    # счёта ставится из выписки, а не набирается руками.
+    bank = {
+        "period_start": _iso(getattr(meta, "period_start", None)),
+        "period_end": _iso(getattr(meta, "period_end", None)),
+        "opening_balance": _money_text(getattr(meta, "opening_balance", None)),
+        "closing_balance": _money_text(getattr(meta, "closing_balance", None)),
+        "account_number": getattr(meta, "account_number", None) or "",
+        "card_number": getattr(meta, "card_number", None) or "",
+    }
     return {
+        "bank": bank,
         "rows": rows,
         "parser_key": parser_key,
         "parsers_tried": [

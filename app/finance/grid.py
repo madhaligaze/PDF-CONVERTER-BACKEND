@@ -30,6 +30,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Any, Sequence
 
+import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.books.layout import norm
@@ -55,11 +56,11 @@ COLUMNS: tuple[GridColumn, ...] = (
     GridColumn("paid_at", "Дата платежа", "date", 110),
     GridColumn("kind_label", "Вид", "readonly", 90, editable=False),
     GridColumn("amount", "Сумма", "money", 130),
-    GridColumn("account_from", "Со счёта", "enum", 140, source="accounts"),
-    GridColumn("account_to", "На счёт", "enum", 140, source="accounts"),
-    GridColumn("category", "Категория", "enum", 160, source="categories"),
-    GridColumn("counterparty", "Контрагент", "enum", 170, source="counterparties"),
-    GridColumn("project", "Проект", "enum", 140, source="projects"),
+    GridColumn("account_from", "Со счёта", "enum", 175, source="accounts"),
+    GridColumn("account_to", "На счёт", "enum", 175, source="accounts"),
+    GridColumn("category", "Категория", "enum", 180, source="categories"),
+    GridColumn("counterparty", "Контрагент", "enum", 210, source="counterparties"),
+    GridColumn("project", "Проект", "enum", 180, source="projects"),
     GridColumn("accrued_at", "Дата сделки", "date", 110),
     GridColumn("comment", "Комментарий", "text", 260),
     GridColumn("status_label", "Состояние", "readonly", 110, editable=False),
@@ -142,10 +143,67 @@ def build_grid(
     }
 
 
+def row_of(session: Session, workspace: Workspace, operation: Operation) -> dict[str, Any]:
+    """Одна строка листа — ровно в том виде, в каком её отдаёт `build_grid`.
+
+    Лист после правки записывает эту строку обратно в свои ячейки. Без неё
+    ему оставалось перечитывать журнал целиком, а перечитанный журнал
+    отсортирован заново: операция с исправленной датой уезжала на другое
+    место, строки на экране оставались прежними, и следующая правка уходила в
+    соседнюю операцию.
+    """
+    return build_grid(session, workspace, [operation])["rows"][0]
+
+
 def _resolve(session: Session, workspace: Workspace, model, name: str, **extra):
-    if not (name or "").strip():
+    """Запись справочника по тексту ячейки: точно, иначе единственная по началу.
+
+    Выпадающий список Univer не дополняет набранное: «Кас» + Enter оставлял в
+    ячейке «Кас», и сервер отвечал «Счёта «Кас» нет», хотя счёт «Касса» один
+    и перепутать его не с чем. А при быстром наборе список перехватывает фокус
+    на второй-третьей букве, и в ячейке остаётся «Ба» от «Банковский счёт».
+    Человек из Excel печатает, а не щёлкает мышью по списку.
+
+    Правило то же, что у заголовков колонок книг: нечёткое совпадение
+    принимается, только если кандидат ровно один. «Ба» при двух счетах на
+    «Ба…» — не угадывание, а отказ. И это не тихо: лист записывает ответ
+    сервера обратно, и в ячейке появляется полное название.
+    """
+    clean = (name or "").strip()
+    if not clean:
         return None
-    return service.find_entry(session, model, workspace.id, name, **extra)
+    found = service.find_entry(session, model, workspace.id, clean, **extra)
+    if found is not None:
+        return found
+    key = norm(clean)
+    if len(key) < 2:
+        return None
+    conditions = [
+        model.workspace_id == workspace.id,
+        model.normalized_name.startswith(key, autoescape=True),
+        model.archived_at.is_(None),
+    ]
+    for field, value in extra.items():
+        conditions.append(getattr(model, field) == value)
+    candidates = session.scalars(sa.select(model).where(*conditions).limit(2)).all()
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _account(session: Session, workspace: Workspace, text: str) -> Account | None:
+    """Счёт по тексту ячейки — или отказ со списком того, что есть.
+
+    Счёт из таблицы не создаётся: место, где лежат деньги, не должно
+    появляться из опечатки. Но и отказ «такого нет» без списка заставлял идти
+    в справочник, чтобы узнать, как счёт называется.
+    """
+    account = _resolve(session, workspace, Account, text)
+    if text.strip() and account is None:
+        names = [item.name for item in service.list_accounts(session, workspace.id)]
+        raise service.FinanceError(
+            f"Счёта «{text.strip()}» нет. Есть: {', '.join(names)}. "
+            "Новый счёт заводится в «Справочниках»"
+        )
+    return account
 
 
 def apply_cell(
@@ -203,13 +261,7 @@ def apply_cell(
         changes[column_key] = text
     elif column.kind == "enum":
         if column_key in ("account_from", "account_to"):
-            account = _resolve(session, workspace, Account, text)
-            if text and account is None:
-                raise service.FinanceError(
-                    f"Счёта «{text}» нет. Счета заводятся в справочнике — импорт и "
-                    "таблица их не создают: место, где лежат деньги, не должно "
-                    "появляться из опечатки"
-                )
+            account = _account(session, workspace, text)
             changes[f"{column_key}_id"] = account.id if account else None
         elif column_key == "category":
             side = "income" if operation.kind == "income" else "expense"
@@ -247,11 +299,8 @@ def append_row(
     списание. Это избавляет от лишней колонки и повторяет привычку кассовой
     книги, где приход и расход различаются тем, в какую графу поставили сумму.
     """
-    account_from = _resolve(session, workspace, Account, str(cells.get("account_from") or ""))
-    account_to = _resolve(session, workspace, Account, str(cells.get("account_to") or ""))
-    for key, value in (("account_from", cells.get("account_from")), ("account_to", cells.get("account_to"))):
-        if str(value or "").strip() and (account_from if key == "account_from" else account_to) is None:
-            raise service.FinanceError(f"Счёта «{str(value).strip()}» нет в справочнике")
+    account_from = _account(session, workspace, str(cells.get("account_from") or ""))
+    account_to = _account(session, workspace, str(cells.get("account_to") or ""))
 
     if account_from and account_to:
         kind = "transfer"
@@ -270,19 +319,40 @@ def append_row(
     money = parse_money(cells.get("amount"))
     if money is None or not money.value:
         raise service.FinanceError("Без суммы строка не станет операцией")
+    # Минус в сумме не выбрасываем молча. Человек из кассовой книги пишет
+    # расход с минусом — и если счёт стоит в «Со счёта», минус с ним согласен.
+    # Но минус при счёте в «На счёт» означал бы «пришло минус пять тысяч»:
+    # взять модуль и завести поступление — ровно та тихая смена знака, за
+    # которую разбор импорта критикует соседей по рынку.
+    if money.negative and kind != "expense":
+        raise service.FinanceError(
+            "Сумма с минусом, а счёт указан в «На счёт» — это было бы поступление. "
+            "Для расхода поставьте счёт в «Со счёта»"
+            if kind == "income"
+            else "У перевода сумма без минуса: направление задают «Со счёта» и «На счёт»"
+        )
 
     side = "income" if kind == "income" else "expense"
+    # Справочники кроме счетов по-прежнему пополняются из таблицы, но сначала
+    # ищется существующая запись — в том числе по началу названия, иначе
+    # «Арен» заводило бы вторую статью рядом с «Арендой» и делило отчёт.
     category = None
     if str(cells.get("category") or "").strip() and kind != "transfer":
-        category = service.ensure_category(session, workspace.id, side, str(cells["category"]))
+        text = str(cells["category"])
+        category = _resolve(session, workspace, Category, text, side=side) or service.ensure_category(
+            session, workspace.id, side, text
+        )
     counterparty = None
     if str(cells.get("counterparty") or "").strip():
-        counterparty = service.ensure_counterparty(
-            session, workspace.id, str(cells["counterparty"]), role="client" if kind == "income" else "supplier"
+        role = "client" if kind == "income" else "supplier"
+        text = str(cells["counterparty"])
+        counterparty = _resolve(session, workspace, Counterparty, text, role=role) or service.ensure_counterparty(
+            session, workspace.id, text, role=role
         )
     projects: list[tuple[uuid.UUID, Decimal]] = []
     if str(cells.get("project") or "").strip():
-        project = service.ensure_project(session, workspace.id, str(cells["project"]))
+        text = str(cells["project"])
+        project = _resolve(session, workspace, Project, text) or service.ensure_project(session, workspace.id, text)
         if project is not None:
             projects.append((project.id, money.value))
 
@@ -304,4 +374,4 @@ def append_row(
     return service.create_operation(session, workspace, data, actor=actor)
 
 
-__all__ = ["COLUMNS", "GridColumn", "KIND_LABELS", "append_row", "apply_cell", "build_grid"]
+__all__ = ["COLUMNS", "GridColumn", "KIND_LABELS", "append_row", "apply_cell", "build_grid", "row_of"]

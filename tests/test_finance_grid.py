@@ -128,7 +128,67 @@ def test_neizvestnyy_schet_v_yacheike_otkaz(one_income):
         space = service.ensure_workspace(session)
         with pytest.raises(FinanceError) as exc:
             grid.apply_cell(session, space, operation_id, "account_to", "Kaspi Gold")
-    assert "заводятся в справочнике" in str(exc.value)
+    text = str(exc.value)
+    # Отказ называет, что есть, — иначе за названием счёта шли в справочник.
+    assert "Kaspi Gold" in text and "Касса" in text and "Справочник" in text
+
+
+def test_schet_po_nachalu_nazvaniya_esli_on_odin(one_income):
+    """«Кас» + Enter — это «Касса»: выпадающий список Univer не дополняет набор."""
+    space_id, operation_id = one_income
+    with finance_session() as session:
+        space = service.ensure_workspace(session)
+        grid.apply_cell(session, space, operation_id, "account_to", "Банк")
+        row = grid.row_of(session, space, session.get(grid.Operation, operation_id))
+    assert row["cells"]["account_to"] == "Банковский счёт"
+
+
+def test_neodnoznachnoe_nachalo_scheta_otkaz(one_income):
+    """Два кандидата — не угадываем, а отказываем."""
+    space_id, operation_id = one_income
+    with finance_session() as session:
+        space = service.ensure_workspace(session)
+        service.create_account(session, space, name="Касса офис")
+        with pytest.raises(FinanceError):
+            grid.apply_cell(session, space, operation_id, "account_to", "Кас")
+
+
+def test_novaya_stroka_minus_pri_postuplenii_otkaz(one_income):
+    """Минус при счёте в «На счёт» — не повод молча завести поступление."""
+    with finance_session() as session:
+        space = service.ensure_workspace(session)
+        with pytest.raises(FinanceError) as exc:
+            grid.append_row(
+                session, space,
+                {"paid_at": "05.09.2026", "amount": "-5000", "account_to": "Касса"},
+            )
+    assert "минус" in str(exc.value).lower()
+
+
+def test_novaya_stroka_minus_pri_raskhode_prinyat(one_income):
+    """Минус при счёте в «Со счёта» с видом согласен — это расход на 5 000."""
+    with finance_session() as session:
+        space = service.ensure_workspace(session)
+        operation = grid.append_row(
+            session, space,
+            {"paid_at": "05.09.2026", "amount": "-5000", "account_from": "Касса"},
+        )
+        assert operation.kind == "expense"
+        assert operation.amount == Decimal("5000")
+
+
+def test_kategoriya_po_nachalu_ne_plodit_dvoynika(one_income):
+    """«Арен» в новой строке — это существующая «Аренда», а не вторая статья."""
+    with finance_session() as session:
+        space = service.ensure_workspace(session)
+        before = len(service.list_categories(session, space.id))
+        operation = grid.append_row(
+            session, space,
+            {"paid_at": "05.09.2026", "amount": "1000", "account_from": "Касса", "category": "Арен"},
+        )
+        category = session.get(grid.Category, operation.category_id)
+        assert category.name == "Аренда"
+        assert len(service.list_categories(session, space.id)) == before
 
 
 def test_kategoriya_v_yacheike_zavoditsya_srazu(one_income):

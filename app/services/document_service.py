@@ -284,25 +284,24 @@ def _extract_pdf_metadata(
     if account_index > -1 and account_index + 1 < len(lines):
         account_number = lines[account_index + 1]
 
-    opening_label = next((line for line in lines if line.startswith("Доступно на ") and line.endswith(":")), None)
-    opening_balance = None
-    closing_balance = None
-    if opening_label and opening_label in lines:
-        opening_idx = lines.index(opening_label)
-        if opening_idx + 1 < len(lines):
-            opening_balance = _parse_amount(lines[opening_idx + 1])
-    closing_label = next(
-        (
-            line
-            for line in reversed(lines)
-            if line.startswith("Доступно на ") and line.endswith(":") and line != opening_label
-        ),
-        None,
-    )
-    if closing_label and closing_label in lines:
-        closing_idx = lines.index(closing_label)
-        if closing_idx + 1 < len(lines):
-            closing_balance = _parse_amount(lines[closing_idx + 1])
+    # Остатки — по дате в подписи, а не по порядку подписей.
+    #
+    # «Доступно на ДД.ММ.ГГ» в выписке Kaspi Gold встречается трижды: в шапке —
+    # на дату выдачи, с двоеточием, и в «Кратком содержании» — на начало и на
+    # конец периода. Остатком на начало раньше бралось первое из них, то есть
+    # остаток на КОНЕЦ из шапки: в выписке за 18.09.25–18.09.26 «на старте»
+    # стояло 21 439,09 вместо 28 012,68, и сверка с банком не могла сойтись.
+    balances: dict[str, float] = {}
+    for index, line in enumerate(lines):
+        label = re.match(r"^Доступно на (\d{2}\.\d{2}\.\d{2,4}):?$", line)
+        if not label or index + 1 >= len(lines):
+            continue
+        try:
+            balances.setdefault(label.group(1), _parse_amount(lines[index + 1]))
+        except DocumentParseError:
+            continue
+    opening_balance = balances.get(period_match.group(1)) if period_match else None
+    closing_balance = balances.get(period_match.group(2)) if period_match else None
 
     currency = None
     if "Валюта счета:" in lines:

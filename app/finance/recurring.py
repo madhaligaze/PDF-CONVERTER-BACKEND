@@ -61,12 +61,27 @@ def _shift(when: date, period: str, day: int) -> date:
     return date(year, month, min(day, calendar.monthrange(year, month)[1]))
 
 
+def clamp_day(day: Any) -> int:
+    """Число месяца в пределах 1–31.
+
+    Приведение живёт отдельной функцией, потому что раньше оно стояло только
+    в одном из двух мест: в базу день писался приведённым, а первая дата
+    считалась из сырого. День `-5` доходил до `date(год, месяц, -5)` и падал
+    пятисотой. Одно значение — одно приведение.
+    """
+    try:
+        return max(1, min(31, int(day)))
+    except (TypeError, ValueError) as exc:
+        raise FinanceError("Число месяца должно быть числом от 1 до 31") from exc
+
+
 def first_date(start_at: date, period: str, day: int) -> date:
     if period == "week":
         return start_at
+    safe = clamp_day(day)
     last = calendar.monthrange(start_at.year, start_at.month)[1]
-    candidate = date(start_at.year, start_at.month, min(day, last))
-    return candidate if candidate >= start_at else _shift(candidate, period, day)
+    candidate = date(start_at.year, start_at.month, min(safe, last))
+    return candidate if candidate >= start_at else _shift(candidate, period, safe)
 
 
 def create(
@@ -102,10 +117,10 @@ def create(
         title=title.strip() or "Без названия",
         kind=kind,
         period=period,
-        day=max(1, min(31, int(day))),
+        day=clamp_day(day),
         start_at=start_at,
         until=until,
-        next_at=first_date(start_at, period, int(day)),
+        next_at=first_date(start_at, period, day),
         amount=Decimal(str(amount)),
         currency=workspace.base_currency,
         account_from_id=account_from_id,

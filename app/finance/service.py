@@ -20,7 +20,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Iterable, Sequence
 
 import sqlalchemy as sa
@@ -58,6 +58,73 @@ class FinanceError(RuntimeError):
 
 class VersionConflict(FinanceError):
     """Операцию уже поправил кто-то другой."""
+
+
+# ── Пределы значений ─────────────────────────────────────────────────────────
+#
+# Столбец денег — `numeric(18, 2)`, то есть абсолютная величина меньше 10^16.
+# Само по себе это не новость; новость в том, что без проверки перед записью
+# Postgres отвечает `NumericValueOutOfRange`, psycopg роняет запрос, и человек
+# получает пятисотую вместо объяснения. Проверено вводом сорока девяток в
+# ячейку «Сумма»: 500 Internal Server Error и пустой экран.
+#
+# Потолок взят с запасом на одну цифру вниз: `amount_base` считается как сумма
+# × курс, и сумма, ровно влезающая в столбец, после пересчёта в валюту
+# компании уже не влезала бы — падение переехало бы на строку ниже и выглядело
+# бы совсем необъяснимо.
+MONEY_MAX = Decimal("999999999999.99")  # 10^12 − 0.01
+
+#: Разумный век для даты платежа. Не «валидация ради валидации»: год набирают
+#: руками и промахиваются мимо клавиши, а операция с датой 2926 года молча
+#: становится планом и навсегда оседает в «с учётом ожиданий» и в календаре.
+#: Громкий отказ здесь дешевле тихой цифры, которую никто не пойдёт искать.
+DATE_MIN = date(2000, 1, 1)
+DATE_MAX = date(2100, 12, 31)
+
+
+def check_money(value: Any, *, field: str = "Сумма") -> Decimal:
+    """Сумма к записи: влезает в столбец и уже округлена до копеек.
+
+    Округляем здесь, а не полагаемся на Postgres, потому что округляли в двух
+    местах по-разному. Столбец `numeric(18, 2)` округляет `0.005` вверх, до
+    копейки, а `amount_base` считался через `quantize` с банковским правилом —
+    в ноль. Одна и та же операция весила копейку в сводке и ноль в отчёте,
+    и выписка по счёту разошлась со сводкой на 0.01 ₸ ровно по этой причине.
+    Расхождение в копейку не «мелочь»: оно означает, что два экрана считают
+    по-разному, и в следующий раз разойдутся на большее.
+
+    Ненулевая сумма, которая округляется в ноль, — отказ. Записать её значит
+    показать в журнале строку на ноль тенге там, где деньги были.
+    """
+    try:
+        amount = Decimal(str(value))
+    except (ArithmeticError, TypeError, ValueError) as exc:
+        raise FinanceError(f"{field}: это не сумма") from exc
+    if not amount.is_finite():
+        raise FinanceError(f"{field}: это не сумма")
+    if abs(amount) > MONEY_MAX:
+        raise FinanceError(
+            f"{field} слишком большая: потолок {MONEY_MAX:,.2f}".replace(",", " ")
+            + ". Проверьте, не лишние ли это нули"
+        )
+    rounded = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if amount and not rounded:
+        raise FinanceError(
+            f"{field} «{amount}» меньше копейки — в учёте она стала бы нулём"
+        )
+    return rounded
+
+
+def check_date(value: date | None, *, field: str) -> date | None:
+    """Дата в пределах разумного века — иначе опечатка в годе уедет в отчёт."""
+    if value is None:
+        return None
+    if not DATE_MIN <= value <= DATE_MAX:
+        raise FinanceError(
+            f"{field} «{value.isoformat()}» вне разумных пределов "
+            f"({DATE_MIN.year}–{DATE_MAX.year}). Похоже на опечатку в годе"
+        )
+    return value
 
 
 # ── Пространство и первичное наполнение ──────────────────────────────────────
@@ -270,13 +337,120 @@ def create_account(
         normalized_name=norm(clean),
         kind=kind,
         currency=(currency or workspace.base_currency).upper(),
-        starting_balance=Decimal(str(starting_balance or 0)),
+        starting_balance=check_money(starting_balance or 0, field="Начальный остаток"),
         excluded_from_reports=excluded_from_reports,
         position=_next_position(session, Account, workspace.id),
     )
     session.add(account)
     session.flush()
     return account
+
+
+def set_starting_balance(
+    session: Session, workspace: Workspace, account_id: uuid.UUID, value: Any
+) -> tuple[Account, Decimal]:
+    """Поменять начальный остаток счёта. Возвращает счёт и прежний остаток.
+
+    Раньше остаток задавался только при создании счёта. А «Банковский счёт» и
+    «Касса» заводятся при регистрации сами, с нулём, — и человек, загрузивший
+    в них выписку, навсегда оставался с отрицательным остатком: у выписки Kaspi
+    за год «Всего на счетах» показывало −6 523,59 при 21 439,09 на карте.
+    """
+    account = session.get(Account, account_id)
+    if account is None or account.workspace_id != workspace.id:
+        raise FinanceError("Счёт не найден")
+    before = Decimal(str(account.starting_balance))
+    account.starting_balance = check_money(value, field="Начальный остаток")
+    session.flush()
+    return account, before
+
+
+def account_net_before(
+    session: Session, workspace_id: uuid.UUID, account_id: uuid.UUID, when: date
+) -> tuple[Decimal, int]:
+    """Движение по счёту до даты (факт): сумма и сколько операций.
+
+    Нужно сверке выписки: остаток счёта на начало периода выписки — это
+    начальный остаток плюс всё, что было раньше. Если раньше не было ничего,
+    остаток на начало и есть начальный остаток, и его можно взять из выписки.
+    """
+    signed = sa.case(
+        (Operation.account_to_id == account_id, Operation.amount),
+        else_=-Operation.amount,
+    )
+    total, count = session.execute(
+        sa.select(sa.func.coalesce(sa.func.sum(signed), 0), sa.func.count(Operation.id)).where(
+            Operation.workspace_id == workspace_id,
+            Operation.deleted_at.is_(None),
+            Operation.status == "fact",
+            Operation.paid_at < when,
+            sa.or_(Operation.account_to_id == account_id, Operation.account_from_id == account_id),
+        )
+    ).one()
+    return Decimal(str(total)), int(count or 0)
+
+
+def reconcile_statement(
+    session: Session, workspace: Workspace, preview: Preview
+) -> dict[str, Any] | None:
+    """Сверка выписки с банком — то, что банк напечатал, против того, что разобрано.
+
+    Три числа из самой выписки (остаток на начало, на конец и движение по
+    разобранным строкам) и одно из учёта (остаток счёта на начало периода).
+    Сходится — значит, при разборе не потеряно ни одной операции, и после
+    загрузки остаток счёта совпадёт с банком. Не сходится — разница видна до
+    того, как операции заведены.
+
+    Соседи по рынку этого не делают: выписка Kaspi, загруженная в Finmap,
+    дала остаток −13 047,18 при 21 439,09 на карте, и ни одного слова о том,
+    что остатки не сошлись.
+    """
+    bank = preview.bank
+    if not bank:
+        return None
+    net = Decimal("0")
+    for row in preview.rows:
+        amount = row.values.get("amount")
+        if not amount:
+            continue
+        value = Decimal(str(amount))
+        net += value if row.values.get("kind") == "income" else -value
+    opening = Decimal(bank["opening_balance"]) if bank.get("opening_balance") else None
+    closing = Decimal(bank["closing_balance"]) if bank.get("closing_balance") else None
+    out: dict[str, Any] = {
+        **bank,
+        "file_net": str(net),
+        "expected_closing": str(opening + net) if opening is not None else None,
+        "gap": str(closing - (opening + net)) if opening is not None and closing is not None else None,
+        "account_id": None,
+        "starting_balance": None,
+        "ledger_opening": None,
+        "earlier_operations": 0,
+        "can_set_start": False,
+    }
+    name = bank.get("account")
+    start = bank.get("period_start")
+    if not name or not start:
+        return out
+    account = next(
+        (item for item in list_accounts(session, workspace.id) if item.normalized_name == norm(name)),
+        None,
+    )
+    if account is None:
+        return out
+    earlier, count = account_net_before(session, workspace.id, account.id, date.fromisoformat(start))
+    ledger_opening = Decimal(str(account.starting_balance)) + earlier
+    out.update(
+        account_id=str(account.id),
+        starting_balance=str(account.starting_balance),
+        ledger_opening=str(ledger_opening),
+        earlier_operations=count,
+        # Начальный остаток из выписки предлагаем, только если раньше периода
+        # по счёту ничего не было: иначе остаток на начало задают прежние
+        # операции, и менять начальный остаток значило бы подгонять ответ.
+        can_set_start=opening is not None and count == 0 and ledger_opening != opening,
+    )
+    return out
 
 
 def _find_or_create(
@@ -433,6 +607,16 @@ class OperationInput:
 def _validate(session: Session, workspace: Workspace, data: OperationInput) -> None:
     if data.amount is None or Decimal(data.amount) < 0:
         raise FinanceError("Сумма не может быть отрицательной: направление задаёт вид операции")
+    check_money(data.amount)
+    # Курс проверяем вместе с суммой: в базе лежит и то и другое, а `amount_base`
+    # считается их произведением — переполнится он, а не сумма.
+    if data.rate is not None:
+        rate = Decimal(str(data.rate))
+        if rate <= 0:
+            raise FinanceError("Курс должен быть больше нуля")
+        check_money(Decimal(str(data.amount)) * rate, field="Сумма в валюте компании")
+    check_date(data.paid_at, field="Дата платежа")
+    check_date(data.accrued_at, field="Дата начисления")
     if data.kind == "transfer":
         if not (data.account_from_id and data.account_to_id):
             raise FinanceError("Для перевода нужны оба счёта")
@@ -520,7 +704,9 @@ def create_operation(
     session: Session, workspace: Workspace, data: OperationInput, *, actor: str = ""
 ) -> Operation:
     _validate(session, workspace, data)
-    amount = Decimal(str(data.amount))
+    # Округляет `check_money`, и только он: сумма, которую увидит база, и
+    # сумма, от которой считается `amount_base`, обязаны быть одним числом.
+    amount = check_money(data.amount)
     rate = Decimal(str(data.rate)) if data.rate is not None else Decimal("1")
     currency = (data.currency or workspace.base_currency).upper()
     operation = Operation(
@@ -535,7 +721,7 @@ def create_operation(
         currency=currency,
         # Сумма в валюте компании считается сейчас и хранится: отчёт за июнь,
         # открытый в сентябре, обязан показывать те же цифры.
-        amount_base=(amount * rate).quantize(Decimal("0.01")),
+        amount_base=check_money(amount * rate, field="Сумма в валюте компании"),
         rate=rate,
         account_from_id=data.account_from_id,
         account_to_id=data.account_to_id,
@@ -609,17 +795,29 @@ def update_operation(
         for tag_id in tags:
             session.add(OperationTag(operation_id=operation.id, tag_id=tag_id))
 
+    # Проверяем операцию целиком, а не те поля, что вспомнились.
+    #
+    # `status` здесь был пропущен, и умолчание `OperationInput` подставляло
+    # «факт». Значит, любое ожидание при правке проверялось как факт и
+    # отклонялось с «Не указано, на какой счёт пришли деньги» — при том что
+    # отсутствие счёта у ожидания разрешено намеренно (см. `_validate`). Счёт
+    # клиенту выставляют, не зная, куда придут деньги; поправить у такого
+    # ожидания хотя бы комментарий было нельзя.
     data = OperationInput(
         kind=operation.kind,
+        status=operation.status,
         paid_at=operation.paid_at,
+        accrued_at=operation.accrued_at,
         amount=Decimal(str(operation.amount)),
+        rate=Decimal(str(operation.rate)) if operation.rate is not None else None,
         account_from_id=operation.account_from_id,
         account_to_id=operation.account_to_id,
         category_id=operation.category_id,
     )
     _validate(session, workspace, data)
-    operation.amount_base = (Decimal(str(operation.amount)) * Decimal(str(operation.rate))).quantize(
-        Decimal("0.01")
+    operation.amount = check_money(operation.amount)
+    operation.amount_base = check_money(
+        operation.amount * Decimal(str(operation.rate)), field="Сумма в валюте компании"
     )
     operation.version += 1
     session.flush()
@@ -716,12 +914,42 @@ def list_operations(
     )
     rows = list(
         session.scalars(
-            base.order_by(Operation.paid_at.desc(), Operation.created_at.desc())
+            # `id` последним ключом: операции одной выписки заводятся одной
+            # транзакцией, и `created_at` у них одинаковый. Без третьего ключа
+            # порядок одинаковых дат держится на плане запроса Postgres, то есть
+            # на удаче — а на нём стоят страницы журнала и строки листа.
+            base.order_by(Operation.paid_at.desc(), Operation.created_at.desc(), Operation.id)
             .limit(limit)
             .offset(offset)
         )
     )
     return rows, int(total or 0)
+
+
+def operation_sums(
+    session: Session, workspace_id: uuid.UUID, flt: OperationFilter | None = None
+) -> dict[str, Decimal]:
+    """Итоги журнала по всему фильтру — в базе, а не по странице.
+
+    Раньше карточки «Поступило / Списано» над журналом складывали 250 строк
+    текущей страницы. Рядом стояло «Операций: 2050» — итог по фильтру, и
+    суммы читались как итог того же фильтра. На выписке Kaspi за год журнал
+    показывал «Поступило 568 310,56» при настоящих 11 029 038,88: цифры
+    выглядели как цифры, а врали в двадцать раз.
+
+    Считается только факт: ожидание ещё не поступило и не списано. Так итог
+    журнала совпадает с отчётом «Деньги» за тот же период.
+    """
+    flt = flt or OperationFilter()
+    query = _apply_filter(
+        sa.select(Operation.kind, sa.func.coalesce(sa.func.sum(Operation.amount_base), 0)),
+        workspace_id,
+        flt,
+    ).where(Operation.status == "fact", Operation.kind.in_(("income", "expense")))
+    sums = {"income": Decimal("0"), "expense": Decimal("0")}
+    for kind, value in session.execute(query.group_by(Operation.kind)):
+        sums[kind] = Decimal(str(value))
+    return sums
 
 
 def operation_projects(session: Session, operation_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, list[OperationProject]]:
@@ -802,9 +1030,12 @@ def save_preview(
     known = _known_keys(session, workspace.id)
     duplicates = 0
     for row in preview.rows:
-        state = row.state
-        if state == "imported" and row.values.get("external_key") in known:
-            state = "duplicate"
+        if row.state == "imported" and row.values.get("external_key") in known:
+            # Состояние меняем у самой строки, а не в местной переменной:
+            # `preview.counts` считается по `row.state`, и от местной
+            # переменной ответ предпросмотра ничего не узнавал — обещал
+            # «готово 2050» там, где заведётся ноль.
+            row.state = "duplicate"
             duplicates += 1
             row.problems.append(
                 {"field": "", "text": "такая операция уже есть — повторная загрузка того же файла"}
@@ -813,7 +1044,7 @@ def save_preview(
             ImportRow(
                 batch_id=batch.id,
                 line=row.line,
-                state=state,
+                state=row.state,
                 raw=row.raw,
                 parsed=row.values,
                 problems=row.problems,
@@ -1049,8 +1280,11 @@ __all__ = [
     "SEED_ACCOUNTS",
     "SEED_CATEGORIES",
     "VersionConflict",
+    "account_net_before",
     "apply_batch",
     "archive",
+    "check_date",
+    "check_money",
     "create_account",
     "create_operation",
     "delete_operation",
@@ -1067,6 +1301,9 @@ __all__ = [
     "list_projects",
     "list_tags",
     "operation_projects",
+    "operation_sums",
+    "reconcile_statement",
+    "set_starting_balance",
     "operation_tags",
     "save_preview",
     "update_operation",

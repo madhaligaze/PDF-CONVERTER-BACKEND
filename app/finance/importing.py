@@ -154,7 +154,12 @@ COLUMNS: tuple[Column, ...] = (
     Column(
         key="category",
         title="Категория",
-        names=("категория", "статья", "статья затрат", "статья доходов", "category", "назначение"),
+        # «Назначение» здесь было и уводило в статью назначение платежа из
+        # банковской выгрузки: «Оплата по счёту 311», «Закуп упаковки» — каждая
+        # строка заводила свою статью, и отчёт по статьям рассыпался на сотни
+        # однодневок без единой ошибки. Назначение — текст, его место в
+        # комментарии, откуда статью проставят правила.
+        names=("категория", "статья", "статья затрат", "статья доходов", "category"),
         required=False,
     ),
     Column(
@@ -189,7 +194,7 @@ COLUMNS: tuple[Column, ...] = (
         key="comment",
         title="Комментарий",
         names=(
-            "комментарий", "назначение платежа", "описание", "примечание", "comment",
+            "комментарий", "назначение платежа", "назначение", "описание", "примечание", "comment",
             "детали операции", "содержание операции",
         ),
         required=False,
@@ -742,15 +747,26 @@ class Preview:
     date_reading: DateReading
     question: dict[str, Any] | None = None
     accounts_missing: list[str] = field(default_factory=list)
+    #: Остатки, напечатанные банком в выписке (только для PDF-выписок).
+    bank: dict[str, Any] | None = None
 
     @property
     def counts(self) -> dict[str, int]:
+        """Сколько строк в каком состоянии. Сумма частей равна `total`.
+
+        `duplicate` появился не для симметрии. Пока его не было, предпросмотр
+        повторной загрузки того же файла показывал «готово 2050», а заводилось
+        ноль: повторы отсеивались уже после нажатия. Экран, на котором
+        принимают решение, обязан показывать то, что случится, — иначе он
+        просит согласия на цифру, которой не будет.
+        """
         counter = Counter(row.state for row in self.rows)
         return {
             "total": len(self.rows),
             "ready": counter.get("imported", 0),
             "failed": counter.get("failed", 0),
             "skipped": counter.get("skipped", 0),
+            "duplicate": counter.get("duplicate", 0),
         }
 
 
@@ -991,6 +1007,7 @@ def _analyze_statement(
         date_reading=DateReading("dmy", f"выписка прочитана шаблоном «{parsed['parser_key']}»"),
         question=question,
         accounts_missing=[] if chosen else list(known_accounts),
+        bank={**(parsed.get("bank") or {}), "account": chosen},
     )
 
 def _number_duplicates(rows: list[ParsedRow]) -> None:

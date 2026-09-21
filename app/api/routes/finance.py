@@ -25,6 +25,7 @@ import logging
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from urllib.parse import quote
 from uuid import UUID
 
 import sqlalchemy as sa
@@ -68,6 +69,7 @@ from app.finance.models import (
     Project,
     Tag,
 )
+from app.finance import export as export_module
 from app.finance.service import FinanceError, VersionConflict
 
 log = logging.getLogger(__name__)
@@ -187,8 +189,17 @@ def _parse_date(value: str | None, *, field: str) -> date | None:
 
 
 def _money(value: Any, *, field: str) -> Decimal:
+    """Сумма из тела запроса. Проверка та же, что у записи в базу.
+
+    Раньше здесь ловился только нечитаемый текст, а величина — нет: сорок
+    девяток доезжали до Postgres и возвращались пятисотой. Проверка живёт в
+    `service.check_money`, чтобы ответ был одинаковым, откуда бы сумма ни
+    пришла — из формы, из ячейки таблицы или из файла.
+    """
     try:
-        return Decimal(str(value))
+        return service.check_money(value, field=field)
+    except FinanceError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (InvalidOperation, TypeError) as exc:
         raise HTTPException(status_code=422, detail=f"{field}: это не сумма") from exc
 
@@ -578,6 +589,48 @@ class EntryIn(BaseModel):
     role: str | None = None
 
 
+class StartingBalanceIn(BaseModel):
+    starting_balance: str
+
+
+@router.patch("/accounts/{account_id}")
+def patch_account_balance(
+    account_id: UUID,
+    body: StartingBalanceIn,
+    member: Member = Depends(require_ability("accounts")),
+) -> dict[str, Any]:
+    """Начальный остаток счёта. Меняет остаток во всех отчётах задним числом.
+
+    Поэтому право то же, что у состава счетов, и запись в истории с отменой:
+    опечатку в начальном остатке обязаны уметь вернуть одной кнопкой.
+    """
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        try:
+            account, before = service.set_starting_balance(
+                session, workspace, account_id, _money(body.starting_balance, field="Начальный остаток")
+            )
+        except FinanceError as exc:
+            raise _fail(exc) from exc
+        history.write(
+            session,
+            workspace,
+            kind="account.balance",
+            entity="account",
+            entity_id=account.id,
+            title=f"начальный остаток «{account.name}»: {before} → {account.starting_balance}",
+            before={"starting_balance": str(before)},
+            after={"starting_balance": str(account.starting_balance)},
+            actor=_actor(member),
+        )
+        return {
+            "id": str(account.id),
+            "name": account.name,
+            "starting_balance": str(account.starting_balance),
+        }
+
+
 @router.post("/dictionaries/{kind}")
 def create_entry(kind: str, body: EntryIn, member: Member = Depends(require_ability("write"))) -> dict[str, Any]:
     """Создать статью, контрагента, проект или тег.
@@ -706,6 +759,12 @@ def _names(session, workspace_id: UUID) -> dict[str, dict[UUID, str]]:
     }
 
 
+#: Что бывает в фильтрах журнала. Держим рядом с разбором фильтра, а не в
+#: моделях: это словарь HTTP-слоя, и отказ показывается человеку отсюда.
+KINDS = frozenset({"income", "expense", "transfer"})
+STATUSES = frozenset({"fact", "plan"})
+
+
 def _filter(
     date_from: str | None,
     date_to: str | None,
@@ -720,14 +779,28 @@ def _filter(
     counterparty_id: UUID | None,
     project_id: UUID | None,
 ) -> service.OperationFilter:
-    def split(value: str | None) -> tuple[str, ...]:
-        return tuple(part for part in (value or "").split(",") if part)
+    def split(value: str | None, allowed: frozenset[str], *, field: str) -> tuple[str, ...]:
+        """Разобрать список через запятую и отказать на незнакомом значении.
+
+        Молчаливый пропуск был хуже отказа: `kinds=нечто` не фильтровал
+        ничего, журнал отдавал все операции, и человек читал полный список как
+        «расходов по этому виду столько». Фильтр, который не фильтрует, —
+        это неверная цифра, а не пустой экран.
+        """
+        parts = tuple(part.strip() for part in (value or "").split(",") if part.strip())
+        unknown = [part for part in parts if part not in allowed]
+        if unknown:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{field}: не знаю значение «{unknown[0]}». Бывают: {', '.join(sorted(allowed))}",
+            )
+        return parts
 
     return service.OperationFilter(
         date_from=_parse_date(date_from, field="date_from"),
         date_to=_parse_date(date_to, field="date_to"),
-        kinds=split(kinds),
-        statuses=split(statuses),
+        kinds=split(kinds, KINDS, field="kinds"),
+        statuses=split(statuses, STATUSES, field="statuses"),
         search=search or "",
         by=by,
         amount_from=_money(amount_from, field="amount_from") if amount_from else None,
@@ -774,15 +847,54 @@ def list_operations(
             "total": total,
             "limit": limit,
             "offset": offset,
-            "sums": {
-                "income": str(sum((o.amount_base for o in operations if o.kind == "income"), Decimal("0"))),
-                "expense": str(sum((o.amount_base for o in operations if o.kind == "expense"), Decimal("0"))),
-            },
+            # По всему фильтру, а не по странице — см. `service.operation_sums`.
+            "sums": {key: str(value) for key, value in service.operation_sums(session, workspace.id, flt).items()},
             "items": [
                 _operation_out(operation, names=names, splits=splits, tags=tags)
                 for operation in operations
             ],
         }
+
+
+@router.get("/export/journal.xlsx")
+def export_journal(
+    member: Member = Depends(current_member),
+    date_from: str | None = None,
+    date_to: str | None = None,
+    kinds: str | None = None,
+    statuses: str | None = None,
+    search: str | None = None,
+    by: str = Query(default="paid", pattern="^(paid|accrued)$"),
+    amount_from: str | None = None,
+    amount_to: str | None = None,
+    account_id: UUID | None = None,
+    category_id: UUID | None = None,
+    counterparty_id: UUID | None = None,
+    project_id: UUID | None = None,
+) -> Response:
+    """Журнал с теми же фильтрами — файлом Excel. См. `app.finance.export`."""
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        flt = _filter(
+            date_from, date_to, kinds, statuses, search, by, amount_from, amount_to,
+            account_id, category_id, counterparty_id, project_id,
+        )
+        try:
+            data, _count = export_module.journal_xlsx(session, workspace, flt)
+        except FinanceError as exc:
+            raise _fail(exc) from exc
+        title = workspace.title
+    name = f"Журнал — {title} — {date.today():%d.%m.%Y}.xlsx"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            # Имя по-русски — через `filename*`: заголовок без него браузер
+            # показал бы кракозябрами или обрезал на первой кириллической букве.
+            "Content-Disposition": f"attachment; filename=\"journal.xlsx\"; filename*=UTF-8''{quote(name)}",
+        },
+    )
 
 
 class ProjectSplitIn(BaseModel):
@@ -1009,7 +1121,12 @@ def patch_cell(body: CellPatch, member: Member = Depends(require_ability("write"
         names = _names(session, workspace.id)
         splits = service.operation_projects(session, [operation.id])
         tags = service.operation_tags(session, [operation.id])
-        return _operation_out(operation, names=names, splits=splits, tags=tags)
+        # `row` — строка листа после правки: лист пишет её обратно в свои
+        # ячейки по месту, а не перечитывает журнал (см. `grid.row_of`).
+        return {
+            **_operation_out(operation, names=names, splits=splits, tags=tags),
+            "row": grid_module.row_of(session, workspace, operation),
+        }
 
 
 class GridRowIn(BaseModel):
@@ -1028,7 +1145,10 @@ def add_grid_row(body: GridRowIn, member: Member = Depends(require_ability("writ
             raise _fail(exc) from exc
         names = _names(session, workspace.id)
         splits = service.operation_projects(session, [operation.id])
-        return _operation_out(operation, names=names, splits=splits, tags={})
+        return {
+            **_operation_out(operation, names=names, splits=splits, tags={}),
+            "row": grid_module.row_of(session, workspace, operation),
+        }
 
 
 # ── Отчёты ───────────────────────────────────────────────────────────────────
@@ -1176,6 +1296,19 @@ def upsert_plan(body: PlanIn, member: Member = Depends(require_ability("write"))
             )
         )
         amount = _money(body.amount, field="amount")
+        # План — то же число в отчёте «План / Факт», что и факт, и проверяется
+        # так же: отрицательный план вычитался бы из плана по статье, а месяц
+        # с опечаткой в годе навсегда остался бы строкой, которую не с чем
+        # сравнить.
+        if amount < 0:
+            raise HTTPException(
+                status_code=422,
+                detail="План не бывает отрицательным: сторону задаёт «доход» или «расход»",
+            )
+        try:
+            service.check_date(month, field="Месяц плана")
+        except FinanceError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         if existing is None:
             existing = Plan(
                 workspace_id=workspace.id,
@@ -1387,6 +1520,8 @@ def _preview_response(
         "mapping": preview.mapping,
         "unused_columns": preview.unused_columns,
         "accounts_missing": preview.accounts_missing,
+        # Сверка с остатками, которые напечатал банк (только выписки PDF).
+        "bank": service.reconcile_statement(session, workspace, preview),
         "rules_applied": rule_hits,
         "rows": [
             {
