@@ -28,6 +28,8 @@ class StatementMetadata(BaseModel):
     closing_balance: float | None = None
     transaction_count: int = 0
     totals: StatementTotals = Field(default_factory=StatementTotals)
+    # Как адаптивный разбор решил, какие колонки складывать в приход и расход.
+    reading_note: str | None = None
 
 
 class StatementTransaction(BaseModel):

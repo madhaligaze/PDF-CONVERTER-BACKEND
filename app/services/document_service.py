@@ -64,15 +64,46 @@ def parse_statement_with_diagnostics(
         for parser in matched_extension
     ]
     matches.sort(key=lambda match: match.score, reverse=True)
-
-    selected_match = next((match for match in matches if match.score > 0), None)
-    if selected_match is not None:
-        parser = next(item for item in matched_extension if item.key == selected_match.key)
+    by_key = {parser.key: parser for parser in matched_extension}
+    failures: list[str] = []
+    for selected_match in _selection_order(matches):
+        parser = by_key[selected_match.key]
+        try:
+            statement = parser.parse(filename, content)
+        except (DocumentParseError, ValueError) as exc:
+            failures.append(str(exc))
+            continue
         selected_match.matched = True
-        return parser.parse(filename, content), matches
+        return statement, matches
 
+    if failures:
+        raise DocumentParseError(failures[-1])
     supported_labels = ", ".join(parser.label for parser in matched_extension)
     raise DocumentParseError(f"Документ не подошёл ни под один из доступных шаблонов: {supported_labels}.")
+
+
+# Известные банки идут первыми, даже если их оценка чуть ниже адаптивной:
+# у Kaspi Business заголовок таблицы даёт 0.35, а адаптивный разбор уверенной
+# таблицы — около 0.64. Иначе выписка Kaspi уехала бы в общий разбор.
+_SPECIALIST_KEYS = frozenset({
+    "kaspi_gold_statement",
+    "kaspi_business_statement",
+    "halyk_fiz_statement",
+})
+_ADAPTIVE_KEY = "adaptive_bank_statement"
+_SPECIALIST_FLOOR = 0.34
+
+
+def _selection_order(matches: list[ParserMatch]) -> list[ParserMatch]:
+    ordered = sorted(matches, key=lambda match: match.score, reverse=True)
+    specialists = [match for match in ordered if match.key in _SPECIALIST_KEYS and match.score >= _SPECIALIST_FLOOR]
+    adaptive = [match for match in ordered if match.key == _ADAPTIVE_KEY and match.score > 0]
+    rest = [
+        match
+        for match in ordered
+        if match.score > 0 and match not in specialists and match not in adaptive
+    ]
+    return specialists + adaptive + rest
 
 
 def list_supported_parsers() -> list[ParserDescriptor]:
@@ -154,6 +185,17 @@ def _registered_parsers() -> list[ParserDefinition]:
             accepted_extensions=(".pdf", ".png", ".jpg", ".jpeg"),
             detect=_detect_ocr_statement,
             parse=_parse_ocr_statement,
+        ),
+        ParserDefinition(
+            key="adaptive_bank_statement",
+            label="Adaptive Bank Statement",
+            description=(
+                "Сам разбирает таблицу выписки в PDF или Excel: находит даты, дебет, кредит, "
+                "сумму и остаток и сверяет, что складывать в приход и расход."
+            ),
+            accepted_extensions=(".pdf", ".xlsx", ".xlsm"),
+            detect=_detect_adaptive_statement,
+            parse=_parse_adaptive_statement,
         ),
         ParserDefinition(
             key="generic_bank_statement",
@@ -665,6 +707,26 @@ def _value_exists(rows: list[list[object]], row_index: int, column_index: int) -
 # ─────────────────────────────────────────────────────────────────────────────
 # KASPI BUSINESS PARSER — lazy import, safe at startup
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _detect_adaptive_statement(filename: str, content: bytes) -> float:
+    try:
+        from app.services.adaptive_statement import detect_adaptive_statement
+
+        return detect_adaptive_statement(filename, content)
+    except Exception:
+        return 0.0
+
+
+def _parse_adaptive_statement(filename: str, content: bytes) -> ParsedStatement:
+    try:
+        from app.services.adaptive_statement import parse_adaptive_statement
+
+        return parse_adaptive_statement(filename, content)
+    except DocumentParseError:
+        raise
+    except Exception as exc:
+        raise DocumentParseError(f"Не удалось разобрать выписку: {exc}") from exc
 
 
 def _detect_kaspi_business_statement(filename: str, content: bytes) -> float:

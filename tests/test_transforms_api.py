@@ -17,6 +17,7 @@ def test_parsers_endpoint_returns_supported_templates() -> None:
     assert any(item["key"] == "kaspi_business_statement" for item in payload)
     assert any(item["key"] == "ocr_scanned_statement" for item in payload)
     assert any(item["key"] == "generic_bank_statement" for item in payload)
+    assert any(item["key"] == "adaptive_bank_statement" for item in payload)
 
 
 def test_vision_status_endpoint_returns_runtime_state() -> None:
@@ -170,8 +171,12 @@ def test_generic_bank_statement_autodetects_excel_table() -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["document"]["parser_key"] == "generic_bank_statement"
-    assert any(item["key"] == "generic_bank_statement" and item["matched"] for item in payload["parser_matches"])
+    assert payload["document"]["parser_key"] == "adaptive_bank_statement"
+    assert any(item["key"] == "adaptive_bank_statement" and item["matched"] for item in payload["parser_matches"])
+    assert "плюс" in (payload["document"].get("reading_note") or "")
+    classic = next(item for item in payload["variants"] if item["key"] == "classic_financier")
+    assert classic["rows"][0]["income"] == 12500
+    assert classic["rows"][1]["expense"] == 4800
     assert payload["quality_summary"]["review_required_count"] >= 1
     assert any(item["flags"] for item in payload["row_diagnostics"])
 
