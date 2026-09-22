@@ -61,6 +61,7 @@ TITLES = {
     "integration.create": "подключение создано",
     "integration.receive": "операции пришли из подключения",
     "account.balance": "начальный остаток счёта изменён",
+    "account.number": "номер счёта изменён",
     "autotag.apply": "авторазметка статей",
 }
 
@@ -150,7 +151,7 @@ def _undoable(entry: ActionLog) -> bool:
     """
     if entry.entity == "operation" and entry.entity_id:
         return True
-    if entry.kind == "account.balance" and entry.entity == "account" and entry.entity_id:
+    if entry.kind in ("account.balance", "account.number") and entry.entity == "account" and entry.entity_id:
         return not str(entry.title).startswith("отменено")
     if entry.kind == "autotag.apply":
         return "items" in (entry.after or {})
@@ -205,6 +206,30 @@ def undo(
             session, workspace, kind="account.balance", entity="account", entity_id=account.id,
             title=f"отменено: {entry.title}", before={"starting_balance": now},
             after={"starting_balance": str(previous)}, actor=actor,
+        )
+        return {"ok": True, "account_id": str(account.id)}
+    if entry.entity == "account" and entry.kind == "account.number" and entry.entity_id:
+        # Номер счёта решает, куда ляжет следующая выписка. Ошибочно
+        # записанный номер обязан сниматься одной кнопкой, как и остаток.
+        account = session.get(Account, entry.entity_id)
+        if account is None or account.workspace_id != workspace.id:
+            raise FinanceError("Счёта больше нет — отменять нечего")
+        previous = str((entry.before or {}).get("number") or "")
+        if previous and any(
+            other.number == previous and other.id != account.id
+            for other in session.scalars(
+                sa.select(Account).where(Account.workspace_id == workspace.id, Account.archived_at.is_(None))
+            )
+        ):
+            raise FinanceError(f"Номер {previous} теперь записан у другого счёта — вернуть его нельзя")
+        now = account.number or ""
+        account.number = previous
+        entry.undone_at = datetime.now(timezone.utc)
+        session.flush()
+        write(
+            session, workspace, kind="account.number", entity="account", entity_id=account.id,
+            title=f"отменено: {entry.title}", before={"number": now},
+            after={"number": previous}, actor=actor,
         )
         return {"ok": True, "account_id": str(account.id)}
     if entry.kind == "autotag.apply":

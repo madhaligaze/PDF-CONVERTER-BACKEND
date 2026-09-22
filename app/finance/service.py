@@ -28,6 +28,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.books.layout import norm
+from app.finance import banks
 from app.finance.config import finance_settings
 from app.finance.importing import ParsedRow, Preview
 from app.finance.models import (
@@ -320,6 +321,7 @@ def create_account(
     currency: str | None = None,
     starting_balance: Decimal | float | str = 0,
     excluded_from_reports: bool = False,
+    number: str = "",
 ) -> Account:
     clean = (name or "").strip()
     if not clean:
@@ -339,11 +341,56 @@ def create_account(
         currency=(currency or workspace.base_currency).upper(),
         starting_balance=check_money(starting_balance or 0, field="Начальный остаток"),
         excluded_from_reports=excluded_from_reports,
+        number=_check_number(session, workspace.id, number),
         position=_next_position(session, Account, workspace.id),
     )
     session.add(account)
     session.flush()
     return account
+
+
+def _check_number(
+    session: Session, workspace_id: uuid.UUID, number: str | None, *, own_id: uuid.UUID | None = None
+) -> str:
+    """Номер счёта без оформления — и свободен ли он в этой компании.
+
+    Один номер у двух счетов сделал бы выбор счёта по выписке угадыванием:
+    выписка легла бы на тот, что нашёлся первым.
+    """
+    raw = (number or "").strip()
+    if not raw:
+        return ""
+    key = banks.account_key(raw)
+    if not key:
+        raise FinanceError(f"«{raw}» не похоже на номер счёта: нужны буквы и цифры, от восьми знаков")
+    taken = session.scalar(
+        sa.select(Account).where(
+            Account.workspace_id == workspace_id,
+            Account.number == key,
+            Account.archived_at.is_(None),
+        )
+    )
+    if taken is not None and taken.id != own_id:
+        raise FinanceError(f"Номер {key} уже записан у счёта «{taken.name}»")
+    return key
+
+
+def set_account_number(
+    session: Session, workspace: Workspace, account_id: uuid.UUID, number: str | None
+) -> tuple[Account, str]:
+    """Записать счёту номер в банке. Возвращает счёт и прежний номер."""
+    account = session.get(Account, account_id)
+    if account is None or account.workspace_id != workspace.id:
+        raise FinanceError("Счёт не найден")
+    before = account.number or ""
+    account.number = _check_number(session, workspace.id, number, own_id=account.id)
+    session.flush()
+    return account, before
+
+
+def account_numbers(session: Session, workspace_id: uuid.UUID) -> dict[str, str]:
+    """Номер счёта → название. Этим импорт узнаёт счета по выписке."""
+    return {item.number: item.name for item in list_accounts(session, workspace_id) if item.number}
 
 
 def set_starting_balance(
@@ -409,11 +456,21 @@ def reconcile_statement(
     if not bank:
         return None
     net = Decimal("0")
+    here = bank.get("account")
     for row in preview.rows:
         amount = row.values.get("amount")
         if not amount:
             continue
         value = Decimal(str(amount))
+        if row.values.get("kind") == "transfer":
+            # Перевод между своими счетами: знак — с точки зрения счёта
+            # выписки. Раньше любой перевод считался списанием, и перевод С
+            # депозита НА счёт выписки уводил сверку в минус на двойную сумму.
+            incoming = row.values.get("own_transfer") == "in" or (
+                bool(here) and row.values.get("account_to") == here
+            )
+            net += value if incoming else -value
+            continue
         net += value if row.values.get("kind") == "income" else -value
     opening = Decimal(bank["opening_balance"]) if bank.get("opening_balance") else None
     closing = Decimal(bank["closing_balance"]) if bank.get("closing_balance") else None
@@ -1020,6 +1077,12 @@ def save_preview(
             "header_line": preview.header_line,
             "unused_columns": preview.unused_columns,
             "accounts_missing": preview.accounts_missing,
+            # Номер счёта из выписки и счёт, на который она легла: при заводке
+            # номер записывается счёту, и следующая выписка найдёт его сама.
+            "statement_account": {
+                "number": (preview.bank or {}).get("account_number") or "",
+                "account": (preview.bank or {}).get("account") or "",
+            },
         },
         rows_total=counts["total"],
         created_by=actor,
@@ -1098,6 +1161,12 @@ def apply_batch(
         )
     )
     known = _known_keys(session, workspace.id)
+    remembered = _remember_statement_number(session, workspace, batch, accounts)
+    by_bin = {
+        str((item.details or {}).get("bin")): item
+        for item in list_counterparties(session, workspace.id)
+        if (item.details or {}).get("bin")
+    }
 
     imported = 0
     for row in rows:
@@ -1132,11 +1201,19 @@ def apply_batch(
                 session, workspace.id, side, values["category"], create=create_dictionaries
             )
         counterparty = None
-        if values.get("counterparty"):
+        party_bin = str(values.get("counterparty_bin") or "")
+        if party_bin and party_bin in by_bin:
+            # БИН — тот же контрагент, как бы банк ни напечатал имя: «ТОО
+            # "Альфа"» в одной выписке и «Альфа ТОО» в другой.
+            counterparty = by_bin[party_bin]
+        elif values.get("counterparty"):
             role = "client" if kind == "income" else "supplier"
             counterparty = ensure_counterparty(
                 session, workspace.id, values["counterparty"], role=role, create=create_dictionaries
             )
+            if counterparty is not None and party_bin and not (counterparty.details or {}).get("bin"):
+                counterparty.details = {**(counterparty.details or {}), "bin": party_bin}
+                by_bin[party_bin] = counterparty
         projects: list[tuple[uuid.UUID, Decimal]] = []
         if values.get("project"):
             project = ensure_project(session, workspace.id, values["project"], create=create_dictionaries)
@@ -1206,7 +1283,29 @@ def apply_batch(
         "skipped": batch.rows_skipped,
         "duplicate": batch.rows_duplicate,
         "total": batch.rows_total,
+        "remembered": remembered,
     }
+
+
+def _remember_statement_number(
+    session: Session, workspace: Workspace, batch: ImportBatch, accounts: dict[str, Account]
+) -> dict[str, str] | None:
+    """Записать счёту номер из выписки, которую на него заводят.
+
+    Только если у счёта номера ещё нет и этот номер не записан у другого счёта:
+    чужой номер молча не перетирается — человек мог выбрать счёт по ошибке, и
+    тогда следующая выписка тихо легла бы не туда. Возвращает, что записано.
+    """
+    statement = (batch.decisions or {}).get("statement_account") or {}
+    key = banks.account_key(statement.get("number"))
+    account = accounts.get(norm(statement.get("account") or ""))
+    if not key or account is None or account.number:
+        return None
+    if any(other.number == key for other in accounts.values()):
+        return None
+    account.number = key
+    session.flush()
+    return {"account": account.name, "number": key, "account_id": str(account.id)}
 
 
 def fix_import_row(

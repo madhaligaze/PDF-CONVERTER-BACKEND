@@ -182,6 +182,11 @@ class Account(FinanceBase):
     kind: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("'bank'"))
     currency: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("'KZT'"))
     starting_balance: Mapped[Decimal] = mapped_column(MONEY, server_default=sa.text("0"))
+    #: Номер счёта в банке (IBAN), без пробелов и в верхнем регистре; пусто —
+    #: у кассы и сейфа. По нему выписка находит свой счёт сама, а перевод на
+    #: свой депозит отличается от расхода. Уникален в пределах компании —
+    #: держит сервис, а не индекс: у пустых номеров уникальности быть не должно.
+    number: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("''"))
     #: Исключён из отчётов. Не удалён: удалить счёт с операциями нельзя, а
     #: «личная карта директора» в корпоративном cash flow не нужна.
     excluded_from_reports: Mapped[bool] = mapped_column(sa.Boolean, server_default=sa.text("false"))

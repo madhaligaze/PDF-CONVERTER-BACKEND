@@ -30,6 +30,7 @@ dependencies = [
     "structlog>=25.5.0",
     "tenacity>=9.1.4",
     "uvicorn[standard]>=0.43.0",
+    "xlrd>=2.0.1",
     "xlsxwriter>=3.2.9",
 ]
 

@@ -530,6 +530,7 @@ def dictionaries(member: Member = Depends(current_member)) -> dict[str, Any]:
                     "currency": item.currency,
                     "starting_balance": str(item.starting_balance),
                     "excluded_from_reports": item.excluded_from_reports,
+                    "number": item.number or "",
                 }
                 for item in service.list_accounts(session, workspace.id)
             ],
@@ -561,6 +562,8 @@ class AccountIn(BaseModel):
     currency: str | None = None
     starting_balance: str = "0"
     excluded_from_reports: bool = False
+    #: Номер счёта в банке (IBAN). По нему выписка находит свой счёт.
+    number: str = ""
 
 
 @router.post("/accounts")
@@ -577,10 +580,11 @@ def create_account(body: AccountIn, member: Member = Depends(require_ability("ac
                 currency=body.currency,
                 starting_balance=_money(body.starting_balance, field="starting_balance"),
                 excluded_from_reports=body.excluded_from_reports,
+                number=body.number,
             )
         except FinanceError as exc:
             raise _fail(exc) from exc
-        return {"id": str(account.id), "name": account.name}
+        return {"id": str(account.id), "name": account.name, "number": account.number}
 
 
 class EntryIn(BaseModel):
@@ -630,6 +634,43 @@ def patch_account_balance(
             "name": account.name,
             "starting_balance": str(account.starting_balance),
         }
+
+
+class AccountNumberIn(BaseModel):
+    number: str = ""
+
+
+@router.put("/accounts/{account_id}/number")
+def put_account_number(
+    account_id: UUID,
+    body: AccountNumberIn,
+    member: Member = Depends(require_ability("accounts")),
+) -> dict[str, Any]:
+    """Номер счёта в банке. Пустая строка снимает номер.
+
+    Право то же, что у состава счетов: номер решает, на какой счёт ляжет
+    следующая выписка, — это не подпись, а адрес денег.
+    """
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        try:
+            account, before = service.set_account_number(session, workspace, account_id, body.number)
+        except FinanceError as exc:
+            raise _fail(exc) from exc
+        if before != account.number:
+            history.write(
+                session,
+                workspace,
+                kind="account.number",
+                entity="account",
+                entity_id=account.id,
+                title=f"номер счёта «{account.name}»: {before or '—'} → {account.number or '—'}",
+                before={"number": before},
+                after={"number": account.number},
+                actor=_actor(member),
+            )
+        return {"id": str(account.id), "name": account.name, "number": account.number}
 
 
 @router.post("/dictionaries/{kind}")
@@ -1522,6 +1563,7 @@ def import_preview(
                 accounts,
                 date_order=date_order,
                 default_account=default_account,
+                account_numbers=service.account_numbers(session, workspace.id),
             )
         except ImportError_ as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -1565,7 +1607,8 @@ def _preview_response(
         "mapping": preview.mapping,
         "unused_columns": preview.unused_columns,
         "accounts_missing": preview.accounts_missing,
-        # Сверка с остатками, которые напечатал банк (только выписки PDF).
+        "accounts_suggested": preview.accounts_suggested,
+        # Сверка с остатками, которые напечатал банк, — PDF или таблицей.
         "bank": service.reconcile_statement(session, workspace, preview),
         "rules_applied": rule_hits,
         "rows": [
@@ -2152,6 +2195,7 @@ def sheets_preview(
                 accounts,
                 date_order=body.date_order,
                 default_account=body.default_account,
+                account_numbers=service.account_numbers(session, workspace.id),
             )
         except ImportError_ as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -2257,7 +2301,7 @@ def apply_batch(batch_id: UUID, body: ApplyIn, member: Member = Depends(require_
     with finance_session() as session:
         workspace = _workspace(session, member)
         try:
-            return service.apply_batch(
+            done = service.apply_batch(
                 session,
                 workspace,
                 batch_id,
@@ -2267,6 +2311,22 @@ def apply_batch(batch_id: UUID, body: ApplyIn, member: Member = Depends(require_
             )
         except FinanceError as exc:
             raise _fail(exc) from exc
+        remembered = done.get("remembered")
+        if remembered:
+            # Номер записан счёту сам, по выписке, — это видно в истории и
+            # отменяется оттуда же, как любая правка счёта.
+            history.write(
+                session,
+                workspace,
+                kind="account.number",
+                entity="account",
+                entity_id=UUID(remembered["account_id"]),
+                title=f"номер счёта «{remembered['account']}» записан из выписки: {remembered['number']}",
+                before={"number": ""},
+                after={"number": remembered["number"]},
+                actor=_actor(member),
+            )
+        return done
 
 
 class RowFixIn(BaseModel):

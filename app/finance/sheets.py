@@ -114,6 +114,7 @@ def preview_tab(
     date_order: str | None = None,
     default_account: str | None = None,
     reader: Reader | None = None,
+    account_numbers: dict[str, str] | None = None,
 ) -> Preview:
     """Разобрать вкладку книги так же, как разбирается загруженный файл.
 
@@ -130,6 +131,7 @@ def preview_tab(
         known_accounts,
         date_order=date_order,
         default_account=default_account,
+        account_numbers=account_numbers,
     )
 
 

@@ -38,18 +38,15 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-#: Расширения, которые уводим в разбор выписок, а не в табличный путь.
-STATEMENT_EXTENSIONS = (".pdf",)
+# Какие файлы сюда уходят, решает `importing.analyze` по содержимому
+# (`formats.sniff`): PDF — всегда, Excel — только если в нём нет таблицы с
+# шапкой и файл узнаёт один из шаблонов выписок.
 
 _SPACES = re.compile(r"[\s ]+")
 
 
 class StatementError(RuntimeError):
     """Файл не разобрался ни одним из известных шаблонов выписок."""
-
-
-def is_statement(file_name: str) -> bool:
-    return (file_name or "").lower().endswith(STATEMENT_EXTENSIONS)
 
 
 def _parse_date(value: str) -> date | None:
@@ -179,4 +176,4 @@ def read_statement(data: bytes, file_name: str, *, account: str | None) -> dict[
     }
 
 
-__all__ = ["STATEMENT_EXTENSIONS", "StatementError", "is_statement", "read_statement"]
+__all__ = ["StatementError", "read_statement"]
