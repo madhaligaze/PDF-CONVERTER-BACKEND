@@ -68,7 +68,6 @@ from app.services.onboarding_service import (
     get_onboarding_project,
     list_onboarding_projects,
 )
-from app.services.quality_service import analyze_statement_quality
 from app.services.session_service import (
     get_preference,
     list_correction_memory,
@@ -477,7 +476,6 @@ def _build_preview_response(
 ) -> PreviewResponse:
     from app.services.signature_util import jaccard, signature_from_columns, MATCH_THRESHOLD
 
-    quality_summary, row_diagnostics = analyze_statement_quality(statement)
     base_variants = build_variants(statement)
     templates = list_templates(statement.metadata.parser_key)
     base_lookup = {variant.key: variant for variant in base_variants}
@@ -487,28 +485,43 @@ def _build_preview_response(
         if template.base_variant_key in base_lookup
     ]
 
+    # Шаблоны привязаны к шаблону разбора, а общий разбор один на выписки
+    # физлиц и юрлиц. Поэтому шаблон по умолчанию берётся только из той же
+    # группы видов, что и первый вид выписки: сохранённый вид физлица не
+    # должен открываться поверх «Юр счёта» у выписки ТОО.
+    preferred_group = base_variants[0].group if base_variants else "primary"
+
+    def _same_group(template) -> bool:
+        base = base_lookup.get(template.base_variant_key)
+        return base is not None and base.group == preferred_group
+
     # Default selection: an explicitly-default template always wins (manual override);
     # otherwise auto-match by column-structure signature (Jaccard) above threshold.
-    default_template = next((template for template in templates if template.is_default), None)
+    default_template = next(
+        (template for template in templates if template.is_default and _same_group(template)),
+        None,
+    )
     if default_template is None:
         incoming_sig = {key: signature_from_columns(variant.columns) for key, variant in base_lookup.items()}
         best_score = MATCH_THRESHOLD
         for template in templates:
-            if template.base_variant_key not in base_lookup or not template.source_signature:
+            if not _same_group(template) or not template.source_signature:
                 continue
             score = jaccard(template.source_signature, incoming_sig[template.base_variant_key])
             if score >= best_score:
                 best_score = score
                 default_template = template
     default_variant_key = f"template::{default_template.template_id}" if default_template else None
+    if default_variant_key is None and saved_variants and saved_variants[0].group != preferred_group:
+        # Без явного выбора экран открывает первый вид списка, а сохранённые
+        # шаблоны стоят в нём первыми.
+        default_variant_key = base_variants[0].key
 
     return PreviewResponse(
         session_id=session_id,
         document=statement.metadata,
         parser_matches=parser_matches,
         applied_rule=applied_rule,
-        quality_summary=quality_summary,
-        row_diagnostics=row_diagnostics,
         ocr_review=None,
         variants=base_variants,
         saved_variants=saved_variants,
@@ -595,8 +608,6 @@ def _build_ocr_review_preview(filename: str, content: bytes) -> PreviewResponse 
         },
         parser_matches=[],
         applied_rule=None,
-        quality_summary={"overall_confidence": 0.0},
-        row_diagnostics=[],
         ocr_review=review,
         variants=[],
         saved_variants=[],

@@ -30,6 +30,9 @@ class StatementMetadata(BaseModel):
     totals: StatementTotals = Field(default_factory=StatementTotals)
     # Как адаптивный разбор решил, какие колонки складывать в приход и расход.
     reading_note: str | None = None
+    # Чей счёт: "legal" (ТОО, АО, ИП) или "personal". От этого зависит вид
+    # таблицы — см. app/services/legal_statement.py. None — признаков не нашлось.
+    holder_kind: str | None = None
 
 
 class StatementTransaction(BaseModel):
@@ -102,8 +105,6 @@ class PreviewResponse(BaseModel):
     document: StatementMetadata
     parser_matches: list["ParserMatch"] = Field(default_factory=list)
     applied_rule: "AppliedRuleInfo | None" = None
-    quality_summary: "QualitySummary" = Field(default_factory=lambda: QualitySummary())
-    row_diagnostics: list["RowDiagnostic"] = Field(default_factory=list)
     ocr_review: "OCRReviewPayload | None" = None
     variants: list[PreviewVariant]
     saved_variants: list[PreviewVariant] = Field(default_factory=list)
@@ -179,37 +180,6 @@ class ParserMatch(BaseModel):
     label: str
     score: float
     matched: bool = False
-
-
-class QualityFlag(BaseModel):
-    code: str
-    severity: str
-    message: str
-
-
-class RowDiagnostic(BaseModel):
-    row_number: int
-    date: str
-    operation: str
-    detail: str
-    amount: float
-    confidence: float
-    source: str = "native"
-    corrected: bool = False
-    flags: list[QualityFlag] = Field(default_factory=list)
-
-
-class QualitySummary(BaseModel):
-    overall_confidence: float = 1.0
-    anomaly_score: float = 0.0  # 0–1, higher = more anomalies relative to session size
-    review_required_count: int = 0
-    high_risk_count: int = 0
-    medium_risk_count: int = 0
-    low_risk_count: int = 0
-    clean_count: int = 0
-    corrected_count: int = 0
-    totals_mismatch: bool = False
-    recommendations: list[str] = Field(default_factory=list)
 
 
 class VisionStatus(BaseModel):

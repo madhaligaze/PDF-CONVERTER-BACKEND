@@ -64,10 +64,6 @@ def test_preview_creates_history_record() -> None:
     )
 
     assert preview.status_code == 200
-    preview_payload = preview.json()
-    assert "quality_summary" in preview_payload
-    assert "row_diagnostics" in preview_payload
-    assert preview_payload["quality_summary"]["overall_confidence"] <= 1.0
 
     history = client.get("/api/v1/transforms/history")
 
@@ -177,8 +173,6 @@ def test_generic_bank_statement_autodetects_excel_table() -> None:
     classic = next(item for item in payload["variants"] if item["key"] == "classic_financier")
     assert classic["rows"][0]["income"] == 12500
     assert classic["rows"][1]["expense"] == 4800
-    assert payload["quality_summary"]["review_required_count"] >= 1
-    assert any(item["flags"] for item in payload["row_diagnostics"])
 
 
 def test_kaspi_business_statement_preview_builds_compact_variant() -> None:
@@ -535,8 +529,6 @@ def test_session_row_correction_updates_preview() -> None:
     assert preview.status_code == 200
     payload = preview.json()
     session_id = payload["session_id"]
-    target_row = next(item for item in payload["row_diagnostics"] if item["row_number"] == 2)
-    assert target_row["flags"]
 
     corrected = client.patch(
         f"/api/v1/transforms/sessions/{session_id}/rows/2",
@@ -550,7 +542,10 @@ def test_session_row_correction_updates_preview() -> None:
 
     assert corrected.status_code == 200
     corrected_payload = corrected.json()
-    corrected_row = next(item for item in corrected_payload["row_diagnostics"] if item["row_number"] == 2)
-    assert corrected_row["source"] == "manual_correction"
-    assert corrected_row["corrected"] is True
-    assert corrected_payload["quality_summary"]["corrected_count"] >= 1
+    split = next(item for item in corrected_payload["variants"] if item["key"] == "operation_split")
+    assert split["rows"][1]["operation"] == "Outgoing transfer"
+    assert split["rows"][1]["detail"] == "Office rent LLC"
+    assert split["rows"][1]["expense"] == 4800
+    # Отчёта качества в ответе больше нет — его никто не открывал.
+    assert "quality_summary" not in corrected_payload
+    assert "row_diagnostics" not in corrected_payload

@@ -21,6 +21,8 @@ from openpyxl import load_workbook
 
 from app.schemas.statement import ParsedStatement, StatementMetadata, StatementTotals, StatementTransaction
 from app.services.document_service import DocumentParseError
+from app.services.halyk_fiz_statement_service import looks_like_halyk_personal
+from app.services.legal_statement import LEGAL, holder_kind, legal_operation, legal_totals
 
 _EXCEL_EPOCH = datetime(1899, 12, 30)
 _MAX_EXCEL_ROWS = 5000
@@ -99,6 +101,15 @@ _HEADER_PHRASES: tuple[tuple[str, str], ...] = (
 )
 _PHRASES = tuple(sorted(_HEADER_PHRASES, key=lambda item: len(item[1]), reverse=True))
 
+_TABLE_END_WORDS = (
+    "обороты",
+    "итого",
+    "всего",
+    "исходящий остаток",
+    "остаток на конец",
+    "исходящее сальдо",
+)
+
 _NOT_A_HEADER = (
     "последнего движения",
     "дата выписки",
@@ -174,6 +185,12 @@ _PERIOD_DASH_RE = re.compile(
     re.IGNORECASE,
 )
 _IBAN_RE = re.compile(r"\bKZ[0-9A-Z]{18}\b", re.IGNORECASE)
+_TAX_ID_LABEL_RE = re.compile(
+    r"^(?:иин|бин|инн|iin|bin)(?:\s*/\s*(?:иин|бин|iin|bin))?"
+    r"(?:\s+(?:клиента|владельца|организации))?\s*:?\s*(.*)$",
+    re.IGNORECASE,
+)
+_TAX_ID_VALUE_RE = re.compile(r"(?<!\d)(\d{12})(?!\d)")
 _AMOUNT_TOKEN_RE = re.compile(
     r"(?<!\d)(?P<neg>\(|[+-])?\s*(?P<num>\d{1,3}(?:[ \u00a0]\d{3})+(?:[.,]\d{2})?|\d+[.,]\d{2})\)?(?!\d)"
 )
@@ -206,6 +223,8 @@ class Layout:
     operation_col: int | None = None
     document_col: int | None = None
     value_date_col: int | None = None
+    counterparty_col: int | None = None
+    purpose_col: int | None = None
     headerless: bool = False
 
 
@@ -217,6 +236,10 @@ class RawRow:
     operation_text: str
     document_number: str | None
     processing_date: str | None
+    # Контрагент и назначение платежа по отдельности, если у них свои колонки:
+    # вид для юрлица кладёт их в разные колонки.
+    counterparty: str = ""
+    purpose: str = ""
 
 
 @dataclass
@@ -385,6 +408,15 @@ def _interpret_grid(
     if plan.residual is not None:
         reconciled = plan.residual <= 0.05
 
+    owner_tax_id = _labeled_tax_id(preamble)
+    kind = holder_kind(
+        holder=holder,
+        tax_id=owner_tax_id,
+        header_cells=rows[header_index] if header_index is not None else (),
+        requisites=preamble_text,
+    )
+    transactions, totals = _for_holder(plan.transactions, kind, owner_tax_id)
+
     metadata = StatementMetadata(
         source_filename=filename,
         title=title,
@@ -396,15 +428,36 @@ def _interpret_grid(
         period_end=period_end,
         opening_balance=opening,
         closing_balance=closing,
-        transaction_count=len(plan.transactions),
-        totals=_totals(plan.transactions),
+        transaction_count=len(transactions),
+        totals=totals,
         reading_note=note,
+        holder_kind=kind,
     )
     return ReadResult(
-        statement=ParsedStatement(metadata=metadata, transactions=plan.transactions),
+        statement=ParsedStatement(metadata=metadata, transactions=transactions),
         headerless=headerless,
         reconciled=reconciled,
     )
+
+
+def _for_holder(
+    transactions: list[StatementTransaction],
+    kind: str | None,
+    owner_tax_id: str | None,
+) -> tuple[list[StatementTransaction], StatementTotals]:
+    """У юрлица вид операции и итоги считаются так же, как у Kaspi Business.
+
+    Слова физлица здесь врут: «Оплата по счёту № 26» от клиента ТОО — это
+    поступление, а не «Покупка», и «Пополнений» у счёта с миллионом прихода
+    выходило ноль.
+    """
+    if kind != LEGAL:
+        return transactions, _totals(transactions)
+    relabeled = [
+        item.model_copy(update={"operation": legal_operation(item, owner_tax_id=owner_tax_id)})
+        for item in transactions
+    ]
+    return relabeled, legal_totals(relabeled)
 
 
 def _find_header(
@@ -500,6 +553,8 @@ def _layout_from_roles(header: list[object], roles: dict[str, int], extras: list
         operation_col=roles.get("operation"),
         document_col=roles.get("document"),
         value_date_col=roles.get("value_date"),
+        counterparty_col=roles.get("counterparty"),
+        purpose_col=roles.get("detail"),
         headerless=False,
     )
 
@@ -595,6 +650,10 @@ def _is_serial_index(values: list[float]) -> bool:
 def _merge_continuations(rows: list[list[object]], layout: Layout) -> list[list[object]]:
     money_indexes = [slot.index for slot in layout.money]
     merged: list[list[object]] = []
+    # Строка закрыта, если за ней пошёл подвал или повтор шапки: иначе
+    # «Обороты: Дебет Кредит За период…» с последней страницы дописывались
+    # к последней операции.
+    closed = False
     for row in rows:
         if not any(cell not in (None, "") for cell in row):
             continue
@@ -602,25 +661,74 @@ def _merge_continuations(rows: list[list[object]], layout: Layout) -> list[list[
             continue
         if _coerce_date(_cell(row, layout.date_col), allow_serial=not layout.headerless):
             merged.append(list(row))
+            closed = False
             continue
-        if not merged:
+        if not merged or closed:
+            continue
+        if _closes_table(row, layout):
+            closed = True
             continue
         if any(_meaningful_amount(_cell(row, index)) for index in money_indexes):
             continue
-        extra = " ".join(
-            _normalize(cell)
-            for cell in row
-            if _normalize(cell) and _coerce_amount(cell) is None and _coerce_date(cell) is None
-        )
-        if not extra or not layout.detail_cols:
+        if not layout.detail_cols:
             continue
-        target = layout.detail_cols[0]
         current = merged[-1]
-        while len(current) <= target:
-            current.append(None)
-        previous = _normalize(current[target])
-        current[target] = f"{previous} {extra}".strip() if previous else extra
+        if layout.headerless:
+            extra = " ".join(
+                _normalize(cell)
+                for cell in row
+                if _normalize(cell) and _coerce_amount(cell) is None and _coerce_date(cell) is None
+            )
+            if extra:
+                _append_text(current, layout.detail_cols[0], extra)
+            continue
+        # Под шапкой у строки-продолжения каждая ячейка стоит под своей
+        # колонкой, туда её и дописываем. Раньше всё склеивалось в первую
+        # текстовую колонку, и в PDF Halyk контрагент перемешивался с
+        # назначением построчно: «Товарищество с ограниченной по аренде, счет
+        # на оплату № ответственностью "Алатау…». Числа в текстовой колонке —
+        # часть текста («№ 34», «481981.86(KZT)»), их тоже не выбрасываем.
+        text_cols = sorted(layout.detail_cols)
+        for index, cell in enumerate(row):
+            text = _normalize(cell)
+            if not text:
+                continue
+            if index in layout.detail_cols:
+                target = index
+            else:
+                if _coerce_amount(cell) is not None or _coerce_date(cell) is not None:
+                    continue
+                left = [column for column in text_cols if column < index]
+                target = left[-1] if left else layout.detail_cols[0]
+            _append_text(current, target, text)
     return merged
+
+
+def _closes_table(row: list[object], layout: Layout) -> bool:
+    """Подвал или повтор шапки, а не продолжение операции.
+
+    «Обороты», «Итого» ищутся только под датой: в назначении платежа такие
+    слова бывают. Слова в денежной колонке бывают только в шапке и в подвале
+    («Дебет», «Кредит» над оборотами) — но это верно, лишь когда колонки
+    известны по шапке.
+    """
+    under_date = _normalize(_cell(row, layout.date_col)).lower()
+    if under_date.startswith(_TABLE_END_WORDS):
+        return True
+    if layout.headerless:
+        return False
+    for index in (slot.index for slot in layout.money):
+        text = _normalize(_cell(row, index))
+        if text and _coerce_amount(text) is None and any(char.isalpha() for char in text):
+            return True
+    return False
+
+
+def _append_text(row: list[object], index: int, text: str) -> None:
+    while len(row) <= index:
+        row.append(None)
+    previous = _normalize(row[index])
+    row[index] = f"{previous} {text}".strip() if previous else text
 
 
 def _raw_row(row: list[object], layout: Layout) -> RawRow | None:
@@ -634,6 +742,8 @@ def _raw_row(row: list[object], layout: Layout) -> RawRow | None:
     processing = None
     if layout.value_date_col is not None:
         processing = _coerce_date(_cell(row, layout.value_date_col), allow_serial=True)
+    counterparty = _normalize(_cell(row, layout.counterparty_col)) if layout.counterparty_col is not None else ""
+    purpose = _normalize(_cell(row, layout.purpose_col)) if layout.purpose_col is not None else ""
     return RawRow(
         date=parsed_date,
         values={slot.index: _coerce_amount(_cell(row, slot.index)) for slot in layout.money},
@@ -641,6 +751,8 @@ def _raw_row(row: list[object], layout: Layout) -> RawRow | None:
         operation_text=operation_text,
         document_number=document or None,
         processing_date=processing,
+        counterparty=counterparty,
+        purpose=purpose,
     )
 
 
@@ -828,6 +940,10 @@ def _make_transaction(raw: RawRow, income: float | None, expense: float | None) 
         direction="inflow" if net > 0 else "outflow",
         document_number=raw.document_number,
         processing_date=raw.processing_date,
+        # Контрагент, названный банком в своей колонке. «Финансы» берут его
+        # в справочник контрагентов, вид «Юр счёт» — в колонку «Контрагент».
+        raw_counterparty=raw.counterparty or None,
+        comment=raw.purpose or None,
         source="adaptive",
     )
 
@@ -1036,7 +1152,29 @@ def _labeled_text(rows: list[list[object]], labels: tuple[str, ...]) -> str | No
     return None
 
 
+def _labeled_tax_id(rows: list[list[object]]) -> str | None:
+    """БИН или ИИН владельца из реквизитов: «ИИН/БИН | 211240002990».
+
+    Отдельно от `_labeled_text`: двенадцать цифр та читает как сумму и
+    пропускает.
+    """
+    for row in rows:
+        for index, cell in enumerate(row):
+            text = _normalize(cell)
+            label = _TAX_ID_LABEL_RE.match(text)
+            if not label:
+                continue
+            for candidate in [label.group(1), *row[index + 1 : index + 4]]:
+                found = _TAX_ID_VALUE_RE.search(re.sub(r"[\s\xa0]", "", _normalize(candidate)))
+                if found:
+                    return found.group(1)
+    return None
+
+
 def _amount_after_label(text: str, labels: tuple[str, ...]) -> float | None:
+    # Часть PDF отдаёт пробелы неразрывными: «Исходящий\xa0остаток:» иначе
+    # не узнаётся, и сверка с банком молча пропадает.
+    text = text.replace("\xa0", " ")
     folded = text.lower().replace("ё", "е")
     for label in labels:
         start = 0
@@ -1236,7 +1374,7 @@ def _specialist_fingerprint(filename: str, content: bytes) -> bool:
                 document.close()
             if "Kaspi Gold" in text and "ВЫПИСКА" in text:
                 return True
-            if "Народный Банк Казахстана" in text and "Выписка по счету" in text:
+            if looks_like_halyk_personal(text):
                 return True
             return False
         if extension not in {".xlsx", ".xlsm"}:
@@ -1270,12 +1408,14 @@ def _pdf_grid(content: bytes) -> tuple[list[list[object]], str] | None:
             return None
         page_rows: list[list[tuple]] = []
         texts: list[str] = []
+        rulings: list[list[tuple[float, float, float]]] = []
         for index, page in enumerate(document):
             if index >= _MAX_PDF_PAGES:
                 break
             words = [word for word in page.get_text("words") if str(word[4]).strip()]
             page_rows.append(words)
             texts.append(page.get_text("text"))
+            rulings.append(_vertical_rulings(page))
     finally:
         document.close()
     if not any(page_rows):
@@ -1288,17 +1428,29 @@ def _pdf_grid(content: bytes) -> tuple[list[list[object]], str] | None:
         return flat, "\n".join(texts)
 
     _, header_row, bounds = header
+    header_page = next(
+        index for index, page in enumerate(visual_pages) if any(row is header_row for row in page)
+    )
     grid: list[list[object]] = []
-    active_bounds = bounds
-    for page in visual_pages:
+    active_bounds = _snap_bounds(bounds, header_row, rulings[header_page])
+    reached = False
+    for page_index, page in enumerate(visual_pages):
         for row in page:
             if row is header_row:
+                reached = True
+                grid.append(list(row.cells))
+                continue
+            if not reached:
+                # Реквизиты над таблицей режутся по своим промежуткам, а не по
+                # колонкам таблицы: иначе «Клиент  ТОО Omar Development and
+                # Consulting» разъезжался на «ТОО Omar | Development and |
+                # Consulting», и владельцем счёта становился «ТОО Omar».
                 grid.append(list(row.cells))
                 continue
             if _cell_role(row.cells[0] if row.cells else "") == "date" and len(row.cells) >= 3:
                 refreshed = _bounds_from_groups(row.groups, row.page_width)
                 if refreshed:
-                    active_bounds = refreshed
+                    active_bounds = _snap_bounds(refreshed, row, rulings[page_index])
                     grid.append(list(row.cells))
                     continue
             if active_bounds:
@@ -1306,6 +1458,70 @@ def _pdf_grid(content: bytes) -> tuple[list[list[object]], str] | None:
             else:
                 grid.append(list(row.cells))
     return grid, "\n".join(texts)
+
+
+def _vertical_rulings(page: fitz.Page) -> list[tuple[float, float, float]]:
+    """Вертикальные линейки таблицы: (x, верх, низ)."""
+    found: list[tuple[float, float, float]] = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return found
+    for drawing in drawings:
+        for item in drawing.get("items", ()):
+            if item[0] == "l":
+                start, end = item[1], item[2]
+                if abs(start.x - end.x) <= 1 and abs(start.y - end.y) >= 2:
+                    found.append(((start.x + end.x) / 2, min(start.y, end.y), max(start.y, end.y)))
+            elif item[0] == "re":
+                rect = item[1]
+                if rect.height < 2:
+                    continue
+                if rect.width <= 2:
+                    found.append(((rect.x0 + rect.x1) / 2, rect.y0, rect.y1))
+                else:
+                    # Ячейка, нарисованная прямоугольником: её края — те же линейки.
+                    found.append((rect.x0, rect.y0, rect.y1))
+                    found.append((rect.x1, rect.y0, rect.y1))
+    return found
+
+
+def _snap_bounds(
+    bounds: list[tuple[float, float]],
+    header: VisualRow,
+    rulings: list[tuple[float, float, float]],
+) -> list[tuple[float, float]]:
+    """Границы колонок по линейкам таблицы, если они нарисованы.
+
+    Без линеек граница — середина между подписями шапки. Подписи стоят по
+    центру колонок, и длинный текст широкой колонки заезжал в соседнюю: в
+    выписке Halyk «счет на оплату № 34» терял «34» в колонке НДС.
+    """
+    if not bounds or not rulings or len(header.groups) != len(bounds):
+        return bounds
+    top = min(word[1] for word in header.words)
+    bottom = max(word[3] for word in header.words)
+    xs = sorted({round(x, 1) for x, y0, y1 in rulings if y0 <= bottom + 2 and y1 >= top - 2})
+    if len(xs) < 2:
+        return bounds
+    cells: list[tuple[float, float]] = []
+    for group in header.groups:
+        left_edge = min(word[0] for word in group)
+        right_edge = max(word[2] for word in group)
+        lefts = [x for x in xs if x <= left_edge + 1]
+        rights = [x for x in xs if x >= right_edge - 1]
+        if not lefts or not rights:
+            return bounds
+        cells.append((lefts[-1], rights[0]))
+    # Две подписи в одной ячейке — шапка разбита не по колонкам, линейкам не верим.
+    if any(right > next_left + 1 for (_, right), (next_left, _) in zip(cells, cells[1:])):
+        return bounds
+    snapped: list[tuple[float, float]] = []
+    for index, (left, _right) in enumerate(cells):
+        low = 0.0 if index == 0 else left
+        high = bounds[-1][1] if index == len(cells) - 1 else cells[index + 1][0]
+        snapped.append((low, high))
+    return snapped
 
 
 @dataclass
@@ -1487,24 +1703,29 @@ def _read_pdf_lines(filename: str, content: bytes) -> ReadResult | None:
     note = "Строки выписки прочитаны по дате в начале строки. " + _compose_note(
         plan, opening, closing, headerless=False
     )
+    holder = _text_after_label(text, _HOLDER_LABELS)
+    first_date = next((index for index, line in enumerate(lines) if _LINE_DATE_RE.match(line)), len(lines))
+    kind = holder_kind(holder=holder, tax_id=None, requisites="\n".join(lines[:first_date]))
+    transactions, totals = _for_holder(plan.transactions, kind, None)
     metadata = StatementMetadata(
         source_filename=filename,
         title=f"Выписка {bank}" if bank else "Банковская выписка",
         parser_key="adaptive_bank_statement",
-        account_holder=_text_after_label(text, _HOLDER_LABELS),
+        account_holder=holder,
         account_number=_iban(text),
         currency=_currency(text),
         period_start=period_start,
         period_end=period_end,
         opening_balance=opening,
         closing_balance=closing,
-        transaction_count=len(plan.transactions),
-        totals=_totals(plan.transactions),
+        transaction_count=len(transactions),
+        totals=totals,
         reading_note=note,
+        holder_kind=kind,
     )
     reconciled = plan.residual <= 0.05 if plan.residual is not None else None
     return ReadResult(
-        statement=ParsedStatement(metadata=metadata, transactions=plan.transactions),
+        statement=ParsedStatement(metadata=metadata, transactions=transactions),
         headerless=True,
         reconciled=reconciled,
     )

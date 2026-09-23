@@ -9,10 +9,20 @@ from app.schemas.statement import (
     TransformationTemplate,
 )
 from app.services import formula_engine
-# kaspi_business_statement_service imported lazily inside _build_kaspi_business_variants
+from app.services.legal_statement import LEGAL, counterparty_name, payment_purpose
 
 PRIMARY_GROUP = "primary"
+# Группа вида для юрлиц. Название историческое — вид появился у Kaspi Business,
+# теперь его получает выписка юрлица любого банка.
 KASPI_BUSINESS_GROUP = "kaspi_business_plus"
+
+_LEGAL_COLUMNS = (
+    ("date", "Дата операции", "text"),
+    ("income", "Приход, ₸", "currency"),
+    ("expense", "Расход, ₸", "currency"),
+    ("detail", "Контрагент", "text"),
+    ("comment", "Комментарий", "text"),
+)
 
 
 def build_variants(statement: ParsedStatement) -> list[PreviewVariant]:
@@ -29,6 +39,10 @@ def build_variants(statement: ParsedStatement) -> list[PreviewVariant]:
     variants = _build_primary_variants(transactions)
     if any(t.category for t in transactions):
         variants.append(_build_ai_variant(transactions))
+    if statement.metadata.holder_kind == LEGAL:
+        # Вид юрлица первым, виды физлица остаются рядом за переключателем —
+        # на случай, если владелец определился неверно.
+        variants.insert(0, _build_legal_variant(transactions))
     return variants
 
 
@@ -358,19 +372,46 @@ def _build_primary_variants(transactions) -> list[PreviewVariant]:
 
 
 
+def _legal_columns() -> list[PreviewColumn]:
+    return [PreviewColumn(key=key, label=label, kind=kind) for key, label, kind in _LEGAL_COLUMNS]
+
+
+def _build_legal_variant(transactions) -> PreviewVariant:
+    """\u0422\u043e\u0442 \u0436\u0435 \u0432\u0438\u0434, \u0447\u0442\u043e \u0443 Kaspi Business, \u0434\u043b\u044f \u0432\u044b\u043f\u0438\u0441\u043a\u0438 \u044e\u0440\u043b\u0438\u0446\u0430 \u043b\u044e\u0431\u043e\u0433\u043e \u0431\u0430\u043d\u043a\u0430."""
+    return PreviewVariant(
+        key="business_compact_classic",
+        name="\u042e\u0440 \u0441\u0447\u0451\u0442",
+        description="\u041e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u0444\u043e\u0440\u043c\u0430\u0442 \u0434\u043b\u044f \u0431\u0443\u0445\u0433\u0430\u043b\u0442\u0435\u0440\u0438\u0438: \u043a\u043e\u043d\u0442\u0440\u0430\u0433\u0435\u043d\u0442 \u0438 \u043d\u0430\u0437\u043d\u0430\u0447\u0435\u043d\u0438\u0435 \u043f\u043b\u0430\u0442\u0435\u0436\u0430 \u0432 \u0441\u0432\u043e\u0438\u0445 \u043a\u043e\u043b\u043e\u043d\u043a\u0430\u0445.",
+        columns=_legal_columns(),
+        rows=[_legal_row(row) for row in transactions],
+        group=KASPI_BUSINESS_GROUP,
+    )
+
+
+def _legal_row(transaction) -> dict[str, object | None]:
+    counterparty = counterparty_name(transaction.raw_counterparty)
+    comment = payment_purpose(transaction.comment)
+    if not counterparty and not comment:
+        # \u041a\u043e\u043b\u043e\u043d\u043e\u043a \u043a\u043e\u043d\u0442\u0440\u0430\u0433\u0435\u043d\u0442\u0430 \u0438 \u043d\u0430\u0437\u043d\u0430\u0447\u0435\u043d\u0438\u044f \u0443 \u0432\u044b\u043f\u0438\u0441\u043a\u0438 \u043d\u0435 \u0431\u044b\u043b\u043e \u2014 \u0432\u0435\u0441\u044c \u0442\u0435\u043a\u0441\u0442
+        # \u0441\u0442\u0440\u043e\u043a\u0438 \u0438\u0434\u0451\u0442 \u0432 \u043a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440\u0438\u0439: \u043d\u0430\u0437\u044b\u0432\u0430\u0442\u044c \u0435\u0433\u043e \u043a\u043e\u043d\u0442\u0440\u0430\u0433\u0435\u043d\u0442\u043e\u043c \u043d\u0435\u0442 \u043e\u0441\u043d\u043e\u0432\u0430\u043d\u0438\u0439.
+        comment = transaction.detail
+    return {
+        "date": transaction.date,
+        "income": transaction.income,
+        "expense": transaction.expense,
+        "detail": counterparty or None,
+        "comment": comment or None,
+        "direction": transaction.direction,
+    }
+
+
 def _build_kaspi_business_variants(transactions) -> list[PreviewVariant]:
     return [
         PreviewVariant(
             key="business_compact_classic",
             name="\u041a\u0430\u0441\u043f\u0438 \u042e\u0440 \u0441\u0447\u0435\u0442",
             description="\u041e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u0444\u043e\u0440\u043c\u0430\u0442 \u0434\u043b\u044f \u0431\u0443\u0445\u0433\u0430\u043b\u0442\u0435\u0440\u0438\u0438.",
-            columns=[
-                PreviewColumn(key="date", label="\u0414\u0430\u0442\u0430 \u043e\u043f\u0435\u0440\u0430\u0446\u0438\u0438"),
-                PreviewColumn(key="income", label="\u041f\u0440\u0438\u0445\u043e\u0434, \u20b8", kind="currency"),
-                PreviewColumn(key="expense", label="\u0420\u0430\u0441\u0445\u043e\u0434, \u20b8", kind="currency"),
-                PreviewColumn(key="detail", label="\u041a\u043e\u043d\u0442\u0440\u0430\u0433\u0435\u043d\u0442"),
-                PreviewColumn(key="comment", label="\u041a\u043e\u043c\u043c\u0435\u043d\u0442\u0430\u0440\u0438\u0439"),
-            ],
+            columns=_legal_columns(),
             rows=[
                 {
                     "date": row.date,

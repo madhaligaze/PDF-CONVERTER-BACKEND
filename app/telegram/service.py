@@ -12,8 +12,6 @@ from dataclasses import dataclass, field
 from app.schemas.statement import (
     ParsedStatement,
     PreviewVariant,
-    QualitySummary,
-    RowDiagnostic,
     SessionSummary,
 )
 from app.services.document_service import (
@@ -21,7 +19,6 @@ from app.services.document_service import (
     parse_statement_with_diagnostics,
 )
 from app.services.export_service import export_statement, export_statement_csv
-from app.services.quality_service import analyze_statement_quality
 from app.services.session_service import (
     get_preference,
     list_recent_sessions,
@@ -77,17 +74,20 @@ def default_variant_index(statement: ParsedStatement, variants: list[PreviewVari
     """Pick the index of the preferred variant: preference → default template → first."""
     if not variants:
         return 0
+    # Выбор берётся только из группы первого вида: у выписки юрлица это
+    # «Юр счёт», и сохранённый вид физлица того же шаблона разбора его не перебивает.
+    group = variants[0].group
     preference = get_preference(statement.metadata.parser_key)
     if preference and preference.preferred_variant_key:
         for index, variant in enumerate(variants):
-            if variant.key == preference.preferred_variant_key:
+            if variant.key == preference.preferred_variant_key and variant.group == group:
                 return index
     templates = list_templates(statement.metadata.parser_key)
     default_template = next((t for t in templates if t.is_default), None)
     if default_template is not None:
         default_key = f"template::{default_template.template_id}"
         for index, variant in enumerate(variants):
-            if variant.key == default_key:
+            if variant.key == default_key and variant.group == group:
                 return index
     return 0
 
@@ -124,20 +124,15 @@ def export_variant(session_id: str, variant_index: int, *, csv: bool) -> ExportR
 @dataclass
 class SummaryData:
     statement: ParsedStatement
-    quality: QualitySummary
-    diagnostics: list[RowDiagnostic] = field(default_factory=list)
     variants: list[PreviewVariant] = field(default_factory=list)
     default_index: int = 0
 
 
 def prepare_summary(statement: ParsedStatement) -> SummaryData:
     """Compute everything the bot needs to render a statement summary."""
-    quality, diagnostics = analyze_statement_quality(statement)
     variants = build_all_variants(statement)
     return SummaryData(
         statement=statement,
-        quality=quality,
-        diagnostics=diagnostics,
         variants=variants,
         default_index=default_variant_index(statement, variants),
     )
@@ -148,10 +143,6 @@ def summarize_session(session_id: str) -> SummaryData | None:
     if statement is None:
         return None
     return prepare_summary(statement)
-
-
-def get_quality(statement: ParsedStatement) -> tuple[QualitySummary, list[RowDiagnostic]]:
-    return analyze_statement_quality(statement)
 
 
 def get_session(session_id: str) -> ParsedStatement | None:

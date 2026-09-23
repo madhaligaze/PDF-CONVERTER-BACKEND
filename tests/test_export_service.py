@@ -55,7 +55,8 @@ def test_export_statement_adds_operations_sheet_for_kaspi_gold() -> None:
 
     workbook = load_workbook(BytesIO(workbook_bytes), data_only=True)
 
-    assert workbook.sheetnames == ["Выписка", "Операций", "Audit Trail"]
+    # Листа «Audit Trail» с «уверенностью» по каждой ячейке больше нет.
+    assert workbook.sheetnames == ["Выписка", "Операций"]
 
     operations_sheet = workbook["Операций"]
     headers = [operations_sheet.cell(9, column).value for column in range(1, 6)]
@@ -71,6 +72,6 @@ def test_export_operation_split_does_not_include_net_column() -> None:
 
     workbook = load_workbook(BytesIO(workbook_bytes), data_only=True)
 
-    assert workbook.sheetnames == ["Операций", "Audit Trail"]
+    assert workbook.sheetnames == ["Операций"]
     headers = [workbook["Операций"].cell(9, column).value for column in range(1, 6)]
     assert headers == ["Дата", "Операция", "Детали", "Приход, ₸", "Расход, ₸"]

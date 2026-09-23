@@ -8,6 +8,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from app.schemas.statement import ParsedStatement
+from app.services.legal_statement import totals_labels
 from app.services.template_service import get_template
 from app.services.variant_service import (
     apply_template_to_variant,
@@ -63,9 +64,6 @@ def export_statement(
         operations_variant = _resolve_variant(statement, "operation_split")
         operations_sheet = workbook.create_sheet("Операций")
         _write_variant_sheet(operations_sheet, statement, operations_variant, "Операций")
-
-    audit_sheet = workbook.create_sheet("Audit Trail")
-    _write_audit_sheet(audit_sheet, statement, variant)
 
     stream = BytesIO()
     workbook.save(stream)
@@ -194,11 +192,14 @@ def _write_metadata(sheet, statement: ParsedStatement, column_count: int) -> Non
     sheet["A1"].font = TITLE_FONT
     sheet["A1"].alignment = Alignment(vertical="center")
 
+    # У юрлица в purchase_total комиссии банка, а topup_total — весь приход:
+    # подписи «Покупки» и «Пополнения» там врали. Сами числа те же.
+    labels = totals_labels(metadata.holder_kind)
     top_rows = [
-        ("Клиент:", metadata.account_holder, "Пополнения", metadata.totals.topup_total),
-        ("Номер карты:", metadata.card_number, "Переводы", metadata.totals.transfer_total),
-        ("Номер счета:", metadata.account_number, "Покупки", metadata.totals.purchase_total),
-        ("Валюта счета:", metadata.currency, "Снятия", metadata.totals.cash_withdrawal_total),
+        ("Клиент:", metadata.account_holder, labels["topup_total"], metadata.totals.topup_total),
+        ("Номер карты:", metadata.card_number, labels["transfer_total"], metadata.totals.transfer_total),
+        ("Номер счета:", metadata.account_number, labels["purchase_total"], metadata.totals.purchase_total),
+        ("Валюта счета:", metadata.currency, labels["cash_withdrawal_total"], metadata.totals.cash_withdrawal_total),
         ("Доступно на старте:", metadata.opening_balance, None, None),
         ("Доступно на финише:", metadata.closing_balance, None, None),
     ]
@@ -240,52 +241,6 @@ def export_statement_csv(statement: ParsedStatement, variant_key: str) -> bytes:
 
     # BOM for correct Cyrillic display in Excel on Windows
     return ("\ufeff" + output.getvalue()).encode("utf-8")
-
-
-def _write_audit_sheet(sheet, statement: ParsedStatement, variant) -> None:
-    headers = [
-        "Export row",
-        "Export column",
-        "Export header",
-        "Value",
-        "Source row",
-        "Provenance",
-        "Confidence",
-        "Correction",
-        "Template transform",
-    ]
-    for column_index, label in enumerate(headers, start=1):
-        cell = sheet.cell(row=1, column=column_index, value=label)
-        cell.fill = HEADER_FILL
-        cell.font = HEADER_FONT
-
-    transaction_lookup = {index: item for index, item in enumerate(statement.transactions, start=1)}
-    row_pointer = 2
-    for export_row_number, row in enumerate(variant.rows, start=1):
-        source_row_number = row.get("_source_row_number")
-        if isinstance(source_row_number, int):
-            source_row = transaction_lookup.get(source_row_number)
-        else:
-            source_row = transaction_lookup.get(export_row_number)
-        for export_column_number, column in enumerate(variant.columns, start=1):
-            value = row.get(column.key)
-            provenance = row.get("_provenance") or (source_row.source if source_row else "derived_variant")
-            confidence = source_row.source_confidence if source_row else None
-            correction = "yes" if source_row and source_row.corrected else "no"
-            template_transform = "yes" if variant.template_id else "no"
-            sheet.cell(row=row_pointer, column=1, value=export_row_number)
-            sheet.cell(row=row_pointer, column=2, value=export_column_number)
-            sheet.cell(row=row_pointer, column=3, value=column.label)
-            sheet.cell(row=row_pointer, column=4, value=value)
-            sheet.cell(row=row_pointer, column=5, value=source_row_number if source_row else None)
-            sheet.cell(row=row_pointer, column=6, value=provenance)
-            sheet.cell(row=row_pointer, column=7, value=confidence)
-            sheet.cell(row=row_pointer, column=8, value=correction)
-            sheet.cell(row=row_pointer, column=9, value=template_transform)
-            row_pointer += 1
-
-    for column_index in range(1, len(headers) + 1):
-        sheet.column_dimensions[get_column_letter(column_index)].width = 20
 
 
 def _apply_column_widths(sheet, columns, rows) -> None:

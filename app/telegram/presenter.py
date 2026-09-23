@@ -5,7 +5,6 @@ callback_data layout (kept well under Telegram's 64-byte limit; session_id is
     x:<e|c>:<session_id>:<idx>   export excel/csv of variant #idx
     v:<session_id>               open the variant chooser
     vp:<session_id>:<idx>        pick variant #idx → show its export buttons
-    q:<session_id>               show quality report
     s:<session_id>               open a session from history
     b:<session_id>               back to the summary
     hist                         open recent history
@@ -20,10 +19,9 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from app.schemas.statement import (
     ParsedStatement,
     PreviewVariant,
-    QualitySummary,
-    RowDiagnostic,
     SessionSummary,
 )
+from app.services.legal_statement import totals_labels
 
 SUPPORTED_FORMATS = "PDF, Excel (.xlsx/.xlsm), фото/скан (.png/.jpg/.jpeg)"
 
@@ -68,7 +66,16 @@ def manual_review_text(error: str | None) -> str:
     return base
 
 
-def summary_text(statement: ParsedStatement, quality: QualitySummary) -> str:
+def _balance_gap(statement: ParsedStatement) -> float | None:
+    """Насколько операции не сходятся с остатками банка; None — сверить нечем."""
+    meta = statement.metadata
+    if meta.opening_balance is None or meta.closing_balance is None:
+        return None
+    net = meta.totals.income_total - meta.totals.expense_total
+    return round(abs(meta.opening_balance + net - meta.closing_balance), 2)
+
+
+def summary_text(statement: ParsedStatement) -> str:
     meta = statement.metadata
     totals = meta.totals
     currency = _esc(meta.currency) or ""
@@ -89,22 +96,19 @@ def summary_text(statement: ParsedStatement, quality: QualitySummary) -> str:
     info.append(f"🔢 Операций: {meta.transaction_count}")
     lines.append("\n".join(info))
 
+    labels = totals_labels(meta.holder_kind)
     lines.append(
         "💰 <b>Итоги</b>\n"
-        f"  Пополнения: {_money(totals.topup_total)}{cur}\n"
+        f"  {labels['topup_total']}: {_money(totals.topup_total)}{cur}\n"
         f"  Списания: {_money(totals.expense_total)}{cur}\n"
-        f"  Покупки: {_money(totals.purchase_total)}{cur}\n"
-        f"  Переводы: {_money(totals.transfer_total)}{cur}\n"
-        f"  Снятия: {_money(totals.cash_withdrawal_total)}{cur}"
+        f"  {labels['purchase_total']}: {_money(totals.purchase_total)}{cur}\n"
+        f"  {labels['transfer_total']}: {_money(totals.transfer_total)}{cur}\n"
+        f"  {labels['cash_withdrawal_total']}: {_money(totals.cash_withdrawal_total)}{cur}"
     )
 
-    if quality.high_risk_count or quality.review_required_count:
-        lines.append(
-            f"⚠️ Качество: высокий риск {quality.high_risk_count}, "
-            f"на проверку {quality.review_required_count}"
-        )
-    if quality.totals_mismatch:
-        lines.append("⚠️ Возможно несоответствие итогов — проверьте суммы.")
+    gap = _balance_gap(statement)
+    if gap is not None and gap > 0.05:
+        lines.append(f"⚠️ Операции не сходятся с остатками банка на {_money(gap)}{cur} — проверьте суммы.")
 
     insights = statement.ai_insights
     if insights and insights.summary:
@@ -112,34 +116,6 @@ def summary_text(statement: ParsedStatement, quality: QualitySummary) -> str:
 
     lines.append("\nВыберите формат выгрузки ниже 👇")
     return "\n\n".join(lines)
-
-
-def quality_text(quality: QualitySummary, diagnostics: list[RowDiagnostic]) -> str:
-    lines = [
-        "⚠️ <b>Качество распознавания</b>",
-        (
-            f"Уверенность: {round(quality.overall_confidence * 100)}%  ·  "
-            f"высокий риск: {quality.high_risk_count}  ·  "
-            f"на проверку: {quality.review_required_count}  ·  "
-            f"исправлено: {quality.corrected_count}"
-        ),
-    ]
-    risky = [d for d in diagnostics if d.flags][:6]
-    if risky:
-        lines.append("\n<b>Строки на внимание:</b>")
-        for d in risky:
-            reason = d.flags[0].message if d.flags else ""
-            lines.append(
-                f"• №{d.row_number} {_esc(d.date)} — {_esc(d.detail[:40])} "
-                f"({_money(d.amount)}): {_esc(reason[:60])}"
-            )
-    if quality.recommendations:
-        lines.append("\n<b>Рекомендации:</b>")
-        for rec in quality.recommendations[:4]:
-            lines.append(f"• {_esc(rec)}")
-    if not risky and not quality.recommendations:
-        lines.append("\n✅ Существенных проблем не обнаружено.")
-    return "\n".join(lines)
 
 
 # ── Keyboards ───────────────────────────────────────────────────────────────────
@@ -160,7 +136,6 @@ def summary_keyboard(session_id: str, default_index: int) -> InlineKeyboardMarku
         InlineKeyboardButton(text="📄 CSV", callback_data=f"x:c:{session_id}:{default_index}"),
     )
     kb.row(InlineKeyboardButton(text="🧩 Выбрать вариант", callback_data=f"v:{session_id}"))
-    kb.row(InlineKeyboardButton(text="⚠️ Качество", callback_data=f"q:{session_id}"))
     return kb.as_markup()
 
 
@@ -178,12 +153,6 @@ def variant_export_keyboard(session_id: str, index: int) -> InlineKeyboardMarkup
         InlineKeyboardButton(text="📊 Excel", callback_data=f"x:e:{session_id}:{index}"),
         InlineKeyboardButton(text="📄 CSV", callback_data=f"x:c:{session_id}:{index}"),
     )
-    kb.row(InlineKeyboardButton(text="← Назад", callback_data=f"b:{session_id}"))
-    return kb.as_markup()
-
-
-def back_keyboard(session_id: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text="← Назад", callback_data=f"b:{session_id}"))
     return kb.as_markup()
 

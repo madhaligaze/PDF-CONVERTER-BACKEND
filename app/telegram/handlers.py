@@ -128,7 +128,7 @@ async def _process_upload(message: Message, filename: str, file_obj) -> None:
 
     data = await asyncio.to_thread(service.prepare_summary, result.statement)
     await status.edit_text(
-        presenter.summary_text(data.statement, data.quality),
+        presenter.summary_text(data.statement),
         reply_markup=presenter.summary_keyboard(result.session_id, data.default_index),
     )
 
@@ -196,27 +196,16 @@ async def cb_pick_variant(callback: CallbackQuery) -> None:
     await callback.answer(f"Вариант: {name}")
 
 
-@router.callback_query(F.data.startswith("q:"))
-async def cb_quality(callback: CallbackQuery) -> None:
-    session_id = callback.data.split(":", 1)[1]
-    data = await _load(callback, session_id)
-    if data is None:
-        return
-    await callback.message.edit_text(
-        presenter.quality_text(data.quality, data.diagnostics),
-        reply_markup=presenter.back_keyboard(session_id),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("b:"))
+# «q:» — кнопка «Качество» из старых сообщений. Отчёта качества больше нет;
+# нажатие возвращает к сводке, а не висит без ответа.
+@router.callback_query(F.data.startswith("b:") | F.data.startswith("q:"))
 async def cb_back(callback: CallbackQuery) -> None:
     session_id = callback.data.split(":", 1)[1]
     data = await _load(callback, session_id)
     if data is None:
         return
     await callback.message.edit_text(
-        presenter.summary_text(data.statement, data.quality),
+        presenter.summary_text(data.statement),
         reply_markup=presenter.summary_keyboard(session_id, data.default_index),
     )
     await callback.answer()
@@ -229,7 +218,7 @@ async def cb_open_session(callback: CallbackQuery) -> None:
     if data is None:
         return
     await callback.message.answer(
-        presenter.summary_text(data.statement, data.quality),
+        presenter.summary_text(data.statement),
         reply_markup=presenter.summary_keyboard(session_id, data.default_index),
     )
     await callback.answer()

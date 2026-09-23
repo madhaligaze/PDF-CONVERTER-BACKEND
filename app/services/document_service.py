@@ -366,6 +366,7 @@ def _extract_pdf_metadata(
         closing_balance=closing_balance,
         transaction_count=len(transactions),
         totals=totals,
+        holder_kind="personal",
     )
 
 
@@ -397,6 +398,7 @@ def _extract_workbook_metadata(
         closing_balance=closing_balance,
         transaction_count=len(transactions),
         totals=_calculate_totals(transactions),
+        holder_kind="personal",
     )
 
 

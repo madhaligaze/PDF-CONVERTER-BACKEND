@@ -29,6 +29,16 @@ _COL_INCOME = 5
 _COL_EXPENSE = 6
 
 
+def looks_like_halyk_personal(text: str) -> bool:
+    """Выписка физлица Halyk: в шапке «ФИО:» и «ИИН:».
+
+    У выписки ТОО тот же банк, но в шапке «Клиент» и «ИИН/БИН», а таблица
+    другая — дебет, кредит, контрагент, детали платежа. Её читает общий
+    разбор и показывает видом для юрлица.
+    """
+    return "Народный Банк Казахстана" in text and "Выписка по счету" in text and "ФИО" in text
+
+
 def detect_halyk_fiz_statement(filename: str, content: bytes) -> float:
     if Path(filename).suffix.lower() != ".pdf":
         return 0.0
@@ -38,9 +48,7 @@ def detect_halyk_fiz_statement(filename: str, content: bytes) -> float:
         doc.close()
     except Exception:
         return 0.0
-    if "Народный Банк Казахстана" in sample and "Выписка по счету" in sample:
-        return 1.0
-    return 0.0
+    return 1.0 if looks_like_halyk_personal(sample) else 0.0
 
 
 def parse_halyk_fiz_statement(filename: str, content: bytes) -> ParsedStatement:
@@ -94,6 +102,7 @@ def _extract_metadata(
         closing_balance=closing_balance,
         transaction_count=len(transactions),
         totals=totals,
+        holder_kind="personal",
     )
 
 

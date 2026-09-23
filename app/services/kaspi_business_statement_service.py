@@ -249,6 +249,7 @@ def _build_metadata(
         closing_balance=closing_balance,
         transaction_count=len(transactions),
         totals=_calculate_totals(transactions),
+        holder_kind="legal",
     )
 
 

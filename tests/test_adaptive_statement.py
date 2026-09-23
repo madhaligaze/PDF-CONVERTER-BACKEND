@@ -98,8 +98,13 @@ def test_debit_credit_keeps_balance_out_of_turnover() -> None:
     assert statement.metadata.title == "Выписка Forte Bank"
     assert statement.metadata.totals.expense_total == 200
     assert statement.metadata.totals.income_total == 500
-    assert statement.metadata.totals.purchase_total == 200
+    # Владелец — ИП, это счёт юрлица: итоги как у Kaspi Business. «Оплата
+    # аренды» — списание, а не покупка; в purchase_total только комиссии банка.
+    assert statement.metadata.holder_kind == "legal"
+    assert statement.metadata.totals.purchase_total == 0
     assert statement.metadata.totals.topup_total == 500
+    assert statement.transactions[0].operation == "Списание"
+    assert statement.transactions[1].operation == "Поступление"
     note = statement.metadata.reading_note or ""
     assert "Дебет посчитан как расход" in note
     assert "Остаток на конец сходится" in note
