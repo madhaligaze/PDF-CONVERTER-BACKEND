@@ -1,13 +1,16 @@
-"""Модель одной книги Web-Excel.
+"""Полка «Таблиц»: одна запись — одна таблица.
 
-Снимок хранится целиком в `snapshot` (JSON `IWorkbookData`), а не разложенным
-по ячейкам. Это осознанно: книга читается и пишется целиком одним экраном, а
-запросов вида «сумма по колонке за июль» к этой таблице не бывает — за ними
-ходят в дашборд, который считает по своим источникам.
+Снимок книги Univer (`IWorkbookData`) хранится **строкой**, а не JSON-колонкой, и
+сервер его не разбирает никогда. Разбор снимка в объекты Python стоит примерно
+в десять раз больше его размера: таблица на 20 МБ — это 200 МБ памяти на одно
+сохранение. Строка же проходит насквозь: пришла телом запроса, легла в базу,
+ушла обратно. Postgres сжимает её сам (TOAST).
 
-`origin_spreadsheet_id` — id книги в Google, из которой сделан импорт. Он нужен,
-чтобы позже показать «в исходнике появились новые строки», и чтобы не
-импортировать одну и ту же книгу дважды под разными именами.
+`sheets` — оглавление для полки: названия листов и их размер. Отдельно от снимка,
+чтобы список полки не поднимал из базы ни одного снимка.
+
+Имя таблицы `shelf`, а не прежнее `books`: `books` есть и у модуля «Книги», и на
+SQLite, где схем нет, два одноимённых класса метили в одну таблицу.
 """
 from __future__ import annotations
 
@@ -24,25 +27,22 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-class WebExcelBook(WebExcelBase):
-    __tablename__ = "books"
+class ShelfTable(WebExcelBase):
+    __tablename__ = "shelf"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
-    # «Новая таблица» или «импортирована из Google» — различаются в списке.
-    kind: Mapped[str] = mapped_column(String(16), default="blank", nullable=False)
-    origin_spreadsheet_id: Mapped[str] = mapped_column(String(64), default="", nullable=False)
-    origin_title: Mapped[str] = mapped_column(String(200), default="", nullable=False)
-    # Список импортированных вкладок — показывается в карточке книги.
-    origin_tabs: Mapped[list | None] = mapped_column(JSON, default=list, nullable=True)
-    snapshot: Mapped[dict | None] = mapped_column(JSON, default=dict, nullable=True)
-    # Кто последним сохранял. Пусто, пока раздел не за логином.
-    updated_by: Mapped[str] = mapped_column(String(120), default="", nullable=False)
-    note: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    # blank — своя; google — по ссылке из Google Sheets; file — из файла .xlsx.
+    source: Mapped[str] = mapped_column(String(16), default="blank", nullable=False)
+    # Ссылка на книгу Google или имя файла — откуда таблица пришла.
+    source_ref: Mapped[str] = mapped_column(String(500), default="", nullable=False)
+    sheets: Mapped[list | None] = mapped_column(JSON, default=list, nullable=True)
+    snapshot: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
     )
 
 
-__all__ = ["WebExcelBook"]
+__all__ = ["ShelfTable"]

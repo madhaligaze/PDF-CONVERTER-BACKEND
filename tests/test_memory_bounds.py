@@ -6,7 +6,8 @@
 * сырой ответ Google с оформлением для одной вкладки «Журнал» — 240 МБ
   объектов Python. Кэш «Таблиц» хранил его вместо готового ответа (2 МБ JSON)
   и не выбрасывал никогда: просроченная запись лежала до следующего чтения той
-  же вкладки, то есть до перезапуска. Три журнала одной книги — почти гигабайт;
+  же вкладки, то есть до перезапуска. Три журнала одной книги — почти гигабайт.
+  23.09.2026 «Таблицы» перестали читать Google на сервере вовсе;
 * aiogram при импорте строит все 635 моделей Telegram — 125 МБ, и платили их
   даже с выключенным ботом, потому что проверка токена жила внутри модуля бота.
 
@@ -15,10 +16,8 @@ Google здесь не участвует: сеть подменяется, пр
 """
 from __future__ import annotations
 
-import gc
 import subprocess
 import sys
-import weakref
 from pathlib import Path
 
 import pytest
@@ -26,212 +25,79 @@ import pytest
 BACKEND = Path(__file__).resolve().parents[1]
 
 
-# ── «Таблицы»: кэш готовых вкладок ──────────────────────────────────────────
+# ── «Таблицы»: сервер книг не читает ─────────────────────────────────────────
 
 
-class _Raw(dict):
-    """Сырой ответ Google. Подкласс — только ради weakref: у dict её нет."""
+def test_tablicy_ne_hodyat_v_google() -> None:
+    """Главный потребитель памяти ушёл вместе с зеркалом книг Google.
+
+    Сырой ответ Google с оформлением для одной вкладки «Журнала» — 240 МБ
+    объектов Python. Теперь импорт из Google и из .xlsx живёт в браузере, а
+    сервер только хранит снимок строкой. Возврат клиента Google в модуль — это
+    возврат той самой утечки, и тест ловит его в момент появления.
+    """
+    import ast
+
+    for source in sorted((BACKEND / "app" / "webexcel").glob("*.py")):
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names.add(node.module)
+        leaked = {name for name in names if name.split(".")[0] in {"gspread", "google", "openpyxl"}}
+        assert not leaked, f"{source.name} снова тянет {sorted(leaked)}"
 
 
-def _raw(rows: int = 3, cols: int = 2) -> _Raw:
-    return _Raw(
-        spreadsheet_title="Журнал ГК BBC",
-        sheet={"data": [{"rowData": [{"values": [{}] * cols} for _ in range(rows)]}]},
-    )
-
-
-def _payload(raw: dict) -> bytes:
-    """Готовый ответ вкладки — байты, как их отдаёт маршрут."""
-    return raw["spreadsheet_title"].encode()
+# ── «Финансы»: кэш клиента Google ────────────────────────────────────────────
 
 
 @pytest.fixture
-def webexcel(monkeypatch):
-    from app.webexcel import google
+def finance_google():
+    from app.finance import google
 
     google.invalidate_cache()
-    monkeypatch.setattr(google.webexcel_settings, "cache_ttl_seconds", 600.0, raising=False)
     yield google
     google.invalidate_cache()
 
 
-def test_syroy_grid_ne_ostaetsya_v_pamyati(webexcel, monkeypatch) -> None:
-    """Главный дефект: кэш держал сырой грид, а не готовую вкладку."""
-    held: list[weakref.ref] = []
-
-    def fetch(sid, tab):
-        raw = _raw()
-        held.append(weakref.ref(raw))
-        return raw
-
-    monkeypatch.setattr(webexcel, "fetch_tab_grid", fetch)
-
-    result = webexcel.cached_tab("book", "Журнал", _payload)
-    gc.collect()
-
-    assert result == "Журнал ГК BBC".encode()
-    assert held and held[0]() is None, "сырой ответ Google пережил запрос"
-
-
-def test_povtornoe_otkrytie_vkladki_ne_hodit_v_google(webexcel, monkeypatch) -> None:
-    """Ради этого кэш и заведён: квота одна на дашборд и «Таблицы»."""
-    calls: list[str] = []
-    monkeypatch.setattr(webexcel, "fetch_tab_grid", lambda sid, tab: calls.append(tab) or _raw())
-
-    first = webexcel.cached_tab("book", "Журнал", _payload)
-    second = webexcel.cached_tab("book", "Журнал", _payload)
-
-    assert first == second
-    assert calls == ["Журнал"]
-
-
-def test_prosrochennaya_vkladka_vybrasyvaetsya_a_ne_lezhit(webexcel, monkeypatch) -> None:
-    """Раньше просроченное лежало до чтения той же вкладки — то есть вечно."""
-    monkeypatch.setattr(webexcel, "fetch_tab_grid", lambda sid, tab: _raw())
+def test_finansy_zabyvayut_prosrochennye_znacheniya(finance_google, monkeypatch) -> None:
+    """Значения вкладок для переноса в учёт — сетки, и раньше жили вечно."""
     now = [100.0]
-    monkeypatch.setattr(webexcel.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(finance_google.time, "monotonic", lambda: now[0])
 
-    webexcel.cached_tab("book", "Журнал", _payload)
-    now[0] += 601  # TTL — 600 секунд
-    webexcel.cached_tab("book", "Справочник", _payload)
+    with finance_google._lock:
+        finance_google._remember(finance_google._values_cache, ("book", "Журнал"), [["x"]])
+        now[0] += 601  # TTL — 600 секунд
+        finance_google._remember(finance_google._values_cache, ("book", "Pay Журнал"), [["y"]])
 
-    assert list(webexcel._tab_cache) == [("book", "Справочник")]
-
-
-def test_kesh_vkladok_ogranichen_po_obyomu(webexcel, monkeypatch) -> None:
-    """Потолок по байтам, а не по числу: вкладки различаются в двадцать раз."""
-    monkeypatch.setattr(webexcel, "_TAB_CACHE_MAX_BYTES", 100)
-    monkeypatch.setattr(webexcel, "fetch_tab_grid", lambda sid, tab: _raw())
-
-    def forty_bytes(raw):
-        return b"x" * 40
-
-    webexcel.cached_tab("book", "a", forty_bytes)  # 40 байт
-    webexcel.cached_tab("book", "b", forty_bytes)  # 80
-    webexcel.cached_tab("book", "c", forty_bytes)  # 120 > 100 → уходит самая старая
-
-    assert list(webexcel._tab_cache) == [("book", "b"), ("book", "c")]
+    assert list(finance_google._values_cache) == [("book", "Pay Журнал")]
 
 
-def test_vkladka_bolshe_potolka_vsyo_ravno_otdaetsya(webexcel, monkeypatch) -> None:
-    """Потолок ограничивает хранение, а не ответ: последняя запись остаётся."""
-    monkeypatch.setattr(webexcel, "_TAB_CACHE_MAX_BYTES", 10)
-    monkeypatch.setattr(webexcel, "fetch_tab_grid", lambda sid, tab: _raw())
+def test_finansy_derzhat_ogranichennoe_chislo_zapisey(finance_google, monkeypatch) -> None:
+    monkeypatch.setattr(finance_google, "_MAX_ENTRIES", 2)
 
-    body = webexcel.cached_tab("book", "Журнал", lambda raw: b"x" * 50)
+    with finance_google._lock:
+        for book in ("A", "B", "C"):
+            finance_google._remember(finance_google._meta_cache, book, {"id": book})
 
-    assert body == b"x" * 50
-    assert list(webexcel._tab_cache) == [("book", "Журнал")]
-
-
-def test_knopka_obnovit_sbrasyvaet_i_gotovye_vkladki(webexcel, monkeypatch) -> None:
-    calls: list[str] = []
-    monkeypatch.setattr(webexcel, "fetch_tab_grid", lambda sid, tab: calls.append(tab) or _raw())
-
-    webexcel.cached_tab("book", "Журнал", _payload)
-    webexcel.invalidate_cache()
-    webexcel.cached_tab("book", "Журнал", _payload)
-
-    assert len(calls) == 2
+    assert list(finance_google._meta_cache) == ["B", "C"]
 
 
-def test_otkaz_google_ne_kladetsya_v_kesh(webexcel, monkeypatch) -> None:
+def test_finansy_ne_keshiruyut_otkaz_google(finance_google, monkeypatch) -> None:
     """Иначе одна ошибка сети отвечала бы отказом ещё десять минут."""
-    def boom(sid, tab):
-        raise webexcel.WebExcelError("Google временно ограничил чтение")
 
-    monkeypatch.setattr(webexcel, "fetch_tab_grid", boom)
+    class Book:
+        def fetch_sheet_metadata(self, params=None):
+            raise RuntimeError("APIError: [429]: Quota exceeded")
 
-    with pytest.raises(webexcel.WebExcelError):
-        webexcel.cached_tab("book", "Журнал", _payload)
-    assert webexcel._tab_cache == {}
+    monkeypatch.setattr(finance_google, "_open", lambda book_id: Book())
 
-
-def test_ostalnye_keshi_tozhe_zabyvayut_prosrochennoe(webexcel, monkeypatch) -> None:
-    """Значения вкладок для переноса в учёт — тоже сетки, и тоже жили вечно."""
-    now = [100.0]
-    monkeypatch.setattr(webexcel.time, "monotonic", lambda: now[0])
-
-    with webexcel._lock:
-        webexcel._remember(webexcel._values_cache, ("book", "Журнал"), [["x"]])
-        now[0] += 601
-        webexcel._remember(webexcel._values_cache, ("book", "Pay Журнал"), [["y"]])
-
-    assert list(webexcel._values_cache) == [("book", "Pay Журнал")]
-
-
-def test_ostalnye_keshi_ogranicheny_po_chislu(webexcel, monkeypatch) -> None:
-    monkeypatch.setattr(webexcel, "_MAX_ENTRIES", 2)
-
-    with webexcel._lock:
-        for ref in ("A", "B", "C"):
-            webexcel._remember(webexcel._ref_cache, ("book", ref), [ref])
-
-    assert list(webexcel._ref_cache) == [("book", "B"), ("book", "C")]
-
-
-def test_marshrut_vkladki_otdaet_to_zhe_chto_ran_she(monkeypatch) -> None:
-    """Фронт собирает книгу из этого ответа — форма обязана остаться прежней."""
-    from fastapi import FastAPI
-    from fastapi.testclient import TestClient
-
-    from app.webexcel import google, routes
-
-    google.invalidate_cache()
-    monkeypatch.setattr(google.webexcel_settings, "cache_ttl_seconds", 600.0, raising=False)
-    monkeypatch.setattr(routes.webexcel_settings, "enabled", True, raising=False)
-    monkeypatch.setattr(
-        type(routes.webexcel_settings), "credentials_available", property(lambda self: True)
-    )
-    grid = {
-        "spreadsheet_title": "Журнал ГК BBC",
-        "spreadsheet_locale": "ru_RU",
-        "sheet": {
-            "properties": {"sheetId": 7, "title": "Журнал", "gridProperties": {}},
-            "data": [{"rowData": [{"values": [{"effectiveValue": {"stringValue": "Аренда"}}]}]}],
-        },
-    }
-    calls: list[str] = []
-    monkeypatch.setattr(google, "fetch_tab_grid", lambda sid, tab: calls.append(tab) or grid)
-
-    app = FastAPI()
-    app.include_router(routes.router)
-    client = TestClient(app)
-
-    first = client.get("/web-excel/sources/book/tab", params={"title": "Журнал"})
-    second = client.get("/web-excel/sources/book/tab", params={"title": "Журнал"})
-    google.invalidate_cache()
-
-    assert first.status_code == 200
-    body = first.json()
-    assert set(body) == {
-        "spreadsheet_id", "spreadsheet_title", "sheet", "styles", "stats", "fonts",
-        "checkboxes", "lists",
-    }
-    assert body["spreadsheet_id"] == "book"
-    assert body["spreadsheet_title"] == "Журнал ГК BBC"
-    assert body["sheet"]["cellData"]["0"]["0"]["v"] == "Аренда"
-    assert second.content == first.content
-    assert calls == ["Журнал"], "повторное открытие ушло в Google"
-
-    # Байт в байт с тем, как FastAPI отдавал этот же словарь раньше, когда
-    # маршрут возвращал его, а не готовые байты.
-    from app.webexcel.univer import convert_tab
-
-    converted = convert_tab(grid)
-    before = FastAPI()
-
-    @before.get("/tab")
-    def old_route() -> dict:
-        return {
-            "spreadsheet_id": "book",
-            "spreadsheet_title": grid["spreadsheet_title"],
-            **{k: converted[k] for k in ("sheet", "styles", "stats", "fonts", "checkboxes", "lists")},
-        }
-
-    old = TestClient(before).get("/tab")
-    assert first.content == old.content
-    assert first.headers["content-type"] == old.headers["content-type"]
+    with pytest.raises(finance_google.GoogleError) as caught:
+        finance_google.spreadsheet_meta("book")
+    assert "ограничил" in str(caught.value)
+    assert finance_google._meta_cache == {}
 
 
 # ── MCP: сетки вкладок ──────────────────────────────────────────────────────

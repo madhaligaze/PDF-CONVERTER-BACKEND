@@ -15,15 +15,12 @@
 Почему чтение, а не правка книги
 ────────────────────────────────
 Права сервисного аккаунта — только чтение (`spreadsheets.readonly` в
-`app.webexcel.config`), и расширять их ради «Финансов» нельзя: тем же аккаунтом
-читает раздел «Таблицы», и его обещание «книгу не трогаем» — не мелочь. Поэтому
-правка живёт в учёте, а книга остаётся источником. Человеку это сказано прямо, а
-не спрятано в отказ при записи.
+`app.finance.google`). Правка живёт в учёте, а книга остаётся источником.
+Человеку это сказано прямо, а не спрятано в отказ при записи.
 
-Клиент Google взят готовый (`app.webexcel.google`) намеренно: у аккаунта одна
-квота на все разделы — 60 чтений в минуту, — и второй клиент со своим кэшем
-означал бы, что два раздела выбирают её друг у друга. Это уже случалось на
-дашборде и стоило часа, в котором «книга не читается» показывалось всем.
+Клиент Google свой (`app.finance.google`). Раньше он был общим с разделом
+«Таблицы», но «Таблицы» от сервисного аккаунта отказались, и делить квоту
+больше не с кем.
 """
 from __future__ import annotations
 
@@ -53,7 +50,7 @@ def _google() -> Any:
     кредов — а «нет кредов» обязано быть пустым экраном с объяснением, а не
     падением всего раздела на старте.
     """
-    import app.webexcel.google as google
+    import app.finance.google as google
 
     return google
 
@@ -61,10 +58,10 @@ def _google() -> Any:
 def is_configured() -> bool:
     """Есть ли у программы доступ к Google вообще."""
     try:
-        from app.webexcel.config import webexcel_settings
+        from app.finance.config import finance_settings
 
-        return bool(webexcel_settings.credentials_available)
-    except Exception:  # noqa: BLE001 — отсутствие модуля тоже «не настроено»
+        return bool(finance_settings.credentials_available)
+    except Exception:  # noqa: BLE001 — сломанные настройки тоже «не настроено»
         return False
 
 

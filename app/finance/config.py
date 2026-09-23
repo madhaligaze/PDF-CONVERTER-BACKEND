@@ -6,6 +6,10 @@
     FINANCE_IMPORT_MAX_ROWS   — потолок строк в одном импорте (20000)
     FINANCE_IMPORT_MAX_MB     — потолок размера файла (15)
     FINANCE_GRID_MAX_ROWS     — сколько операций отдаётся в табличный вид (10000)
+    FINANCE_SERVICE_ACCOUNT_JSON — креды Google для переноса книг в учёт: путь к
+                                JSON сервисного аккаунта или сам JSON. Пусто ⇒
+                                WEBEXCEL_SERVICE_ACCOUNT_JSON, потом
+                                BBC_SERVICE_ACCOUNT_JSON, потом bbc-sheets.json
 
 Про валюту компании
 ───────────────────
@@ -19,11 +23,15 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # backend/app/finance/config.py -> корень репозитория
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+
+#: Тот же файл, что по умолчанию читает дашборд BBC. Путь записан здесь, а не
+#: взят из `app.bbc.config`: раздел про BBC не знает (tests/test_finance_isolated.py).
+_DEFAULT_CREDENTIALS_PATH = str(_REPO_ROOT / "bbc-sheets.json")
 
 
 class FinanceSettings(BaseSettings):
@@ -40,10 +48,39 @@ class FinanceSettings(BaseSettings):
     import_max_rows: int = Field(default=20_000, ge=1)
     import_max_mb: int = Field(default=15, ge=1)
     grid_max_rows: int = Field(default=10_000, ge=1)
+    # Клиент Google жил в разделе «Таблицы», и раздел читал книги его кредами.
+    # «Таблицы» от сервисного аккаунта отказались, клиент переехал сюда — а
+    # переменные остались прежними, чтобы на проде перенос книг не замолчал.
+    service_account_json: str = Field(
+        default=_DEFAULT_CREDENTIALS_PATH,
+        validation_alias=AliasChoices(
+            "FINANCE_SERVICE_ACCOUNT_JSON",
+            "WEBEXCEL_SERVICE_ACCOUNT_JSON",
+            "BBC_SERVICE_ACCOUNT_JSON",
+        ),
+    )
 
     @property
     def import_max_bytes(self) -> int:
         return self.import_max_mb * 1024 * 1024
+
+    @property
+    def credentials_path(self) -> Path | None:
+        raw = (self.service_account_json or "").strip()
+        if not raw or raw.startswith("{"):
+            return None
+        path = Path(raw)
+        return path if path.is_absolute() else _REPO_ROOT / path
+
+    @property
+    def credentials_available(self) -> bool:
+        raw = (self.service_account_json or "").strip()
+        if not raw:
+            return False
+        if raw.startswith("{"):  # JSON целиком — так креды лежат на Railway
+            return True
+        path = self.credentials_path
+        return path is not None and path.is_file()
 
 
 @lru_cache

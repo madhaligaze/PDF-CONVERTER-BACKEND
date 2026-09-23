@@ -1,265 +1,192 @@
-"""HTTP-маршруты Web-Excel.
+"""HTTP-маршруты полки «Таблиц».
 
-Все обработчики объявлены обычным `def`, а не `async def`, и это не небрежность.
-Внутри — синхронный gspread, который на большой вкладке думает восемь секунд.
-В `async def` эти восемь секунд встали бы колом в цикле событий и подвесили бы
-заодно дашборд и анализатор; обычный `def` FastAPI уводит в пул потоков.
+Входа нет: раздел открыт всем, у кого есть адрес. Поэтому здесь нет ничего, кроме
+своих таблиц — ни чужих книг, ни сервисного аккаунта, — и у одной таблицы есть
+потолок размера (`WEBEXCEL_MAX_TABLE_MB`).
+
+Снимок книги ходит строкой и сервером не разбирается — почему, см. `models.py`.
+Список полки поднимает из базы только оглавление: снимки там не нужны, а у
+десятка больших таблиц они весят сотни мегабайт.
 """
 from __future__ import annotations
 
-import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
-from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse, Response
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.orm import load_only
 
 from app.webexcel.config import webexcel_settings
-from app.webexcel.google import (
-    WebExcelError,
-    cached_tab,
-    fetch_tab_grid,
-    invalidate_cache,
-    list_spreadsheets,
-    spreadsheet_meta,
-    values_of_ref,
-)
-from app.webexcel.univer import build_workbook, convert_tab
-
-log = logging.getLogger(__name__)
+from app.webexcel.db import webexcel_session
+from app.webexcel.models import ShelfTable
 
 router = APIRouter(prefix="/web-excel", tags=["web-excel"])
+
+SOURCES = ("blank", "google", "file")
+
+
+class SheetInfo(BaseModel):
+    name: str = Field(default="", max_length=200)
+    rows: int = Field(default=0, ge=0)
+    cols: int = Field(default=0, ge=0)
+
+
+class SaveTableRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=200)
+    source: str | None = Field(default=None, max_length=16)
+    source_ref: str | None = Field(default=None, max_length=500)
+    sheets: list[SheetInfo] | None = Field(default=None, max_length=500)
+    # `IWorkbookData`, сериализованный клиентом. Строкой — см. `models.py`.
+    snapshot: str | None = None
 
 
 def _guard() -> None:
     if not webexcel_settings.enabled:
         raise HTTPException(status_code=404, detail="Раздел «Таблицы» выключен")
-    if not webexcel_settings.credentials_available:
+
+
+def _checked_snapshot(raw: str) -> tuple[str, int]:
+    size = len(raw.encode("utf-8"))
+    if size > webexcel_settings.max_table_bytes:
+        mb = size / (1024 * 1024)
         raise HTTPException(
-            status_code=503,
-            detail="Не настроены креды Google — импорт из Sheets недоступен",
+            status_code=413,
+            detail=(
+                f"Таблица весит {mb:.1f} МБ — на полку помещается до "
+                f"{webexcel_settings.max_table_mb} МБ. Разделите её на две"
+            ),
         )
+    # Разбирать снимок ради проверки — ровно та цена, от которой строка и
+    # спасает. Первого знака достаточно, чтобы не положить на полку пустоту или
+    # текст ошибки вместо книги.
+    if not raw.lstrip().startswith("{"):
+        raise HTTPException(status_code=422, detail="Снимок таблицы повреждён")
+    return raw, size
 
 
-# ── Источники в Google ──────────────────────────────────────────────────────
+def _clean_name(name: str | None, fallback: str) -> str:
+    cleaned = (name or "").strip()
+    return cleaned[:200] or fallback
 
 
-@router.get("/sources")
-def get_sources() -> dict[str, Any]:
-    """Все книги Google, открытые сервисному аккаунту."""
-    _guard()
-    try:
-        return {"books": list_spreadsheets()}
-    except WebExcelError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-
-@router.get("/sources/{spreadsheet_id}")
-def get_source_meta(spreadsheet_id: str) -> dict[str, Any]:
-    """Название книги и её вкладки — без грида, один дешёвый запрос."""
-    _guard()
-    try:
-        return spreadsheet_meta(spreadsheet_id)
-    except WebExcelError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-
-@router.get("/sources/{spreadsheet_id}/tab")
-def get_source_tab(spreadsheet_id: str, title: str = Query(...)) -> Response:
-    """Одна вкладка как лист Univer — со всем оформлением.
-
-    Вкладка отдаётся по одной намеренно. Ответ Google с оформлением для «Журнала»
-    весит 46 МБ на вкладку; тянуть восемь вкладок разом означало бы держать
-    треть гигабайта в памяти контейнера ради одного открытия книги. По той же
-    причине в кэш кладутся готовые байты ответа, а не сырой грид — см.
-    `cached_tab`.
-    """
-    _guard()
-
-    def build(raw: dict[str, Any]) -> bytes:
-        # Справочники выпадающих списков разрешаются здесь: в разборе вкладки
-        # сети нет намеренно, иначе его нельзя было бы проверить без кредов.
-        converted = convert_tab(raw, lambda ref: values_of_ref(spreadsheet_id, ref))
-        payload = {
-            "spreadsheet_id": spreadsheet_id,
-            "spreadsheet_title": raw["spreadsheet_title"],
-            "sheet": converted["sheet"],
-            "styles": converted["styles"],
-            "stats": converted["stats"],
-            "fonts": converted["fonts"],
-            "checkboxes": converted["checkboxes"],
-            "lists": converted["lists"],
-        }
-        # Тот же рендер, которым FastAPI отдаёт возвращённый словарь, — байты
-        # ответа совпадают с прежними до последнего.
-        return JSONResponse(jsonable_encoder(payload)).body
-
-    try:
-        body = cached_tab(spreadsheet_id, title, build)
-    except WebExcelError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return Response(content=body, media_type="application/json")
-
-
-@router.post("/sources/refresh")
-def refresh_sources() -> dict[str, Any]:
-    """Сбросить кэш — по кнопке «Обновить из Google»."""
-    _guard()
-    invalidate_cache()
-    return {"ok": True}
-
-
-# ── Книги приложения ────────────────────────────────────────────────────────
-
-
-class SaveBookRequest(BaseModel):
-    name: str = Field(default="Без названия", max_length=200)
-    kind: str = Field(default="blank", max_length=16)
-    origin_spreadsheet_id: str = Field(default="", max_length=64)
-    origin_title: str = Field(default="", max_length=200)
-    origin_tabs: list[str] = Field(default_factory=list)
-    snapshot: dict[str, Any] = Field(default_factory=dict)
-    note: str = ""
-
-
-def _serialize(book: Any, with_snapshot: bool = False) -> dict[str, Any]:
-    payload = {
-        "id": book.id,
-        "name": book.name,
-        "kind": book.kind,
-        "origin_spreadsheet_id": book.origin_spreadsheet_id,
-        "origin_title": book.origin_title,
-        "origin_tabs": book.origin_tabs or [],
-        "note": book.note,
-        "created_at": book.created_at.isoformat() if book.created_at else None,
-        "updated_at": book.updated_at.isoformat() if book.updated_at else None,
+def _serialize(table: ShelfTable, *, with_snapshot: bool = False) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": table.id,
+        "name": table.name,
+        "source": table.source,
+        "source_ref": table.source_ref,
+        "sheets": table.sheets or [],
+        "size_bytes": table.size_bytes,
+        "created_at": table.created_at.isoformat() if table.created_at else None,
+        "updated_at": table.updated_at.isoformat() if table.updated_at else None,
     }
     if with_snapshot:
-        payload["snapshot"] = book.snapshot or {}
+        payload["snapshot"] = table.snapshot
     return payload
 
 
-@router.get("/books")
-def list_books() -> dict[str, Any]:
-    from sqlalchemy import select
+_SHELF_COLUMNS = (
+    ShelfTable.id,
+    ShelfTable.name,
+    ShelfTable.source,
+    ShelfTable.source_ref,
+    ShelfTable.sheets,
+    ShelfTable.size_bytes,
+    ShelfTable.created_at,
+    ShelfTable.updated_at,
+)
 
-    from app.webexcel.db import webexcel_session
-    from app.webexcel.models import WebExcelBook
 
+@router.get("/shelf")
+def list_shelf() -> dict[str, Any]:
+    _guard()
     with webexcel_session() as session:
         rows = session.scalars(
-            select(WebExcelBook).order_by(WebExcelBook.updated_at.desc())
+            select(ShelfTable)
+            .options(load_only(*_SHELF_COLUMNS))
+            .order_by(ShelfTable.updated_at.desc(), ShelfTable.id.desc())
         ).all()
-        return {"books": [_serialize(row) for row in rows]}
+        return {"tables": [_serialize(row) for row in rows]}
 
 
-@router.get("/books/{book_id}")
-def get_book(book_id: int) -> dict[str, Any]:
-    from app.webexcel.db import webexcel_session
-    from app.webexcel.models import WebExcelBook
-
-    with webexcel_session() as session:
-        book = session.get(WebExcelBook, book_id)
-        if book is None:
-            raise HTTPException(status_code=404, detail="Книга не найдена")
-        return _serialize(book, with_snapshot=True)
-
-
-@router.post("/books")
-def create_book(request: SaveBookRequest) -> dict[str, Any]:
-    from app.webexcel.db import webexcel_session
-    from app.webexcel.models import WebExcelBook
-
-    with webexcel_session() as session:
-        book = WebExcelBook(
-            name=request.name.strip() or "Без названия",
-            kind=request.kind,
-            origin_spreadsheet_id=request.origin_spreadsheet_id,
-            origin_title=request.origin_title,
-            origin_tabs=request.origin_tabs,
-            snapshot=request.snapshot,
-            note=request.note,
-        )
-        session.add(book)
-        session.flush()
-        return _serialize(book)
-
-
-@router.put("/books/{book_id}")
-def update_book(book_id: int, request: SaveBookRequest) -> dict[str, Any]:
-    from app.webexcel.db import webexcel_session
-    from app.webexcel.models import WebExcelBook
-
-    with webexcel_session() as session:
-        book = session.get(WebExcelBook, book_id)
-        if book is None:
-            raise HTTPException(status_code=404, detail="Книга не найдена")
-        book.name = request.name.strip() or book.name
-        if request.snapshot:
-            book.snapshot = request.snapshot
-        if request.note:
-            book.note = request.note
-        session.flush()
-        return _serialize(book)
-
-
-@router.delete("/books/{book_id}")
-def delete_book(book_id: int) -> dict[str, Any]:
-    from app.webexcel.db import webexcel_session
-    from app.webexcel.models import WebExcelBook
-
-    with webexcel_session() as session:
-        book = session.get(WebExcelBook, book_id)
-        if book is None:
-            raise HTTPException(status_code=404, detail="Книга не найдена")
-        session.delete(book)
-        return {"ok": True}
-
-
-# ── Импорт целиком ──────────────────────────────────────────────────────────
-
-
-class ImportRequest(BaseModel):
-    spreadsheet_id: str
-    tabs: list[str] = Field(default_factory=list)
-    name: str = ""
-
-
-@router.post("/import")
-def import_book(request: ImportRequest) -> dict[str, Any]:
-    """Импорт выбранных вкладок книги Google одним снимком Univer.
-
-    Вкладки тянутся последовательно, а не параллельно: квота Google — 60 чтений
-    в минуту на весь сервисный аккаунт, и этот же аккаунт обслуживает дашборд.
-    Четыре параллельных импорта выели бы её за секунды и уронили бы дебиторку
-    у всех остальных.
-
-    **Фронт этим маршрутом не пользуется и пользоваться не должен.** Он ходит
-    повкладочно в `/sources/{id}/tab` и собирает книгу у себя, потому что здесь
-    есть потолок, которого не видно из кода: одна вкладка «Журнала» читается
-    восемь секунд, у «Осн.Общей сводки» вкладок 23, а прокси Next рвёт запрос
-    на 180 секундах. Маршрут оставлен для скриптов и разовых выгрузок, где
-    вкладок немного.
-    """
+@router.get("/shelf/{table_id}")
+def get_table(table_id: int) -> dict[str, Any]:
     _guard()
-    try:
-        meta = spreadsheet_meta(request.spreadsheet_id)
-        wanted = request.tabs or [t["title"] for t in meta["tabs"] if not t["hidden"]][:1]
-        converted = [convert_tab(fetch_tab_grid(request.spreadsheet_id, title)) for title in wanted]
-    except WebExcelError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    with webexcel_session() as session:
+        table = session.get(ShelfTable, table_id)
+        if table is None:
+            raise HTTPException(status_code=404, detail="Таблицы на полке больше нет")
+        return _serialize(table, with_snapshot=True)
 
-    workbook = build_workbook(request.spreadsheet_id, request.name or meta["title"], converted)
-    stats = workbook.pop("_stats", [])
-    fonts = workbook.pop("_fonts", [])
-    return {
-        "workbook": workbook,
-        "stats": stats,
-        "fonts": fonts,
-        "tabs": wanted,
-        "title": meta["title"],
-    }
+
+@router.post("/shelf")
+def create_table(request: SaveTableRequest) -> dict[str, Any]:
+    _guard()
+    snapshot, size = _checked_snapshot(request.snapshot or "")
+    source = request.source if request.source in SOURCES else "blank"
+    with webexcel_session() as session:
+        table = ShelfTable(
+            name=_clean_name(request.name, "Новая таблица"),
+            source=source,
+            source_ref=(request.source_ref or "")[:500],
+            sheets=[sheet.model_dump() for sheet in request.sheets or []],
+            snapshot=snapshot,
+            size_bytes=size,
+        )
+        session.add(table)
+        session.flush()
+        return _serialize(table)
+
+
+@router.put("/shelf/{table_id}")
+def update_table(table_id: int, request: SaveTableRequest) -> dict[str, Any]:
+    """Сохранить таблицу или переименовать её: поля, которых нет в запросе, не трогаются."""
+    _guard()
+    checked = _checked_snapshot(request.snapshot) if request.snapshot is not None else None
+    with webexcel_session() as session:
+        table = session.get(ShelfTable, table_id)
+        if table is None:
+            raise HTTPException(status_code=404, detail="Таблицы на полке больше нет")
+        if request.name is not None:
+            table.name = _clean_name(request.name, table.name)
+        if request.sheets is not None:
+            table.sheets = [sheet.model_dump() for sheet in request.sheets]
+        if checked is not None:
+            table.snapshot, table.size_bytes = checked
+        session.flush()
+        return _serialize(table)
+
+
+@router.post("/shelf/{table_id}/copy")
+def copy_table(table_id: int) -> dict[str, Any]:
+    _guard()
+    with webexcel_session() as session:
+        original = session.get(ShelfTable, table_id)
+        if original is None:
+            raise HTTPException(status_code=404, detail="Таблицы на полке больше нет")
+        copy = ShelfTable(
+            name=_clean_name(f"{original.name} (копия)", original.name),
+            source=original.source,
+            source_ref=original.source_ref,
+            sheets=list(original.sheets or []),
+            snapshot=original.snapshot,
+            size_bytes=original.size_bytes,
+        )
+        session.add(copy)
+        session.flush()
+        return _serialize(copy)
+
+
+@router.delete("/shelf/{table_id}")
+def delete_table(table_id: int) -> dict[str, Any]:
+    _guard()
+    with webexcel_session() as session:
+        table = session.get(ShelfTable, table_id)
+        if table is None:
+            raise HTTPException(status_code=404, detail="Таблицы на полке больше нет")
+        session.delete(table)
+        return {"ok": True}
 
 
 __all__ = ["router"]
