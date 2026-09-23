@@ -5,7 +5,7 @@ number of open tabs. Here one background loop reads Sheets on a fixed interval a
 keeps an in-memory snapshot; clients only ask for a `revision` integer, which is
 served from memory without touching Google at all.
 
-    Google Sheets ──full read──▶ background loop (15 s)
+    Google Sheets ──full read──▶ background loop (15 s, only while watched)
                                    │ content hash moved? → rebuild, revision++
                                    ▼
                             in-memory snapshot + revision
@@ -18,8 +18,14 @@ Worst case latency is one backend interval plus one client interval, ≈20 s.
 the live sheet, `modifiedTime` did not move for over 75 seconds after an edit that
 the Sheets API already returned within 3 seconds. Drive updates that field lazily
 for Sheets, so gating on it silently stretched the promised 10–20 s into minutes.
-The read itself costs one API call and under a second, which at a 15 s interval is
-4 calls/min against a 60/min per-user quota — cheap enough that correctness wins.
+The read itself costs one API call (the opened tab is kept, see `sheets.read_values`)
+and under a second, which at a 15 s interval is 4 calls/min against a 60/min
+per-user quota — cheap enough that correctness wins.
+
+**Только пока смотрят.** Раньше цикл читал лист круглые сутки, и ночью, и в
+выходные, когда дашборд не открыт ни у кого: ~17 тысяч обращений к Google в сутки
+ради снимка, который никто не спросит. Теперь проход без зрителя ничего не читает
+(`watched`), а первый взгляд после простоя будит цикл сразу (`note_demand`).
 
 A snapshot is persisted to `bbc.sheet_snapshots` only when the content hash
 actually changes, so the change history costs almost nothing.
@@ -28,11 +34,14 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 from app.bbc import sheets
+from app.bbc.config import bbc_settings
 from app.bbc.dataset import (
     ContractRow,
     collect_dimensions,
@@ -83,11 +92,50 @@ _snapshot = Snapshot()
 _read_lock = threading.Lock()
 # Outcome of the read that is currently finishing — handed to whoever waited.
 _last_outcome = False
+# Отказ последнего чтения (None — прочитали). По нему цикл решает, отступать ли:
+# `refresh` исключений наружу не пускает, и без этого признака отступ при 429
+# был мёртвым кодом — цикл ходил в Google с прежней частотой.
+_last_error: str | None = None
+
+# Когда данные кто-то спрашивал в последний раз (`time.monotonic()`).
+_last_demand: float | None = None
+# Чем будить фоновый цикл на первом взгляде после простоя. Ставит main.py.
+_waker: Callable[[], None] | None = None
 
 
 def get_snapshot() -> Snapshot:
     with _lock:
         return _snapshot
+
+
+def set_waker(callback: Callable[[], None] | None) -> None:
+    global _waker
+    _waker = callback
+
+
+def watched(now: float | None = None) -> bool:
+    """Смотрит ли дашборд кто-нибудь. Без зрителя цикл в Google не ходит."""
+    window = bbc_settings.idle_after_seconds
+    if window <= 0:
+        return True
+    if _last_demand is None:
+        return False
+    return (time.monotonic() if now is None else now) - _last_demand < window
+
+
+def note_demand() -> None:
+    """Данные кому-то понадобились.
+
+    Первый спрос после простоя будит цикл сразу, а не через интервал: иначе
+    человек, открывший дашборд утром, до 15 секунд смотрел бы на вечерние цифры.
+    Дальше опросы только продлевают окно — будить на каждом незачем.
+    """
+    global _last_demand
+    now = time.monotonic()
+    was_idle = not watched(now)
+    _last_demand = now
+    if was_idle and _waker is not None:
+        _waker()
 
 
 def revision_payload(*, with_counts: bool = False) -> dict[str, Any]:
@@ -97,6 +145,7 @@ def revision_payload(*, with_counts: bool = False) -> dict[str, Any]:
     всему листу, области видимости они не знают, и в ответе, который получает
     ссылка одного отдела, они рассказывают, сколько строк в книге всего.
     """
+    note_demand()
     snapshot = get_snapshot()
     payload: dict[str, Any] = {
         "revision": snapshot.revision,
@@ -187,6 +236,7 @@ def refresh(*, force: bool = False) -> bool:
 
 def _read_sources(*, force: bool) -> bool:
     """The read itself. Never call directly — `refresh()` owns the lock."""
+    global _last_error
     started = datetime.now(UTC)
     changed: list[str] = []
     error: str | None = None
@@ -201,6 +251,12 @@ def _read_sources(*, force: bool) -> bool:
         grid = sheets.read_source(sheets.SOURCE_MASTER)
         digest = content_hash(grid)
         if digest == state.content_hash and not force:
+            # Google снова отвечает — ошибку снимаем. Раньше ранний выход её не
+            # трогал, и баннер «Google ограничил чтение» висел над дашбордом до
+            # следующей правки листа, хотя чтение давно шло.
+            if state.error is not None:
+                with _lock:
+                    state.error = None
             return False
 
         parsed, layout = parse_dataset(grid)
@@ -248,6 +304,7 @@ def _read_sources(*, force: bool) -> bool:
         log.exception("BBC: unexpected refresh failure")
         return False
     finally:
+        _last_error = error
         if changed or error:
             _record_run(started, changed, error)
 
@@ -258,8 +315,20 @@ def _mark_error(source: str, message: str) -> None:
         state.error = message
 
 
+def background_pass() -> bool:
+    """Один проход фонового цикла. False — Google отказал, циклу пора отступить.
+
+    Без зрителя прохода нет вовсе: ни обращения к Google, ни разбора ответа.
+    """
+    if not watched():
+        return True
+    refresh()
+    return _last_error is None
+
+
 def ensure_loaded() -> Snapshot:
     """Load on first use, so an API call never waits for the background loop."""
+    note_demand()
     if not get_snapshot().rows:
         refresh(force=True)
     return get_snapshot()
@@ -268,8 +337,12 @@ def ensure_loaded() -> Snapshot:
 __all__ = [
     "Snapshot",
     "SourceState",
+    "background_pass",
     "ensure_loaded",
     "get_snapshot",
+    "note_demand",
     "refresh",
     "revision_payload",
+    "set_waker",
+    "watched",
 ]

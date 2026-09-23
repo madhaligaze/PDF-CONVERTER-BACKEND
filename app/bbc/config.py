@@ -95,6 +95,15 @@ class BbcSettings(BaseSettings):
         default=15.0,
         validation_alias=AliasChoices("BBC_POLL_INTERVAL_SECONDS"),
     )
+    # Сколько секунд после последнего обращения дашборд считается открытым. Пока
+    # его никто не смотрит, цикл в Google не ходит: раньше он читал мастер-лист
+    # каждые 15 секунд круглые сутки — ночью, в выходные — и держал занятой пятую
+    # часть общей квоты чтений. Открытый дашборд спрашивает `/revision` раз в
+    # 5 секунд, так что две минуты — с большим запасом. 0 — читать всегда.
+    idle_after_seconds: float = Field(
+        default=120.0,
+        validation_alias=AliasChoices("BBC_IDLE_AFTER_SECONDS"),
+    )
 
     # ── Access ───────────────────────────────────────────────────────────────────
     # Base for generated referral links; empty = derive from the incoming request.

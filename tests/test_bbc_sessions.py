@@ -234,6 +234,34 @@ def test_a_fresh_session_is_not_rewritten_on_every_request(admin: AuthedUser) ->
         assert session.scalars(select(BbcUserSession)).one().expires_at == was
 
 
+def test_a_poll_does_not_rewrite_last_seen_every_time(admin: AuthedUser) -> None:
+    """То же для `last_seen_at`. `expires_at` писался раз в полокна, а отметка
+    последнего обращения — на каждый опрос: дашборд спрашивает `/revision` раз в
+    5 секунд с каждой открытой вкладки, и каждый вопрос был UPDATE + COMMIT."""
+    token = login("admin", PASSWORD, user_agent=CHROME)
+    assert resolve_session(token) is not None
+    with bbc_session() as session:
+        first = session.scalars(select(BbcUserSession)).one().last_seen_at
+
+    assert resolve_session(token) is not None
+    with bbc_session() as session:
+        assert session.scalars(select(BbcUserSession)).one().last_seen_at == first
+
+
+def test_last_seen_still_moves_for_someone_who_keeps_working(admin: AuthedUser) -> None:
+    """Кабинет показывает последнее обращение — оно живёт, просто не посекундно."""
+    token = login("admin", PASSWORD, user_agent=CHROME)
+    resolve_session(token)
+    long_ago = datetime.now(UTC) - timedelta(minutes=5)
+    with bbc_session() as session:
+        session.scalars(select(BbcUserSession)).one().last_seen_at = long_ago
+
+    assert resolve_session(token) is not None
+    with bbc_session() as session:
+        seen = session.scalars(select(BbcUserSession)).one().last_seen_at
+    assert seen.replace(tzinfo=UTC) > long_ago
+
+
 def test_an_expired_session_is_not_revived_by_sliding(admin: AuthedUser) -> None:
     """Продление — для живых. Просроченную сессию оно обязано не воскрешать."""
     token = login("admin", PASSWORD, user_agent=CHROME)

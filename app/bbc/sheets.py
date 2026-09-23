@@ -136,6 +136,15 @@ def list_worksheets(spreadsheet_id: str | None = None) -> list[dict[str, Any]]:
     ]
 
 
+#: Сколько держать открытую вкладку. Открытие в gspread — два запроса метаданных
+#: (таблица целиком, потом поиск вкладки), и повторялось оно на каждом чтении:
+#: проход фонового цикла стоил три обращения к Google вместо одного. Срок — чтобы
+#: переставленные вкладки («первый лист») находились заново сами.
+TAB_HANDLE_TTL_SECONDS = 600.0
+
+_handles: dict[tuple[str, str], tuple[float, gspread.Worksheet]] = {}
+
+
 def read_values(name: str | None = None, spreadsheet_id: str | None = None) -> list[list[str]]:
     """Raw grid (list of rows) of the worksheet, exactly as displayed.
 
@@ -144,11 +153,28 @@ def read_values(name: str | None = None, spreadsheet_id: str | None = None) -> l
     прилетает 429 по квоте, и раньше он летел наружу голым APIError: мимо
     обработчика в маршруте (502 с понятным текстом превращалось в 500) и мимо
     человеческой формулировки.
+
+    Открытая вкладка запоминается (`TAB_HANDLE_TTL_SECONDS`), и повторное чтение —
+    одно обращение к Google. Вкладка читается по названию, так что правки листа
+    видны сразу. Отказ чтения забывает вкладку: если её переименовали, следующее
+    чтение ищет заново и честно говорит «лист не найден».
     """
-    worksheet = open_worksheet(name, spreadsheet_id)
+    key = (spreadsheet_id or "", name or "")
+    now = time.monotonic()
+    with _cache_lock:
+        hit = _handles.get(key)
+    if hit is not None and now - hit[0] < TAB_HANDLE_TTL_SECONDS:
+        worksheet = hit[1]
+    else:
+        worksheet = open_worksheet(name, spreadsheet_id)
+        with _cache_lock:
+            _drop_stale(_handles, now, TAB_HANDLE_TTL_SECONDS)
+            _handles[key] = (now, worksheet)
     try:
         return worksheet.get_all_values()
     except Exception as exc:  # noqa: BLE001 — gspread raises many types
+        with _cache_lock:
+            _handles.pop(key, None)
         raise BbcError(humanize(exc)) from exc
 
 
@@ -249,6 +275,7 @@ def invalidate_read_cache() -> None:
     with _cache_lock:
         _cache.clear()
         _tabs_cache.clear()
+        _handles.clear()
 
 
 def write_cells(

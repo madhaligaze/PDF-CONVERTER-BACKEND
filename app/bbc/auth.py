@@ -347,6 +347,11 @@ def _trim_sessions(session: Session, user_id: int, *, keep: str) -> int:
     return len(doomed)
 
 
+#: Как часто сдвигать отметку последнего обращения. Кабинет показывает её с
+#: точностью до минут, а опрос дашборда идёт раз в 5 секунд.
+LAST_SEEN_STEP = timedelta(minutes=1)
+
+
 def session_window() -> timedelta:
     """Сколько сессия живёт без обращений.
 
@@ -368,6 +373,11 @@ def resolve_session(token: str | None) -> AuthedUser | None:
     Продление пишется в базу не на каждый запрос, а когда израсходована
     половина окна. Иначе каждый опрос дашборда — а он опрашивает сам —
     превращался бы в запись в таблицу сессий.
+
+    То же для отметки последнего обращения: она сдвигается не чаще
+    `LAST_SEEN_STEP`. Раньше она писалась на каждый опрос, и запись в таблицу
+    сессий, от которой уберегли `expires_at`, всё равно шла раз в 5 секунд с
+    каждой открытой вкладки.
     """
     if not token:
         return None
@@ -386,7 +396,9 @@ def resolve_session(token: str | None) -> AuthedUser | None:
         if user is None or not user.is_active:
             return None
 
-        record.last_seen_at = now
+        seen = _aware(record.last_seen_at)
+        if seen is None or now - seen >= LAST_SEEN_STEP:
+            record.last_seen_at = now
         if _left(record.expires_at, now) < window / 2:
             record.expires_at = now + window
         return _snapshot(user)

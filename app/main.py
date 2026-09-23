@@ -124,8 +124,9 @@ async def _bbc_refresh_loop() -> None:
     """Background live refresh of the BBC dashboard. Removable module.
 
     The backend — not the browsers — polls Google, so the request count stays
-    constant no matter how many tabs are open. Each pass first checks Drive's
-    `modifiedTime` and only re-reads the sheet when it actually moved.
+    constant no matter how many tabs are open. A pass re-reads the sheet and
+    rebuilds only when the content hash moved — and reads nothing at all while
+    nobody has the dashboard open (see `live.watched`).
     """
     from app.bbc import live
     from app.bbc.config import bbc_settings
@@ -136,32 +137,56 @@ async def _bbc_refresh_loop() -> None:
     max_backoff = 300.0
     delay = interval
 
+    # Первый взгляд на дашборд после простоя будит цикл сразу, не дожидаясь
+    # интервала. Зовётся из потока запроса — отсюда call_soon_threadsafe.
+    loop = asyncio.get_running_loop()
+    wake = asyncio.Event()
+
+    def wake_up() -> None:
+        # Во время отступа не будим: отступ бережёт квоту, и зритель её не вернёт.
+        if delay <= interval:
+            loop.call_soon_threadsafe(wake.set)
+
+    live.set_waker(wake_up)
+
     # Warm the snapshot once so the first request is served from memory.
     try:
         await asyncio.to_thread(live.refresh, force=True)
     except Exception as exc:  # noqa: BLE001
         log.warning("BBC: initial refresh failed: %s", exc)
 
-    while True:
-        await asyncio.sleep(delay)
-        try:
-            # gspread/httpx are blocking — keep them off the event loop.
-            await asyncio.to_thread(live.refresh)
-            delay = interval
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 — best-effort poll, never fatal
+    try:
+        while True:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(wake.wait(), timeout=delay)
+            wake.clear()
+            try:
+                # gspread/httpx are blocking — keep them off the event loop.
+                ok = await asyncio.to_thread(live.background_pass)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — best-effort poll, never fatal
+                log.warning("BBC: live refresh crashed (%s)", exc)
+                ok = False
+
+            if ok:
+                delay = interval
+                continue
             # Отступ при отказе, и в первую очередь при 429.
             #
             # Раньше цикл продолжал ходить каждые 15 секунд, что бы Google ни
             # отвечал. На исчерпанной квоте это значило, что цикл сам же её и
             # держал исчерпанной: минута не успевала «остыть», потому что в неё
-            # снова прилетали четыре запроса. Выход из состояния зависел от
-            # того, перестанут ли люди пользоваться дашбордом.
+            # снова прилетали запросы. Выход из состояния зависел от того,
+            # перестанут ли люди пользоваться дашбордом.
+            #
+            # И долго отступ только выглядел работающим: `refresh()` отказы
+            # глотает, ветка с исключением не срабатывала никогда. Теперь отказ
+            # приходит признаком из `background_pass`.
             delay = min(max_backoff, max(delay, interval) * 2)
-            log.warning(
-                "BBC: live refresh failed (%s), следующая попытка через %.0f с", exc, delay
-            )
+            log.warning("BBC: Google отказал, следующая попытка через %.0f с", delay)
+    finally:
+        live.set_waker(None)
 
 
 @asynccontextmanager
