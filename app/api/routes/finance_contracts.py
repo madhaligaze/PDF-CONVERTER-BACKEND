@@ -106,11 +106,14 @@ def get_schema(member: Member = Depends(contract_member)) -> dict[str, Any]:
 
 
 @router.get("")
-def list_contracts(member: Member = Depends(contract_member)) -> dict[str, Any]:
+def list_contracts(member: Member = Depends(contract_member)) -> Response:
+    """Весь реестр готовыми байтами: одна сборка на одинаковые запросы, без
+    обхода 13 МБ словарей `jsonable_encoder` (см. `service.list_all_bytes`)."""
     access = _access(member)
     with finance_session() as session:
         workspace = _workspace(session, member)
-        return service.list_all(session, workspace, access)
+        body = service.list_all_bytes(session, workspace, access)
+    return Response(content=body, media_type="application/json")
 
 
 @router.get("/changes")

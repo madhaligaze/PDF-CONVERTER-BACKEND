@@ -22,12 +22,15 @@
 from __future__ import annotations
 
 import re
+import threading
+import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable, Sequence
 
+import orjson
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
@@ -1023,13 +1026,22 @@ def _live_contracts(session: Session, workspace_id: uuid.UUID):
     )
 
 
-def list_all(session: Session, workspace: Workspace, access: Access) -> dict[str, Any]:
+def list_all(
+    session: Session,
+    workspace: Workspace,
+    access: Access,
+    *,
+    seq_now: int | None = None,
+    schema_now: int | None = None,
+) -> dict[str, Any]:
     # Номер — до выборки строк, не после: правка, закоммиченная между ними,
     # иначе попала бы под курсор и не пришла бы клиенту ни здесь, ни опросом.
     # Счётчик держит блокировку до коммита, поэтому всё с номером ≤ seq_now
     # уже видно следующему чтению.
-    seq_now = current(session, workspace.id, "contracts")
-    schema_now = current(session, workspace.id, "schema")
+    if seq_now is None:
+        seq_now = current(session, workspace.id, "contracts")
+    if schema_now is None:
+        schema_now = current(session, workspace.id, "schema")
     registry = Registry(session, workspace)
     contracts = list(session.scalars(_live_contracts(session, workspace.id)))
     numbers = NumberIndex()
@@ -1044,6 +1056,65 @@ def list_all(session: Session, workspace: Workspace, access: Access) -> dict[str
         "seq": seq_now,
         "schema_rev": schema_now,
     }
+
+
+#: Готовые ответы «весь реестр» — байтами, общие для одинаковых прав.
+#:
+#: «Утро понедельника»: 20 человек открывают реестр на 10 477 договоров
+#: разом. Сборка — около 5 с чистого Python на запрос, и двадцать одинаковых
+#: сборок толкались за GIL: медиана ответа 47 с, пятеро получили 500, память
+#: 240 → 978 МБ (стресс-прогон 24.09). Ответ зависит только от компании,
+#: номера изменений, номера схемы и прав — одинаковые запросы ждут одну
+#: сборку и берут готовые байты.
+#:
+#: Держится недолго (`LIST_CACHE_TTL`): переименование стороны или
+#: сотрудника номер договоров не двигает, и старое имя не должно жить
+#: дольше минуты. На компанию и набор прав — одна запись, всего не больше
+#: `LIST_CACHE_MAX`: 13 МБ на запись у реестра в 10 000 договоров.
+LIST_CACHE_TTL = 60.0
+LIST_CACHE_MAX = 4
+_list_cache: dict[tuple[Any, ...], tuple[bytes, float]] = {}
+_list_building: dict[tuple[Any, ...], threading.Lock] = {}
+_list_guard = threading.Lock()
+
+
+def _json_default(value: Any) -> Any:
+    plain = _plain(value)
+    if plain is value:
+        raise TypeError(f"не JSON: {type(value).__name__}")
+    return plain
+
+
+def list_all_bytes(session: Session, workspace: Workspace, access: Access) -> bytes:
+    """Весь реестр готовым JSON — одна сборка на одинаковые запросы."""
+    seq_now = current(session, workspace.id, "contracts")
+    schema_now = current(session, workspace.id, "schema")
+    # Сотрудник нужен ключу только при области «где ответственный»: иначе
+    # люди с одинаковыми правами не делили бы сборку.
+    who = access if access.rows == "own" else replace(access, employee_id=None)
+    key = (workspace.id, seq_now, schema_now, who)
+    now = time.monotonic()
+    with _list_guard:
+        hit = _list_cache.get(key)
+        if hit is not None and now - hit[1] < LIST_CACHE_TTL:
+            return hit[0]
+        building = _list_building.setdefault(key, threading.Lock())
+    with building:
+        with _list_guard:
+            hit = _list_cache.get(key)
+            if hit is not None and time.monotonic() - hit[1] < LIST_CACHE_TTL:
+                return hit[0]
+        payload = list_all(session, workspace, access, seq_now=seq_now, schema_now=schema_now)
+        body = orjson.dumps(payload, default=_json_default)
+        del payload
+        with _list_guard:
+            for old in [k for k in _list_cache if k[0] == key[0] and k[3] == key[3]]:
+                del _list_cache[old]
+            _list_cache[key] = (body, time.monotonic())
+            while len(_list_cache) > LIST_CACHE_MAX:
+                _list_cache.pop(next(iter(_list_cache)))
+            _list_building.pop(key, None)
+        return body
 
 
 def changes(session: Session, workspace: Workspace, access: Access, since: int) -> dict[str, Any]:
