@@ -1073,9 +1073,61 @@ def list_all(
 #: `LIST_CACHE_MAX`: 13 МБ на запись у реестра в 10 000 договоров.
 LIST_CACHE_TTL = 60.0
 LIST_CACHE_MAX = 4
-_list_cache: dict[tuple[Any, ...], tuple[bytes, float]] = {}
-_list_building: dict[tuple[Any, ...], threading.Lock] = {}
-_list_guard = threading.Lock()
+
+
+class SharedBuild:
+    """Одна сборка на одинаковые запросы; готовые байты держатся недолго.
+
+    Первый запрос с ключом собирает ответ, остальные с тем же ключом ждут его
+    и берут готовое — вместо того чтобы собирать то же самое параллельно и
+    толкаться за GIL. `slot` — какие записи вытесняет новая (у списка —
+    прежние номера той же компании и тех же прав).
+    """
+
+    def __init__(self, ttl: float, limit: int, slot: Any = None):
+        self.ttl, self.limit, self.slot = ttl, limit, slot
+        self._done: dict[tuple[Any, ...], tuple[bytes, float]] = {}
+        self._building: dict[tuple[Any, ...], threading.Lock] = {}
+        self._guard = threading.Lock()
+
+    def _fresh(self, key: tuple[Any, ...]) -> bytes | None:
+        hit = self._done.get(key)
+        if hit is not None and time.monotonic() - hit[1] < self.ttl:
+            return hit[0]
+        return None
+
+    def get(self, key: tuple[Any, ...], build: Any) -> bytes:
+        with self._guard:
+            body = self._fresh(key)
+            if body is not None:
+                return body
+            building = self._building.setdefault(key, threading.Lock())
+        with building:
+            with self._guard:
+                body = self._fresh(key)
+                if body is not None:
+                    return body
+            body = build()
+            with self._guard:
+                if self.slot is not None:
+                    mine = self.slot(key)
+                    for old in [k for k in self._done if self.slot(k) == mine]:
+                        del self._done[old]
+                self._done[key] = (body, time.monotonic())
+                while len(self._done) > self.limit:
+                    self._done.pop(next(iter(self._done)))
+                self._building.pop(key, None)
+            return body
+
+
+_list_builds = SharedBuild(LIST_CACHE_TTL, LIST_CACHE_MAX, slot=lambda key: (key[0], key[3]))
+
+#: Опрос: 50 вкладок после каждой правки приходят с одним и тем же курсором и
+#: собирали один и тот же ответ 50 раз (стресс-прогон 24.09: пустой опрос под
+#: нагрузкой ждал 0,5 с в очереди за GIL, правка — 0,84 с). Ответ на пару
+#: (since, seq_now) одинаков для одинаковых прав: строки, закоммиченные после
+#: seq_now, придут следующим опросом — курсор ответа и есть seq_now.
+_change_builds = SharedBuild(10.0, 256)
 
 
 def _json_default(value: Any) -> Any:
@@ -1085,47 +1137,59 @@ def _json_default(value: Any) -> Any:
     return plain
 
 
+def _dump(payload: Any) -> bytes:
+    return orjson.dumps(payload, default=_json_default)
+
+
+def _who(access: Access) -> Access:
+    """Права как ключ общей сборки. Сотрудник нужен только при области «где
+    ответственный»: иначе люди с одинаковыми правами не делили бы сборку."""
+    return access if access.rows == "own" else replace(access, employee_id=None)
+
+
 def list_all_bytes(session: Session, workspace: Workspace, access: Access) -> bytes:
     """Весь реестр готовым JSON — одна сборка на одинаковые запросы."""
     seq_now = current(session, workspace.id, "contracts")
     schema_now = current(session, workspace.id, "schema")
-    # Сотрудник нужен ключу только при области «где ответственный»: иначе
-    # люди с одинаковыми правами не делили бы сборку.
-    who = access if access.rows == "own" else replace(access, employee_id=None)
-    key = (workspace.id, seq_now, schema_now, who)
-    now = time.monotonic()
-    with _list_guard:
-        hit = _list_cache.get(key)
-        if hit is not None and now - hit[1] < LIST_CACHE_TTL:
-            return hit[0]
-        building = _list_building.setdefault(key, threading.Lock())
-    with building:
-        with _list_guard:
-            hit = _list_cache.get(key)
-            if hit is not None and time.monotonic() - hit[1] < LIST_CACHE_TTL:
-                return hit[0]
-        payload = list_all(session, workspace, access, seq_now=seq_now, schema_now=schema_now)
-        body = orjson.dumps(payload, default=_json_default)
-        del payload
-        with _list_guard:
-            for old in [k for k in _list_cache if k[0] == key[0] and k[3] == key[3]]:
-                del _list_cache[old]
-            _list_cache[key] = (body, time.monotonic())
-            while len(_list_cache) > LIST_CACHE_MAX:
-                _list_cache.pop(next(iter(_list_cache)))
-            _list_building.pop(key, None)
-        return body
+    key = (workspace.id, seq_now, schema_now, _who(access))
+    return _list_builds.get(
+        key, lambda: _dump(list_all(session, workspace, access, seq_now=seq_now, schema_now=schema_now))
+    )
 
 
-def changes(session: Session, workspace: Workspace, access: Access, since: int) -> dict[str, Any]:
+def changes_bytes(session: Session, workspace: Workspace, access: Access, since: int) -> bytes:
+    """Опрос готовым JSON: пустой — сразу, с изменениями — одна сборка на курсор."""
+    seq_now = current(session, workspace.id, "contracts")
+    schema_now = current(session, workspace.id, "schema")
+    if seq_now <= since:
+        return _dump(
+            {"contracts": [], "removed": [], "parties": {}, "people": {}, "seq": seq_now, "schema_rev": schema_now}
+        )
+    key = (workspace.id, since, seq_now, schema_now, _who(access))
+    return _change_builds.get(
+        key, lambda: _dump(changes(session, workspace, access, since, seq_now=seq_now, schema_now=schema_now))
+    )
+
+
+def changes(
+    session: Session,
+    workspace: Workspace,
+    access: Access,
+    since: int,
+    *,
+    seq_now: int | None = None,
+    schema_now: int | None = None,
+) -> dict[str, Any]:
     """Договоры, изменённые после `since`, — вместе с их сторонами и людьми.
 
     Опрос идёт раз в две секунды от каждой открытой вкладки, и почти всегда
     ответ «ничего не менялось». Поэтому сначала два дешёвых чтения счётчиков,
     и только если номер сдвинулся — сборка справочников и договоров.
     """
-    seq_now = current(session, workspace.id, "contracts")
-    schema_now = current(session, workspace.id, "schema")
+    if seq_now is None:
+        seq_now = current(session, workspace.id, "contracts")
+    if schema_now is None:
+        schema_now = current(session, workspace.id, "schema")
     if seq_now <= since:
         return {
             "contracts": [],

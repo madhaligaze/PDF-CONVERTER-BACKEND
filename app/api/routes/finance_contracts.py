@@ -117,11 +117,14 @@ def list_contracts(member: Member = Depends(contract_member)) -> Response:
 
 
 @router.get("/changes")
-def get_changes(since: int = Query(0, ge=0), member: Member = Depends(contract_member)) -> dict[str, Any]:
+def get_changes(since: int = Query(0, ge=0), member: Member = Depends(contract_member)) -> Response:
+    """Опрос раз в 2 с из каждой вкладки: одна сборка на курсор (см.
+    `service.changes_bytes`), готовые байты без `jsonable_encoder`."""
     access = _access(member)
     with finance_session() as session:
         workspace = _workspace(session, member)
-        return service.changes(session, workspace, access, since)
+        body = service.changes_bytes(session, workspace, access, since)
+    return Response(content=body, media_type="application/json")
 
 
 @router.get("/export.xlsx")
