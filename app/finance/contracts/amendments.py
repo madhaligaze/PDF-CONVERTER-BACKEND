@@ -193,7 +193,7 @@ def confirm(
     if not access.edit:
         raise PermissionError("Подтверждать соглашения вам не открыто")
     registry = Registry(session, workspace)
-    contract = get_contract(session, workspace, contract_id)
+    contract = get_contract(session, workspace, contract_id, for_update=True)
     effect = str(piece.get("effect") or "none")
     if effect not in AMENDMENT_EFFECTS:
         raise FinanceError("Такого изменения у соглашения нет")
@@ -315,7 +315,7 @@ def remove_amendment(
     откат делается правкой «опечатка», и это видно в истории."""
     if not access.edit:
         raise PermissionError("Убирать соглашения вам не открыто")
-    contract = get_contract(session, workspace, contract_id)
+    contract = get_contract(session, workspace, contract_id, for_update=True)
     row = session.get(ContractAmendment, amendment_id)
     if row is None or row.contract_id != contract.id:
         raise NotFound("Соглашение не найдено")

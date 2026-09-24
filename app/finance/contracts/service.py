@@ -989,8 +989,25 @@ def changes(session: Session, workspace: Workspace, access: Access, since: int) 
     }
 
 
-def get_contract(session: Session, workspace: Workspace, contract_id: uuid.UUID) -> Contract:
-    contract = session.get(Contract, contract_id)
+def get_contract(
+    session: Session, workspace: Workspace, contract_id: uuid.UUID, *, for_update: bool = False
+) -> Contract:
+    """Договор компании. `for_update` — с блокировкой строки до конца транзакции.
+
+    Блокировка нужна каждой записи: без неё два одновременных запроса к одному
+    полю оба читали старый `field_seq`, оба проходили проверку конфликта, и
+    побеждал последний — правка первого пропадала молча (найдено прогоном двух
+    окон). С блокировкой второй ждёт первого, читает свежий номер поля и
+    получает 409. На SQLite `FOR UPDATE` не существует и тихо опускается.
+    """
+    if for_update:
+        contract = session.scalar(
+            sa.select(Contract).where(Contract.id == contract_id).with_for_update()
+        )
+        if contract is not None:
+            session.refresh(contract)
+    else:
+        contract = session.get(Contract, contract_id)
     if contract is None or contract.workspace_id != workspace.id or contract.deleted_at is not None:
         raise NotFound("Договор не найден")
     return contract
@@ -1335,7 +1352,7 @@ def patch(
     после `known_seq`. Правка другого поля того же договора не мешает.
     """
     registry = Registry(session, workspace)
-    contract = get_contract(session, workspace, contract_id)
+    contract = get_contract(session, workspace, contract_id, for_update=True)
     people_now = people_of(session, [contract.id]).get(contract.id, [])
     if not visible_to(contract, registry, access, people_now):
         raise NotFound("Договор не найден")
@@ -1523,7 +1540,7 @@ def remove(
     if not access.edit:
         raise PermissionError("Убирать договоры вам не открыто")
     registry = Registry(session, workspace)
-    contract = get_contract(session, workspace, contract_id)
+    contract = get_contract(session, workspace, contract_id, for_update=True)
     people_now = people_of(session, [contract.id]).get(contract.id, [])
     if not visible_to(contract, registry, access, people_now):
         raise NotFound("Договор не найден")
@@ -1556,7 +1573,7 @@ def acknowledge(
     if not access.edit:
         raise PermissionError("Отмечать замечания вам не открыто")
     registry = Registry(session, workspace)
-    contract = get_contract(session, workspace, contract_id)
+    contract = get_contract(session, workspace, contract_id, for_update=True)
     numbers = number_index_for(session, workspace.id, [contract.number_key])
     names = {pid: party.name for pid, party in registry.parties.items()}
     current_issues = {issue["code"]: issue for issue in issues_of(contract, registry, numbers, names)}
@@ -1642,7 +1659,9 @@ def apply_due(session: Session) -> int:
     applied = 0
     registries: dict[uuid.UUID, Registry] = {}
     for amendment in due:
-        contract = session.get(Contract, amendment.contract_id)
+        contract = session.scalar(
+            sa.select(Contract).where(Contract.id == amendment.contract_id).with_for_update()
+        )
         if contract is None or contract.deleted_at is not None:
             amendment.applied_at = _now()
             continue
