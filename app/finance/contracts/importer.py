@@ -1112,6 +1112,10 @@ def _section_statuses(current: Plan, registry: Registry, decisions: dict[str, An
             items.append(
                 {"field": field_key, "value": value, "count": count, "known": known, "meaning": meaning, "odd": odd}
             )
+    # Предметы в пункт не выносятся (смысл им назначать не нужно, а их у BBC
+    # под сорок), но правке правила листа нужен их полный список: правило
+    # «агентский — по предмету» пишется написаниями из файла.
+    subjects = [{"value": value, "count": count} for value, count in _values_of(rows, "subject").most_common()]
     return _section(
         "statuses",
         "Статусы и списки",
@@ -1123,6 +1127,7 @@ def _section_statuses(current: Plan, registry: Registry, decisions: dict[str, An
             else f"{unknown} {_plural(unknown, 'статус', 'статуса', 'статусов')} без смысла — сохранятся как написаны"
         ),
         items=items,
+        subjects=subjects,
     )
 
 
