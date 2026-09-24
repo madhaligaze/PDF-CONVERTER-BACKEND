@@ -7,7 +7,14 @@
                       {"field": "executor_is_own", "op": "is", "value": true}]},
              {"all": [{"field": "subject", "op": "in", "value": ["<id>"]}]}]}
 
-Пустое `any` — «все договоры»: так устроен главный лист.
+Пустое правило
+──────────────
+Отбор без условий не отбирает **ничего**. Главному листу отбор не нужен
+вовсе: в нём стоит каждый договор (`place`), а условия его блоков только
+раскладывают договоры по блокам. Раньше пустое `any` значило «все договоры»
+для любого листа, и блок, которому разбор Excel не подобрал правила, молча
+показывал весь реестр: лист «Заказчик ГК» на 192 строки выгружался пятью
+тысячами договоров. Новый лист без правила теперь пуст, пока правило не задано.
 
 Почему одной колонки мало: в реестре BBC «Агентский» и «Финансовая помощь»
 лежат в **предмете** при виде «Иное», и отбор «по виду» не поймал бы ни одной
@@ -91,8 +98,13 @@ def _check(condition: dict[str, Any], facts: dict[str, Any]) -> bool:
     if op == "is":
         return bool(facts.get(field)) is bool(value)
     if op == "contains":
+        # У полей-ссылок (вид, предмет, стороны, свои списки) в фактах лежит
+        # идентификатор; текст — рядом, в «<поле>__text». Сравнивать с id
+        # значит не отобрать ничего: «предмет содержит „аренд“» молчал.
         needle = norm(value)
-        return bool(needle) and any(needle in norm(item) for item in have)
+        text = facts.get(f"{field}__text")
+        pool = _fact_values({"text": text}, "text") if text is not None else have
+        return bool(needle) and any(needle in norm(item) for item in pool)
     wanted = _as_list(value)
     if op in ("eq", "in"):
         return any(item in wanted for item in have)
@@ -101,25 +113,46 @@ def _check(condition: dict[str, Any], facts: dict[str, Any]) -> bool:
     return False
 
 
+def is_empty(rule: dict[str, Any] | None) -> bool:
+    """Правило без единого условия."""
+    return not ((rule or {}).get("any") or [])
+
+
 def matches(rule: dict[str, Any] | None, facts: dict[str, Any]) -> bool:
+    """Подходит ли договор под правило. Пустое правило не отбирает ничего."""
     groups = (rule or {}).get("any") or []
     if not groups:
-        return True
+        return False
     return any(all(_check(condition, facts) for condition in group.get("all", [])) for group in groups)
 
 
-def membership(facts: dict[str, Any], views: Iterable[Any]) -> list[dict[str, Any]]:
-    """В каких листах и блоках стоит договор: `[{"view": key, "block": i}]`.
+def place(view: Any, facts: dict[str, Any]) -> int | None:
+    """Блок листа, в котором стоит договор, или `None` — договора в листе нет.
 
-    Договор встаёт в первый подходящий блок листа — в двух блоках одного листа
-    одна запись не показывается: в Excel она и стояла бы в одном месте.
+    Договор встаёт в первый подходящий блок: в двух блоках одного листа одна
+    запись не показывается — в Excel она и стояла бы в одном месте. Главный
+    лист держит все договоры: первый блок с подходящим правилом, иначе первый
+    блок без правила, иначе первый блок.
     """
+    blocks = [block or {} for block in (view.blocks or [])]
+    for index, block in enumerate(blocks):
+        if matches(block.get("filter"), facts):
+            return index
+    if not getattr(view, "main", False):
+        return None
+    for index, block in enumerate(blocks):
+        if is_empty(block.get("filter")):
+            return index
+    return 0
+
+
+def membership(facts: dict[str, Any], views: Iterable[Any]) -> list[dict[str, Any]]:
+    """В каких листах и блоках стоит договор: `[{"view": key, "block": i}]`."""
     out: list[dict[str, Any]] = []
     for view in views:
-        for index, block in enumerate(view.blocks or []):
-            if matches((block or {}).get("filter"), facts):
-                out.append({"view": view.key, "block": index})
-                break
+        index = place(view, facts)
+        if index is not None:
+            out.append({"view": view.key, "block": index})
     return out
 
 
@@ -131,4 +164,6 @@ def fields_used(rule: dict[str, Any] | None) -> set[str]:
     }
 
 
-__all__ = ["FilterError", "OPS", "VIRTUAL_FIELDS", "fields_used", "matches", "membership", "validate"]
+__all__ = [
+    "FilterError", "OPS", "VIRTUAL_FIELDS", "fields_used", "is_empty", "matches", "membership", "place", "validate",
+]

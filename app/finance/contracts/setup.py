@@ -76,10 +76,12 @@ def schema(session: Session, workspace: Workspace, access: Access) -> dict[str, 
             ).to_dict()
         )
     lists: dict[str, list[dict[str, Any]]] = {}
+    # Архивные значения выборы не предлагают, но подписать ими старый договор
+    # нужно: иначе карточка показала бы вместо «Аренда» голый идентификатор.
+    archived_values: dict[str, list[dict[str, Any]]] = {}
     for value in sorted(registry.values.values(), key=lambda row: (row.field_key, row.position)):
-        if value.archived_at is not None:
-            continue
-        lists.setdefault(value.field_key, []).append(
+        target = lists if value.archived_at is None else archived_values
+        target.setdefault(value.field_key, []).append(
             {"id": str(value.id), "value": value.value, "meaning": value.meaning or {}, "position": value.position}
         )
     parties = {pid: party for pid, party in registry.parties.items()}
@@ -111,6 +113,7 @@ def schema(session: Session, workspace: Workspace, access: Access) -> dict[str, 
         "schema_rev": current(session, workspace.id, "schema"),
         "fields": fields,
         "lists": lists,
+        "archived_values": archived_values,
         "departments": [
             {"id": str(item.id), "code": item.code, "title": item.title, "position": item.position}
             for item in sorted(registry.departments.values(), key=lambda row: row.position)
@@ -170,6 +173,11 @@ def add_entity(
     assert party is not None
     existing = session.get(GroupEntity, party.id)
     if existing is not None:
+        if existing.archived_at is not None:
+            # Юрлицо из архива заводят снова — возвращаем его, а не двойника.
+            existing.archived_at = None
+            session.flush()
+            _schema_changed(session, workspace)
         return existing
     entity = GroupEntity(
         counterparty_id=party.id,
@@ -202,6 +210,15 @@ def update_entity(session: Session, workspace: Workspace, party_id: uuid.UUID, d
     if "archived" in data:
         from datetime import datetime, timezone
 
+        if data["archived"]:
+            # Юрлицо с договорами в архив не уходит: оно перестало бы быть
+            # «нашим» для правил листов, и его договоры молча уехали бы из
+            # «Исполнитель ГК» и получили бы замечание «ни одна сторона не наша».
+            used = _contracts_with_party(session, workspace.id, party_id)
+            if used:
+                raise FinanceError(
+                    f"У юрлица {used} {_contracts_word(used)} — в архив уходит только юрлицо без договоров"
+                )
         entity.archived_at = datetime.now(timezone.utc) if data["archived"] else None
     if "accounts" in data:
         wanted = {uuid.UUID(str(item)) for item in data["accounts"] or []}
@@ -441,13 +458,25 @@ def update_value(session: Session, workspace: Workspace, value_id: uuid.UUID, da
         if clash is not None:
             raise FinanceError(f"«{clean}» в этом списке уже есть — сведите значения")
         item.value, item.normalized = clean, norm(clean)
+    base = _base_economic(session, workspace, item)
     if "meaning" in data:
-        item.meaning = _check_meaning(item.field_key, data["meaning"] or {})
+        meaning = _check_meaning(item.field_key, data["meaning"] or {})
+        if base and meaning.get("system") != (item.meaning or {}).get("system"):
+            raise FinanceError(f"«{item.value}» — системный смысл: по нему считаются выручка и порог НДС")
+        item.meaning = meaning
     if "position" in data:
         item.position = int(data["position"])
     if "archived" in data:
         from datetime import datetime, timezone
 
+        if data["archived"]:
+            if base:
+                raise FinanceError(f"«{item.value}» — системный смысл: по нему считаются выручка и порог НДС")
+            used = _contracts_with_value(session, workspace.id, item)
+            if used:
+                raise FinanceError(
+                    f"«{item.value}» стоит в {used} {_contracts_word(used, case='loc')} — сведите его с другим значением"
+                )
         item.archived_at = datetime.now(timezone.utc) if data["archived"] else None
     session.flush()
     _schema_changed(session, workspace)
@@ -455,6 +484,72 @@ def update_value(session: Session, workspace: Workspace, value_id: uuid.UUID, da
     # где оно стоит: двигаем их номер, чтобы клиенты перечитали.
     _touch_contracts_with_value(session, workspace, item)
     return item
+
+
+def _contracts_word(count: int, case: str = "nom") -> str:
+    tail = count % 100
+    if case == "loc":
+        return "договоре" if tail % 10 == 1 and tail != 11 else "договорах"
+    if 11 <= tail <= 14:
+        return "договоров"
+    return {1: "договор", 2: "договора", 3: "договора", 4: "договора"}.get(tail % 10, "договоров")
+
+
+def _contracts_with_party(session: Session, workspace_id: uuid.UUID, party_id: uuid.UUID) -> int:
+    from app.finance.contracts.models import Contract
+
+    return int(
+        session.scalar(
+            sa.select(sa.func.count())
+            .select_from(Contract)
+            .where(
+                Contract.workspace_id == workspace_id,
+                Contract.deleted_at.is_(None),
+                sa.or_(Contract.executor_id == party_id, Contract.customer_id == party_id),
+            )
+        )
+        or 0
+    )
+
+
+def _contracts_with_value(session: Session, workspace_id: uuid.UUID, value: ListValue) -> int:
+    """Сколько живых договоров стоит на значении системного списка.
+
+    Свои списочные поля лежат в `attrs` — их значения в архив уходят
+    свободно: подпись остаётся в `archived_values` схемы.
+    """
+    from app.finance.contracts.models import Contract
+    from app.finance.contracts.service import COLUMN_OF
+
+    column = COLUMN_OF.get(value.field_key)
+    if column is None:
+        return 0
+    return int(
+        session.scalar(
+            sa.select(sa.func.count())
+            .select_from(Contract)
+            .where(
+                Contract.workspace_id == workspace_id,
+                Contract.deleted_at.is_(None),
+                getattr(Contract, column) == value.id,
+            )
+        )
+        or 0
+    )
+
+
+def _base_economic(session: Session, workspace: Workspace, value: ListValue) -> bool:
+    """Одно из четырёх системных значений хозяйственного смысла.
+
+    По ним подстановки ставят смысл и будет считаться порог НДС: «Выручка»
+    в архиве или со сменённым смыслом молча вывела бы продажи из порога.
+    Своё значение поверх системного («Агентский внутри ГК») — не базовое.
+    """
+    if value.field_key != "economic_role":
+        return False
+    from app.finance.contracts.fields import economic_role_values
+
+    return any(item.id == value.id for item in economic_role_values(session, workspace.id).values())
 
 
 def _touch_contracts_with_value(session: Session, workspace: Workspace, value: ListValue) -> None:
@@ -480,6 +575,8 @@ def merge_values(session: Session, workspace: Workspace, *, keep: uuid.UUID, dro
     kept, dropped = session.get(ListValue, keep), session.get(ListValue, drop)
     if kept is None or dropped is None or kept.field_key != dropped.field_key or kept.workspace_id != workspace.id:
         raise FinanceError("Сводить можно значения одного списка")
+    if _base_economic(session, workspace, dropped):
+        raise FinanceError(f"«{dropped.value}» — системный смысл: сведите другое значение в него, а не его в другое")
     column = COLUMN_OF.get(kept.field_key)
     seq = bump(session, workspace.id, "contracts")
     if column:
@@ -613,6 +710,9 @@ def preview_filter(session: Session, workspace: Workspace, access: Access, rule:
         )
     )
     people = people_of(session, [item.id for item in contracts])
+    # Счётчик правила пересчитывается на каждую правку условия — стороны
+    # одним запросом, а не по одному на договор внутри facts_of.
+    registry.parties_for({pid for item in contracts for pid in (item.executor_id, item.customer_id)})
     count, sample = 0, []
     for item in contracts:
         mine = people.get(item.id, [])

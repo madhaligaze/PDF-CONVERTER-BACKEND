@@ -47,11 +47,12 @@ from app.finance.contracts.fields import (
     SNAPSHOT_FIELDS,
     SYSTEM_KEYS,
     bump,
+    deferred_bumps,
     fields_of,
     number_key,
     party_key,
 )
-from app.finance.contracts.models import Contract, ContractImport, EntityField, EntityView
+from app.finance.contracts.models import Contract, ContractImport, ContractPerson, EntityField, EntityView
 from app.finance.contracts.service import (
     RAW_KEY,
     Access,
@@ -61,7 +62,6 @@ from app.finance.contracts.service import (
     _derive,
     _plain,
     _set_field,
-    _write_people,
     looks_numeric,
     read_money,
 )
@@ -70,6 +70,8 @@ from app.finance.service import FinanceError
 
 MAX_ROWS = 20_000
 MAX_COLS = 120
+#: По сколько договоров «Завести» вставляет в базу за раз.
+APPLY_CHUNK = 1_000
 #: Шапка — строка, где хотя бы столько ячеек узнаны как поля.
 HEADER_MIN_MATCHES = 4
 #: Мягкое совпадение шапки: одно начало другого, и доля длины не меньше этой.
@@ -213,27 +215,74 @@ def field_names(fields: Sequence[EntityField]) -> list[FieldNames]:
     return out
 
 
+_ROW_NUMBER_NAMES = frozenset({"№", "#", "n", "no", "№ п/п", "п/п"})
+
+
+class HeaderMatcher:
+    """Поиск поля по шапке с разложенным заранее каталогом.
+
+    Разбор проверяет «не шапка ли это» на каждой строке листа, то есть на
+    каждой ячейке каждого договора. Прежний поиск на каждую ячейку заново
+    нормализовал её текст по разу на каждое поле каталога и на каждый ярус —
+    около семидесяти регулярных выражений на ячейку; 20 000 строк разбирались
+    пять минут, дольше, чем прокси ждёт ответа. Здесь текст нормализуется один
+    раз на ячейку, три строгих яруса — поиск в словаре, а мягкий проверяется,
+    только если первые четыре знака совпадают хоть с одним написанием: мягкое
+    совпадение — «одно начало другого» длиной от четырёх знаков, без общих
+    первых четырёх его не бывает.
+
+    Ответ тот же, что у поиска перебором: ярусы от строгого к мягкому, два
+    одинаково подходящих поля — «ambiguous» со списком в порядке каталога.
+    """
+
+    def __init__(self, catalog: Sequence[FieldNames]):
+        self.catalog = list(catalog)
+        self.by_name: dict[str, list[str]] = {}
+        self.by_squashed: dict[str, list[str]] = {}
+        self.prefixes: set[str] = set()
+        for item in self.catalog:
+            for name in item.names:
+                self.by_name.setdefault(name, []).append(item.key)
+            for name in item.squashed:
+                self.by_squashed.setdefault(name, []).append(item.key)
+                if len(name) >= 4:
+                    self.prefixes.add(name[:4])
+
+    def match(self, text: Any) -> tuple[str | None, str, list[str]]:
+        full = norm(text)
+        if not full:
+            return None, "empty", []
+        if full in _ROW_NUMBER_NAMES:
+            return ROW_NUMBER, "exact", []
+        raw = str(text or "")
+        # Без скобок `_PAREN` строку не меняет, и ядро совпадает с full.
+        core = norm(_PAREN.sub(" ", raw)) if "(" in raw else full
+        squashed = squash(core)
+        for how, found in (
+            ("exact", self.by_name.get(full, [])),
+            ("core", self.by_name.get(core, []) if core else []),
+            ("squashed", self.by_squashed.get(squashed, []) if squashed else []),
+        ):
+            if len(found) == 1:
+                return found[0], how, []
+            if len(found) > 1:
+                return None, "ambiguous", list(found)
+        if len(squashed) >= 4 and squashed[:4] in self.prefixes:
+            found = [item.key for item in self.catalog if _loose(squashed, item.squashed)]
+            if len(found) == 1:
+                return found[0], "loose", []
+            if len(found) > 1:
+                return None, "ambiguous", found
+        return None, "none", []
+
+
 def match_header(text: Any, catalog: Sequence[FieldNames]) -> tuple[str | None, str, list[str]]:
-    """Поле по шапке: (ключ, как нашлось, кандидаты при двусмысленности)."""
-    full = norm(text)
-    if not full:
-        return None, "empty", []
-    if full in ("№", "#", "n", "no", "№ п/п", "п/п"):
-        return ROW_NUMBER, "exact", []
-    core = header_core(text)
-    tiers = (
-        ("exact", lambda item: full in item.names),
-        ("core", lambda item: bool(core) and core in item.names),
-        ("squashed", lambda item: bool(squash(core)) and squash(core) in item.squashed),
-        ("loose", lambda item: _loose(squash(core), item.squashed)),
-    )
-    for how, test in tiers:
-        found = [item.key for item in catalog if test(item)]
-        if len(found) == 1:
-            return found[0], how, []
-        if len(found) > 1:
-            return None, "ambiguous", found
-    return None, "none", []
+    """Поле по шапке: (ключ, как нашлось, кандидаты при двусмысленности).
+
+    Для одной ячейки. Лист целиком разбирается одним `HeaderMatcher`, чтобы
+    каталог раскладывался один раз.
+    """
+    return HeaderMatcher(catalog).match(text)
 
 
 def _loose(core: str, names: set[str]) -> bool:
@@ -301,23 +350,41 @@ def _nonempty(row: Sequence[Any]) -> list[tuple[int, Any]]:
     return [(index, value) for index, value in enumerate(row) if value not in (None, "") and str(value).strip()]
 
 
+def _is_header_row(cells: Sequence[tuple[int, Any]], matcher: HeaderMatcher) -> bool:
+    """Узнано ли в строке хотя бы `HEADER_MIN_MATCHES` полей.
+
+    Счёт останавливается, как только ответ ясен: строка договора обычно не
+    узнаёт ни одной ячейки, и после того как непроверенных осталось меньше,
+    чем не хватает, смотреть их незачем.
+    """
+    matched = 0
+    remaining = len(cells)
+    for _, value in cells:
+        remaining -= 1
+        text = _cell_text(value)
+        if text and matcher.match(text)[0] is not None:
+            matched += 1
+            if matched >= HEADER_MIN_MATCHES:
+                return True
+        if matched + remaining < HEADER_MIN_MATCHES:
+            return False
+    return False
+
+
 def find_blocks(sheet: SheetData, catalog: Sequence[FieldNames]) -> list[Block]:
     """Блоки листа: название → шапка → строки до следующего блока."""
+    matcher = HeaderMatcher(catalog)
     headers: list[tuple[int, list[Column]]] = []
     for r_index, row in enumerate(sheet.rows):
         cells = _nonempty(row)
-        if len(cells) < HEADER_MIN_MATCHES:
+        if len(cells) < HEADER_MIN_MATCHES or not _is_header_row(cells, matcher):
             continue
         columns = []
-        matched = 0
         for c_index, value in enumerate(row):
             text = _cell_text(value)
-            key, how, candidates = match_header(text, catalog) if text else (None, "empty", [])
-            if key is not None:
-                matched += 1
+            key, how, candidates = matcher.match(text) if text else (None, "empty", [])
             columns.append(Column(c_index, text, key, how, candidates, width=sheet.widths.get(c_index)))
-        if matched >= HEADER_MIN_MATCHES:
-            headers.append((r_index, columns))
+        headers.append((r_index, columns))
     blocks: list[Block] = []
     for number, (h_index, columns) in enumerate(headers):
         previous_end = headers[number - 1][0] if number else -1
@@ -544,10 +611,65 @@ def decide(session: Session, workspace: Workspace, batch_id: uuid.UUID, decision
             merged[key] = {**merged[key], **value}
         else:
             merged[key] = value
+    _check_rule_decisions(merged.get("rules"))
     batch.decisions = merged
     batch.report = report(session, workspace, batch)
+    # «Принять как есть» — это то правило, которое человек видел. Записываем
+    # его в решение: иначе следующее решение (другой список наших юрлиц)
+    # подменило бы принятое правило новым предложением, о котором не спросили.
+    rules = dict(merged.get("rules") or {})
+    frozen = False
+    for item in next(s for s in batch.report["sections"] if s["key"] == "rules")["items"]:
+        raw = rules.get(item["block"])
+        if isinstance(raw, dict) and raw.get("action") == "accept" and not isinstance(raw.get("filter"), dict):
+            rules[item["block"]] = {**raw, "filter": item["filter"]}
+            frozen = True
+    if frozen:
+        batch.decisions = {**merged, "rules": rules}
     session.flush()
     return batch
+
+
+#: Поля, по которым правило листа проверяется на строках файла, и их условия.
+RULE_CONDITION_OPS = {
+    **{key: "in" for key in CATEGORICAL},
+    "executor_is_own": "is",
+    "customer_is_own": "is",
+}
+
+
+def _check_rule_decisions(rules: Any) -> None:
+    """Своё правило блока — только из того, что разбор умеет проверить на
+    строках файла: вид, предмет, отдел, статус (`in`, значения написаниями) и
+    «сторона — наше юрлицо» (`is`). Иначе покрытие в отчёте считалось бы не
+    по тому правилу, которое заведётся."""
+    if rules in (None, {}):
+        return
+    if not isinstance(rules, dict):
+        raise FinanceError("Решения по правилам листов: ждём {\"<лист>#<блок>\": {...}}")
+    for block_id, raw in rules.items():
+        if raw is None:
+            continue
+        if not isinstance(raw, dict) or (raw.get("action") and raw.get("action") not in RULE_ACTIONS):
+            raise FinanceError(f"Правило блока {block_id}: ждём action accept, rule или empty")
+        rule_filter = raw.get("filter")
+        if rule_filter is None:
+            continue
+        if not isinstance(rule_filter, dict) or not isinstance(rule_filter.get("any", []), list):
+            raise FinanceError(f"Правило блока {block_id}: ждём {{\"any\": [{{\"all\": [...]}}]}}")
+        for group in rule_filter.get("any") or []:
+            conditions = group.get("all") if isinstance(group, dict) else None
+            if not isinstance(conditions, list) or not conditions:
+                raise FinanceError(f"Правило блока {block_id}: у группы должно быть хотя бы одно условие")
+            for condition in conditions:
+                field_key = (condition or {}).get("field") if isinstance(condition, dict) else None
+                op = RULE_CONDITION_OPS.get(field_key or "")
+                if op is None:
+                    raise FinanceError(f"Правило блока {block_id}: по полю «{field_key}» при загрузке отбирать нельзя")
+                if condition.get("op", "in") != op:
+                    raise FinanceError(f"Правило блока {block_id}: для «{field_key}» условие «{op}»")
+                if op == "in" and not isinstance(condition.get("value"), list):
+                    raise FinanceError(f"Правило блока {block_id}: для «{field_key}» ждём список значений")
 
 
 # — главное: всё, что протокол знает о строках при текущих решениях —
@@ -568,6 +690,13 @@ class Plan:
     existing: dict[str, uuid.UUID]
     own_keys: set[str]
     clusters: dict[str, dict[str, Any]]
+    #: Как сведено нестрогое совпадение: `swapped` — те же две стороны, но в
+    #: другом порядке; `number_party` — номер и одна общая сторона; `number` —
+    #: только номер, по решению человека.
+    loose_kinds: dict[str, str] = field(default_factory=dict)
+    #: Строка листа → договор главного листа с тем же номером, но без единой
+    #: общей стороны. Не сводится, пока человек не скажет «это он».
+    number_only: dict[str, str] = field(default_factory=dict)
 
 
 def _column_decisions(staged: dict[str, Any], decisions: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -643,40 +772,69 @@ def plan(session: Session, workspace: Workspace, batch: ContractImport, registry
             else:
                 sheet_rows.setdefault(block["id"], []).append(item)
 
-    # Совпадения строк листов со строками главного: номер + обе стороны; иначе
-    # номер, если он однозначен с обеих сторон — это «совпало по номеру», и
-    # такое совпадение показывается отдельно.
+    # Совпадения строк листов со строками главного. Строго — номер и обе
+    # стороны на своих местах. Нестрого, и такое показывается отдельно:
+    # * те же две стороны, переставленные местами (в «Заказчик ГК» и «ФИН.
+    #   ПОМОЩЬ» реестра BBC все шесть нестрогих совпадений — такие);
+    # * номер, однозначный с обеих сторон, и хотя бы одна общая сторона, не
+    #   наше юрлицо (другое написание второй стороны или её замена). Наше
+    #   юрлицо стоит почти в каждом договоре — общим оно доводом не считается.
+    # Один номер без общей внешней стороны — не совпадение: номер у разных
+    # клиентов повторяется, это данные. Такая строка раньше приклеивалась к
+    # чужому договору: сама не заводилась, а правило листа подбиралось по
+    # признакам чужого договора и тянуло в лист тысячи лишних. Теперь она
+    # заводится отдельно, а человек может сказать «это он»
+    # (`decisions["loose"][ref] = "same"`).
+    main_clusters = _party_clusters(main_rows, registry, decisions, main_refs={row["ref"] for row in main_rows})
+    own_for_matching = _own_keys(main_clusters, decisions) | set(
+        (decisions.get("entities") or {}).get("own") or []
+    )
     main_by_key: dict[tuple[str, str, str], list[str]] = {}
     main_by_number: dict[str, list[str]] = {}
+    main_key_of: dict[str, tuple[str, str, str]] = {}
     for item in main_rows:
         key = row_key(item["values"])
+        main_key_of[item["ref"]] = key
         main_by_key.setdefault(key, []).append(item["ref"])
         if key[0]:
             main_by_number.setdefault(key[0], []).append(item["ref"])
     matches: dict[str, str] = {}
     loose: dict[str, str] = {}
+    loose_kinds: dict[str, str] = {}
+    number_only: dict[str, str] = {}
     orphans: list[dict[str, Any]] = []
     sheet_number_counts: dict[str, Tally] = {}
     for block_id, items in sheet_rows.items():
         tally = Tally(number_key(item["values"].get("number")) for item in items)
         sheet_number_counts[block_id] = tally
-    separate = {ref for ref, choice in (decisions.get("loose") or {}).items() if choice == "separate"}
+    choices = decisions.get("loose") or {}
+    separate = {ref for ref, choice in choices.items() if choice == "separate"}
+    same = {ref for ref, choice in choices.items() if choice == "same"}
     for block_id, items in sheet_rows.items():
         for item in items:
+            ref = item["ref"]
             key = row_key(item["values"])
             exact = main_by_key.get(key) or []
             if len(exact) >= 1:
-                matches[item["ref"]] = exact[0]
+                matches[ref] = exact[0]
+                continue
+            if ref in separate:
+                orphans.append(item)
+                continue
+            swapped = main_by_key.get((key[0], key[2], key[1])) or [] if key[0] else []
+            if swapped:
+                loose[ref] = swapped[0]
+                loose_kinds[ref] = "swapped"
                 continue
             by_number = main_by_number.get(key[0]) if key[0] else None
-            if (
-                by_number
-                and len(by_number) == 1
-                and sheet_number_counts[block_id][key[0]] == 1
-                and item["ref"] not in separate
-            ):
-                loose[item["ref"]] = by_number[0]
-                continue
+            if by_number and len(by_number) == 1 and sheet_number_counts[block_id][key[0]] == 1:
+                main_key = main_key_of[by_number[0]]
+                common = ({key[1], key[2]} & {main_key[1], main_key[2]}) - {""} - own_for_matching
+                if common or ref in same:
+                    loose[ref] = by_number[0]
+                    loose_kinds[ref] = "number_party" if common else "number"
+                    continue
+                number_only[ref] = by_number[0]
             orphans.append(item)
 
     # Существующие договоры компании (повторная загрузка): совпадение по тому
@@ -705,7 +863,8 @@ def plan(session: Session, workspace: Workspace, batch: ContractImport, registry
     clusters = _party_clusters(main_rows + orphans, registry, decisions, main_refs={row["ref"] for row in main_rows})
     own_keys = _own_keys(clusters, decisions)
     return Plan(
-        main_sheet, blocks, columns, main_rows, sheet_rows, matches, loose, orphans, existing, own_keys, clusters
+        main_sheet, blocks, columns, main_rows, sheet_rows, matches, loose, orphans, existing, own_keys, clusters,
+        loose_kinds=loose_kinds, number_only=number_only,
     )
 
 
@@ -789,7 +948,15 @@ def _similar_clusters(clusters: dict[str, dict[str, Any]]) -> list[list[str]]:
 
 
 def report(session: Session, workspace: Workspace, batch: ContractImport) -> dict[str, Any]:
-    registry = Registry(session, workspace)
+    return _report_and_plan(session, workspace, batch)[0]
+
+
+def _report_and_plan(
+    session: Session, workspace: Workspace, batch: ContractImport, registry: Registry | None = None
+) -> tuple[dict[str, Any], Plan]:
+    """Отчёт и план, по которому он посчитан: «Завести» берёт план отсюда, а
+    не считает его второй раз."""
+    registry = registry or Registry(session, workspace)
     current_plan = plan(session, workspace, batch, registry)
     staged = batch.staged or {}
     decisions = batch.decisions or {}
@@ -823,7 +990,7 @@ def report(session: Session, workspace: Workspace, batch: ContractImport) -> dic
             "update": len(current_plan.existing),
             "main_rows": len(current_plan.main_rows),
         },
-    }
+    }, current_plan
 
 
 def _section(key: str, title: str, *, blocking: bool, done: bool, summary: str, items: list[Any], **extra: Any) -> dict[str, Any]:
@@ -1053,16 +1220,28 @@ def _section_orphans(current: Plan, decisions: dict[str, Any]) -> dict[str, Any]
         )
     main_by_ref = {row["ref"]: row for row in current.main_rows}
     sheet_by_ref = {row["ref"]: row for rows in current.sheet_rows.values() for row in rows}
-    loose = [
-        {
+
+    def pair(ref: str, main_ref: str, **extra: Any) -> dict[str, Any]:
+        sheet_values, main_values = sheet_by_ref[ref]["values"], main_by_ref[main_ref]["values"]
+        return {
             "ref": ref,
             "main": main_ref,
-            "number": sheet_by_ref[ref]["values"].get("number"),
-            "sheet_customer": sheet_by_ref[ref]["values"].get("customer"),
-            "main_customer": main_by_ref[main_ref]["values"].get("customer"),
+            "number": sheet_values.get("number"),
+            "sheet_customer": sheet_values.get("customer"),
+            "sheet_executor": sheet_values.get("executor"),
+            "main_customer": main_values.get("customer"),
+            "main_executor": main_values.get("executor"),
+            **extra,
         }
+
+    # Сведены нестрого — показываются, чтобы человек мог развести («separate»).
+    loose = [
+        pair(ref, main_ref, kind=current.loose_kinds.get(ref, "number_party"))
         for ref, main_ref in current.loose_matches.items()
     ]
+    # Тот же номер, но ни одной общей стороны — заведутся отдельно, пока
+    # человек не скажет «это он» («same»).
+    number_only = [pair(ref, main_ref) for ref, main_ref in current.number_only.items()]
     count = len(items)
     return _section(
         "orphans",
@@ -1074,9 +1253,11 @@ def _section_orphans(current: Plan, decisions: dict[str, Any]) -> dict[str, Any]
             if count
             else "Все строки листов есть в главном листе"
         )
-        + (f"; {len(loose)} совпали только по номеру" if loose else ""),
+        + (f"; {len(loose)} сведены нестрого" if loose else "")
+        + (f"; {len(number_only)} совпали только номером — заведутся отдельно" if number_only else ""),
         items=items,
         loose=loose,
+        number_only=number_only,
     )
 
 
@@ -1298,51 +1479,135 @@ def _universe(current: Plan, decisions: dict[str, Any]) -> list[dict[str, Any]]:
     return current.main_rows + [row for row in current.orphans if chosen.get(row["ref"], True)]
 
 
+#: Когда предложенное правило листа не принимается без человека: лишних
+#: договоров (правило добавит их в лист, а в листе файла их нет) или
+#: недостающих больше пяти строк или больше десятой части листа.
+#:
+#: Пять строк — столько человек проверит глазами по образцу в отчёте (там до
+#: десяти лишних и до двадцати недостающих). Десятая часть — граница, за
+#: которой лист уже не «тот же, что в Excel»: маленький лист упирается в неё
+#: раньше (один лишний на восемь строк), большой — в пять строк. На реестре
+#: BBC правило пропускается без вопроса у «Исполнитель ГК» (5 лишних на 341)
+#: и «ФИН. ПОМОЩЬ» (2 на 21), а у «Заказчик ГК» (47 лишних на 16) — нет:
+#: там лист после загрузки был бы вчетверо больше, чем в файле.
+RULE_STRAY_ROWS = 5
+RULE_STRAY_SHARE = 0.10
+RULE_ACTIONS = ("accept", "rule", "empty")
+
+
+def rule_limit(in_sheet: int) -> int:
+    """Сколько лишних или недостающих строк правило может принести без вопроса."""
+    return min(RULE_STRAY_ROWS, int(in_sheet * RULE_STRAY_SHARE))
+
+
+def _rule_decision(raw: Any) -> tuple[str | None, dict[str, Any] | None]:
+    """Решение человека по правилу блока: (действие, правило-написаниями).
+
+    `{"filter": …}` без действия — прежний формат «своё правило».
+    """
+    if not isinstance(raw, dict):
+        return None, None
+    action = raw.get("action") or ("rule" if raw.get("filter") else None)
+    if action not in RULE_ACTIONS:
+        return None, None
+    rule_filter = raw.get("filter") if isinstance(raw.get("filter"), dict) else None
+    if action == "rule" and not (rule_filter or {}).get("any"):
+        return "empty", None
+    return action, rule_filter
+
+
 def _section_rules(current: Plan, registry: Registry, decisions: dict[str, Any]) -> dict[str, Any]:
+    """Правило каждого блока других листов, его покрытие и нужен ли человек.
+
+    Решение по блоку — `decisions["rules"]["<лист>#<блок>"]`:
+    * `{"action": "accept"}` — принять предложенное как есть; на `decide`
+      предложенное правило записывается в решение (`filter`), чтобы следующие
+      решения его не подменили;
+    * `{"action": "rule", "filter": {"any": [...]}}` — своё правило;
+    * `{"action": "empty"}` — блок без правила: договоров в нём не будет,
+      пока правило не задано в настройке листа.
+    """
     chosen = decisions.get("rules") or {}
     universe = _universe(current, decisions)
     universe_facts = {row["ref"]: _facts_for_rule(row, current.own_keys) for row in universe}
+    by_ref = {row["ref"]: row for row in universe}
     items = []
+    pending: list[str] = []
     for block in current.blocks:
         if block["sheet"] == current.main_sheet:
             continue
         target = _block_target(current, block["id"], decisions)
-        if block["id"] in chosen and chosen[block["id"]].get("filter"):
-            rule = _filter_to_rule(chosen[block["id"]]["filter"])
-            source = "manual"
+        action, rule_filter = _rule_decision(chosen.get(block["id"]))
+        if action == "empty":
+            rule, source = [], "empty"
+        elif action == "rule":
+            rule, source = _filter_to_rule(rule_filter), "manual"
+        elif action == "accept" and rule_filter is not None:
+            rule, source = _filter_to_rule(rule_filter), "accepted"
         else:
             rule = suggest_rule(target, universe, current.own_keys)
-            source = "suggested"
+            source = "accepted" if action == "accept" else "suggested"
         target_refs = {row["ref"] for row in target}
         caught = {ref for ref, facts in universe_facts.items() if rule and _rule_matches(rule, facts)}
         missing = sorted(target_refs - caught)
         extra = sorted(caught - target_refs)
-        by_ref = {row["ref"]: row for row in universe}
+        limit = rule_limit(len(target_refs))
+        reason = ""
+        if target_refs and source == "suggested":
+            if not rule:
+                reason = "правило не подобралось"
+            elif len(extra) > limit or len(missing) > limit:
+                parts = []
+                if len(extra) > limit:
+                    parts.append(f"лишних {len(extra)}")
+                if len(missing) > limit:
+                    parts.append(f"не попадут {len(missing)}")
+                reason = f"{', '.join(parts)} при {len(target_refs)} строках листа — допустимо не больше {limit}"
+        needs_decision = bool(reason)
+        if needs_decision:
+            pending.append(block["id"])
         items.append(
             {
                 "block": block["id"],
                 "sheet": block["sheet"],
                 "title": block["title"],
                 "filter": _rule_to_filter(rule),
-                "sentence": _sentence(rule, registry),
+                "sentence": (
+                    "Блок без правила — договоров в нём нет, пока правило не задано в настройке листа"
+                    if source == "empty"
+                    else _sentence(rule, registry)
+                ),
                 "source": source,
+                "decision": action,
+                "needs_decision": needs_decision,
+                "reason": reason,
+                "limit": limit,
                 "in_sheet": len(target_refs),
                 "caught": len(caught & target_refs),
                 "extra": len(extra),
+                "missing_count": len(missing),
                 "missing": [_brief(by_ref[ref]) for ref in missing[:20]],
                 "extra_sample": [_brief(by_ref[ref]) for ref in extra[:10]],
             }
         )
+    overview = "; ".join(
+        f"{item['sheet']}{(' / ' + item['title']) if item['title'] else ''}: {item['caught']} из {item['in_sheet']}"
+        + (f", лишних {item['extra']}" if item["extra"] else "")
+        for item in items[:6]
+    )
+    count = len(pending)
     return _section(
         "rules",
         "Правила листов",
-        blocking=False,
-        done=True,
+        blocking=True,
+        done=not pending,
         summary=(
-            "; ".join(f"{item['sheet']}{(' / ' + item['title']) if item['title'] else ''}: {item['caught']} из {item['in_sheet']}" for item in items[:6])
-            or "Других листов нет"
+            f"{count} {_plural(count, 'правило ждёт', 'правила ждут', 'правил ждут')} решения — {overview}"
+            if pending
+            else (overview or "Других листов нет")
         ),
         items=items,
+        pending=pending,
     )
 
 
@@ -1388,18 +1653,38 @@ def _sentence(rule: list[list[tuple[str, Any]]], registry: Registry) -> str:
 
 
 def apply(session: Session, workspace: Workspace, access: Access, actor: Actor, batch_id: uuid.UUID) -> dict[str, Any]:
-    """Завести договоры, листы, наши юрлица и свои поля по решениям."""
+    """Завести партию. Номер схемы двигается один раз — на выходе.
+
+    Заведение юрлиц, значений списков, отделов, полей и листов каждый раз
+    двигало номер схемы в начале транзакции и держало его блокировку до
+    коммита: правка коллеги, заводящая новое значение списка, ждала всю
+    загрузку (см. `fields.deferred_bumps`).
+    """
+    with deferred_bumps(session, workspace.id, "schema"):
+        return _apply(session, workspace, access, actor, batch_id)
+
+
+def _apply(session: Session, workspace: Workspace, access: Access, actor: Actor, batch_id: uuid.UUID) -> dict[str, Any]:
+    """Завести договоры, листы, наши юрлица и свои поля по решениям.
+
+    Номер изменения реестра (`seq`) — один на всю партию и берётся последним,
+    перед коммитом. Счётчик держит блокировку строки до конца транзакции
+    (так опрос видит номера строго по порядку), и прежде он брался до
+    заведения строк: пока заводились 20 000 договоров — две минуты с лишним —
+    любая правка в этой компании ждала. Теперь договоры вставляются пачками по
+    `APPLY_CHUNK` с `seq = 0` (до коммита их никто не видит), и только потом
+    берётся номер и одним UPDATE проставляется всей партии.
+    """
     if not access.setup:
         raise PermissionError("Загружать реестр может владелец или администратор")
     batch = get_batch(session, workspace, batch_id)
     if batch.status != "preview":
         raise FinanceError("Эта загрузка уже заведена или отменена")
-    batch.report = report(session, workspace, batch)
+    registry = Registry(session, workspace)
+    batch.report, current = _report_and_plan(session, workspace, batch, registry)
     if batch.report["blocking"]:
         titles = [s["title"] for s in batch.report["sections"] if s["key"] in batch.report["blocking"]]
         raise FinanceError("Сначала решите: " + ", ".join(titles))
-    registry = Registry(session, workspace)
-    current = plan(session, workspace, batch, registry)
     decisions = batch.decisions or {}
 
     # 1. Наши юрлица — все написания каждого становятся псевдонимами.
@@ -1447,8 +1732,8 @@ def apply(session: Session, workspace: Workspace, access: Access, actor: Actor, 
                 setup.update_value(session, workspace, item.id, {"meaning": {**(item.meaning or {}), **meaning}})
     registry = Registry(session, workspace)
 
-    # 4. Договоры.
-    seq = bump(session, workspace.id, "contracts")
+    # 4. Договоры: собираются в памяти (стороны, значения списков и люди
+    # заводятся по дороге), вставляются пачкой.
     position = int(session.scalar(sa.select(sa.func.max(Contract.position)).where(Contract.workspace_id == workspace.id)) or 0)
     diffs = {item["id"]: item for item in next(s for s in batch.report["sections"] if s["key"] == "diffs")["items"]}
     taken_from_sheet: dict[str, dict[str, Any]] = {}
@@ -1457,24 +1742,50 @@ def apply(session: Session, workspace: Workspace, access: Access, actor: Actor, 
             taken_from_sheet.setdefault(item["main_ref"], {})[item["field"]] = item["sheet"]
     orphans_chosen = decisions.get("orphans") or {}
     end_dates = decisions.get("end_dates") or {}
-    created, updated, failed = 0, 0, []
+    failed: list[dict[str, Any]] = []
     now = datetime.now(timezone.utc)
     rows_to_create = current.main_rows + [row for row in current.orphans if orphans_chosen.get(row["ref"], True)]
+    created = 0
+    chunk: list[tuple[Contract, list[Employee]]] = []
+
+    def insert_chunk() -> None:
+        # Пачкой в базу и сразу из сессии: 20 000 объектов договоров,
+        # державшихся до конца заведения, поднимали процесс на сотню мегабайт.
+        nonlocal created
+        if not chunk:
+            return
+        contracts = [contract for contract, _ in chunk]
+        session.add_all(contracts)
+        session.flush()
+        people_rows = [
+            ContractPerson(contract_id=contract.id, employee_id=employee.id, position=index)
+            for contract, people in chunk
+            for index, employee in enumerate(people)
+        ]
+        session.add_all(people_rows)
+        session.flush()
+        for item in [*contracts, *people_rows]:
+            session.expunge(item)
+        created += len(chunk)
+        chunk.clear()
+
     for row in rows_to_create:
         if row["ref"] in current.existing:
-            updated += 0  # повторная загрузка: сверка — отдельным шагом, не молча
-            continue
+            continue  # повторная загрузка: сверка — отдельным шагом, не молча
         values = {**row["values"], **taken_from_sheet.get(row["ref"], {})}
         try:
-            with session.begin_nested():
-                position += POSITION_STEP
-                _create_from_row(
-                    session, registry, workspace, actor, batch, row, values, custom_keys,
-                    position=position, seq=seq, now=now, end_kind=end_dates.get(row["ref"]),
+            chunk.append(
+                _contract_from_row(
+                    registry, workspace, actor, batch, values, custom_keys,
+                    position=position + POSITION_STEP, now=now, end_kind=end_dates.get(row["ref"]),
                 )
-            created += 1
+            )
+            position += POSITION_STEP
         except FinanceError as exc:
             failed.append({"ref": row["ref"], "error": str(exc)})
+        if len(chunk) >= APPLY_CHUNK:
+            insert_chunk()
+    insert_chunk()
 
     # 5. Листы: главный — по главному листу, остальные — по блокам.
     _build_views(session, workspace, registry, current, decisions, batch)
@@ -1482,7 +1793,16 @@ def apply(session: Session, workspace: Workspace, access: Access, actor: Actor, 
     batch.status = "applied"
     batch.applied_at = now
     batch.report = {**batch.report, "result": {"created": created, "failed": failed}}
+    # Разобранные строки после заведения не нужны: протокол остаётся в
+    # отчёте, файл второй раз не читается. На 20 000 строк это 6 МБ в базе.
+    batch.staged = {}
     bump(session, workspace.id, "schema")
+
+    # 6. Номер изменения — последним: блокировка счётчика держится только
+    # на UPDATE партии и записи истории, а не на всём заведении.
+    seq = bump(session, workspace.id, "contracts")
+    if created:
+        _stamp_seq(session, workspace.id, batch.id, seq)
     history.write(
         session,
         workspace,
@@ -1511,45 +1831,79 @@ def _learn_names(session: Session, workspace: Workspace, current: Plan) -> None:
     session.flush()
 
 
-def _create_from_row(
-    session: Session,
+def _contract_from_row(
     registry: Registry,
     workspace: Workspace,
     actor: Actor,
     batch: ContractImport,
-    row: dict[str, Any],
     values: dict[str, Any],
     custom_keys: dict[str, str],
     *,
     position: int,
-    seq: int,
     now: datetime,
     end_kind: str | None,
-) -> Contract:
+) -> tuple[Contract, list[Employee]]:
+    """Договор из строки файла — в памяти, ещё не в сессии; и его ответственные.
+
+    Стороны, значения списков и люди, которых ещё нет, заводятся по дороге
+    (это отдельные записи, их ищут следующие строки). Сам договор вставляет
+    `apply` — всей партией одной пачкой; все колонки заданы явно, чтобы
+    пачка была одним INSERT, а не группами по набору заполненных колонок.
+
+    Строку целиком отказывает только снимок оплат, который не читается как
+    сумма; он проверяется первым, до того как строка что-то завела в базе.
+    Остальное нечитаемое остаётся текстом с замечанием у договора.
+    """
+    snapshot: dict[str, Any] = {}
+    for key in SNAPSHOT_FIELDS:
+        raw = values.get(key)
+        if raw in (None, ""):
+            continue
+        amount, terms = read_money(raw, field="Сумма") if looks_numeric(str(raw)) else (None, str(raw))
+        snapshot[key.replace("_snapshot", "")] = _plain(amount) if amount is not None else terms
     contract = Contract(
+        id=uuid.uuid4(),
         workspace_id=workspace.id,
+        number="",
+        number_key="",
+        signed_at=None,
+        executor_id=None,
+        customer_id=None,
+        type_id=None,
+        subject_id=None,
+        status_id=None,
+        economic_role_id=None,
+        department_id=None,
+        billing="",
+        amount=None,
+        amount_terms="",
+        currency="KZT",
+        planned_end_at=None,
+        end_date=None,
+        end_kind="",
+        folder_url="",
+        amendments_text="",
+        amendments_summary_text="",
+        note="",
+        attrs={},
+        file_snapshot={},
+        provenance={},
+        acknowledged={},
+        field_seq={},
+        position=position,
+        seq=0,
         source="import",
         import_id=batch.id,
-        position=position,
         created_by=actor.user_id,
         updated_by=actor.user_id,
         created_at=now,
         updated_at=now,
-        attrs={},
-        provenance={},
-        acknowledged={},
-        field_seq={},
-        file_snapshot={},
+        deleted_at=None,
     )
-    session.add(contract)
-    session.flush()
     people: dict[str, list[Employee]] = {}
     changed: set[str] = set()
-    snapshot: dict[str, Any] = {}
     for key, raw in values.items():
         if key in SNAPSHOT_FIELDS:
-            amount, terms = read_money(raw, field="Сумма") if looks_numeric(str(raw)) else (None, str(raw))
-            snapshot[key.replace("_snapshot", "")] = _plain(amount) if amount is not None else terms
             continue
         if key.startswith("custom:"):
             field_key = custom_keys.get(key[len("custom:"):])
@@ -1575,12 +1929,26 @@ def _create_from_row(
     if end_kind in ("terminated", "fulfilled", "unknown") and contract.end_date is not None:
         contract.end_kind = end_kind
         contract.provenance = {**(contract.provenance or {}), "end_kind": "manual"}
-    if "people" in people:
-        _write_people(session, contract, people["people"])
-    contract.seq = seq
-    contract.field_seq = {key: seq for key in changed | {"billing", "economic_role", "end_kind"}}
-    session.flush()
-    return contract
+    # Номер изменения проставит `_stamp_seq` всей партии; ключи — уже сейчас.
+    contract.field_seq = {key: 0 for key in sorted(changed | {"billing", "economic_role", "end_kind"})}
+    return contract, list(people.get("people") or [])
+
+
+def _stamp_seq(session: Session, workspace_id: uuid.UUID, batch_id: uuid.UUID, seq: int) -> None:
+    """Один UPDATE: номер изменения партии — в `seq` и во все ключи `field_seq`."""
+    table = Contract.__table__
+    if session.get_bind().dialect.name == "postgresql":
+        field_seq = sa.text(
+            "(SELECT COALESCE(jsonb_object_agg(k.key, to_jsonb(CAST(:stamp AS BIGINT))), '{}'::jsonb) "
+            "FROM jsonb_object_keys(field_seq) AS k(key))"
+        )
+    else:
+        field_seq = sa.text("(SELECT COALESCE(json_group_object(key, :stamp), '{}') FROM json_each(field_seq))")
+    session.execute(
+        sa.update(table)
+        .where(table.c.workspace_id == workspace_id, table.c.import_id == batch_id)
+        .values(seq=seq, field_seq=field_seq.bindparams(stamp=seq))
+    )
 
 
 def _keep_raw(contract: Contract, key: str, raw: Any) -> None:
@@ -1695,7 +2063,10 @@ def cancel(session: Session, workspace: Workspace, batch_id: uuid.UUID) -> None:
 
 
 __all__ = [
+    "HeaderMatcher",
     "ImportFailed",
+    "RULE_STRAY_ROWS",
+    "RULE_STRAY_SHARE",
     "analyze",
     "apply",
     "cancel",
@@ -1706,6 +2077,7 @@ __all__ = [
     "plan",
     "read_workbook",
     "report",
+    "rule_limit",
     "start",
     "suggest_rule",
 ]

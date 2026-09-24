@@ -206,14 +206,46 @@ def number_key(number: Any) -> str:
 # ── Счётчики ─────────────────────────────────────────────────────────────────
 
 
+#: Ключ в `session.info`: счётчики, чей сдвиг отложен до конца транзакции.
+DEFERRED = "finance.deferred_bumps"
+
+
+class deferred_bumps:
+    """Отложить сдвиг счётчиков до выхода из блока — одним сдвигом в конце.
+
+    Сдвиг держит блокировку строки счётчика до коммита. «Завести» реестра
+    заводит юрлица, значения списков, отделы, поля и листы — и каждый из
+    них двигал номер схемы в начале длинной транзакции: правка коллеги,
+    заводящая новое значение списка, ждала всю загрузку. Внутри блока
+    `bump` только помечает счётчик, настоящий сдвиг — один, на выходе.
+    """
+
+    def __init__(self, session: Session, workspace_id: uuid.UUID, *names: str):
+        self.session, self.workspace_id, self.names = session, workspace_id, set(names)
+
+    def __enter__(self) -> "deferred_bumps":
+        self.session.info[DEFERRED] = {"names": self.names, "dirty": set()}
+        return self
+
+    def __exit__(self, kind, exc, tb) -> None:
+        state = self.session.info.pop(DEFERRED, None)
+        if kind is None and state:
+            for name in sorted(state["dirty"]):
+                bump(self.session, self.workspace_id, name)
+
+
 def bump(session: Session, workspace_id: uuid.UUID, name: str) -> int:
     """Следующее значение счётчика компании.
 
     Блокировка строки держится до конца транзакции — номера видны строго по
     порядку (см. `Counter`). Первая запись счётчика заводится во вложенной
     транзакции: два первых запроса одновременно не должны уронить друг друга
-    на уникальном ключе.
+    на уникальном ключе. Внутри `deferred_bumps` сдвиг откладывается.
     """
+    deferred = session.info.get(DEFERRED)
+    if deferred and name in deferred["names"]:
+        deferred["dirty"].add(name)
+        return current(session, workspace_id, name)
     table = Counter.__table__
     statement = (
         sa.update(table)

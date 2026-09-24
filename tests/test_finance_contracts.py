@@ -318,3 +318,44 @@ def test_ne_otkryty_polya_ne_otdayutsya_i_ne_pravyatsya(space):
             service.patch(session, workspace, lawyer, OWNER, contract.id, {"amount": "1"}, known_seq=None)
         with pytest.raises(FinanceError):
             service.patch(session, workspace, FULL, OWNER, contract.id, {"paid_snapshot": "1"}, known_seq=None)
+
+
+def test_arhiv_ne_uvodit_ispolzuemoe(space):
+    """Архив не отнимает смысл у договоров, которые на нём стоят.
+
+    Юрлицо с договорами, если бы ушло в архив, перестало бы быть «нашим» —
+    его договоры молча выпали бы из «Исполнитель ГК». Статус, стоящий в
+    договорах, в архиве превратил бы их подпись в идентификатор. «Выручка» —
+    системный смысл: без неё продажи выпали бы из порога НДС.
+    """
+    with finance_session() as session:
+        workspace = _ws(session, space)
+        contract = _make(session, space, executor="BBC", customer="ТОО «Бета»", status="Действующий")
+        schema = setup.schema(session, workspace, FULL)
+        bbc = next(item for item in schema["own_entities"] if item["code"] == "BBC")
+        bbca = next(item for item in schema["own_entities"] if item["code"] == "BBCA")
+
+        with pytest.raises(FinanceError, match="без договоров"):
+            setup.update_entity(session, workspace, uuid.UUID(bbc["id"]), {"archived": True})
+        setup.update_entity(session, workspace, uuid.UUID(bbca["id"]), {"archived": True})
+        after = setup.schema(session, workspace, FULL)
+        assert {item["code"] for item in after["own_entities"]} == {"BBC"}
+        assert not service.Registry(session, workspace).is_own(uuid.UUID(bbca["id"]))
+
+        status_id = uuid.UUID(str(contract.status_id))
+        with pytest.raises(FinanceError, match="сведите"):
+            setup.update_value(session, workspace, status_id, {"archived": True})
+
+        revenue = next(v for v in schema["lists"]["economic_role"] if v["meaning"].get("system") == "revenue")
+        with pytest.raises(FinanceError, match="системный смысл"):
+            setup.update_value(session, workspace, uuid.UUID(revenue["id"]), {"archived": True})
+        with pytest.raises(FinanceError, match="системный смысл"):
+            setup.update_value(
+                session, workspace, uuid.UUID(revenue["id"]), {"meaning": {"system": "expense"}}
+            )
+
+        unused = setup.add_value(session, workspace, "status", "Временный")
+        setup.update_value(session, workspace, unused.id, {"archived": True})
+        final = setup.schema(session, workspace, FULL)
+        assert "Временный" not in [v["value"] for v in final["lists"]["status"]]
+        assert "Временный" in [v["value"] for v in final["archived_values"]["status"]]

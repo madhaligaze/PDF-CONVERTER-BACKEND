@@ -220,10 +220,14 @@ class Registry:
             self.department_by_name[item.normalized_name] = item
             if item.title:
                 self.department_by_name.setdefault(norm(item.title), item)
+        # Юрлицо в архиве — больше не «наше» для правил листов и подстановок.
+        # В архив уходит только юрлицо без договоров (setup.update_entity).
         self.own: dict[uuid.UUID, GroupEntity] = {
             item.counterparty_id: item
             for item in session.scalars(
-                sa.select(GroupEntity).where(GroupEntity.workspace_id == workspace.id)
+                sa.select(GroupEntity).where(
+                    GroupEntity.workspace_id == workspace.id, GroupEntity.archived_at.is_(None)
+                )
             )
         }
         self.views: list[EntityView] = list(
@@ -630,6 +634,35 @@ def facts_of(contract: Contract, registry: Registry, people: Sequence[uuid.UUID]
     facts["intra_group"] = own_executor and own_customer
     facts["phase"] = registry.meaning(contract.status_id).get("phase")
     facts["economic"] = registry.meaning(contract.economic_role_id).get("system")
+    # Подписи рядом с идентификаторами: «предмет содержит „аренд“» сравнивает
+    # текст значения, а не его id (views._check, условие `contains`).
+    for key in LIST_KEYS:
+        value_id = getattr(contract, f"{key}_id", None)
+        item = registry.values.get(value_id) if value_id else None
+        if item is not None:
+            facts[f"{key}__text"] = item.value
+    for key, raw in (contract.attrs or {}).items():
+        field_def = registry.field_by_key.get(key)
+        if field_def is None or field_def.type not in ("list", "multi_list"):
+            continue
+        texts = []
+        for item_id in raw if isinstance(raw, list) else [raw]:
+            try:
+                item = registry.values.get(uuid.UUID(str(item_id)))
+            except ValueError:
+                continue
+            if item is not None:
+                texts.append(item.value)
+        if texts:
+            facts[f"{key}__text"] = texts
+    department = registry.departments.get(contract.department_id) if contract.department_id else None
+    if department is not None:
+        facts["department__text"] = f"{department.code} {department.title or ''}".strip()
+    names = registry.parties_for([contract.executor_id, contract.customer_id])
+    for slot in ("executor", "customer"):
+        party = names.get(getattr(contract, f"{slot}_id"))
+        if party is not None:
+            facts[f"{slot}__text"] = party.name
     return facts
 
 

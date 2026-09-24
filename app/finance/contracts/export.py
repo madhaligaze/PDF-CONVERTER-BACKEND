@@ -99,7 +99,16 @@ def _text(registry: Registry, contract: Contract, key: str, people: Sequence[uui
 
 
 def build(session: Session, workspace: Workspace, access: Access, actor: Actor, view_keys: Sequence[str] | None = None) -> bytes:
+    """Книга .xlsx: лист реестра — лист книги, блок — название, шапка и строки.
+
+    Книга пишется потоком (`write_only`): строки уходят в файл по мере записи,
+    а не копятся объектами ячеек. Обычная книга держала в памяти каждую ячейку
+    со стилем — выгрузка 20 000 договоров поднимала процесс на 380 МБ, и
+    память обратно не возвращалась. В потоковой книге ширины колонок и
+    закрепление шапки задаются до первой строки: их знают заранее из листа.
+    """
     from openpyxl import Workbook
+    from openpyxl.cell import WriteOnlyCell
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
 
@@ -113,65 +122,90 @@ def build(session: Session, workspace: Workspace, access: Access, actor: Actor, 
     )
     people = people_of(session, [item.id for item in contracts])
     visible = [item for item in contracts if visible_to(item, registry, access, people.get(item.id, []))]
+    # Стороны всех выгружаемых договоров — одним запросом, а не по одному на
+    # договор внутри facts_of.
+    registry.parties_for({pid for item in visible for pid in (item.executor_id, item.customer_id)})
     facts = {item.id: facts_of(item, registry, people.get(item.id, [])) for item in visible}
     hidden = set(access.hidden)
 
     views: list[EntityView] = [
         view for view in registry.views if not view_keys or view.key in view_keys
     ]
-    book = Workbook()
-    book.remove(book.active)
+    book = Workbook(write_only=True)
     bold = Font(bold=True)
     wrap = Alignment(wrap_text=True, vertical="top")
+    taken_titles: list[str] = []
     for view in views:
-        sheet = book.create_sheet(title=_sheet_title(view.title, book.sheetnames))
+        title = _sheet_title(view.title, taken_titles)
+        taken_titles.append(title)
+        sheet = book.create_sheet(title=title)
         fill_hex = (view.style or {}).get("header_fill") or ""
         fill = PatternFill("solid", start_color=fill_hex) if fill_hex else None
-        row_index = 1
-        taken: set[uuid.UUID] = set()
+        blocks = list(view.blocks or [])
+        layouts = [
+            [column for column in (block.get("columns") or []) if column.get("key") not in hidden]
+            or _default_columns(registry, hidden)
+            for block in blocks
+        ]
+        # Договор — в одном блоке листа: в первом подходящем (`views.place`).
+        members: list[list[Contract]] = [[] for _ in blocks]
+        for item in visible:
+            index = views_module.place(view, facts[item.id])
+            if index is not None and index < len(members):
+                members[index].append(item)
         widths: dict[int, float] = {}
-        for number, block in enumerate(view.blocks or []):
-            columns = [
-                column for column in (block.get("columns") or []) if column.get("key") not in hidden
-            ] or _default_columns(registry, hidden)
-            members = [
-                item
-                for item in visible
-                if item.id not in taken and views_module.matches(block.get("filter"), facts[item.id])
-            ]
-            taken.update(item.id for item in members)
-            if block.get("title"):
-                sheet.cell(row=row_index, column=2, value=block["title"]).font = bold
-                row_index += 1
+        for columns in layouts:
             for c_index, column in enumerate(columns, start=1):
-                cell = sheet.cell(row=row_index, column=c_index, value=column.get("label") or _title(registry, column["key"]))
-                cell.font = bold
-                cell.alignment = wrap
-                if fill is not None:
-                    cell.fill = fill
                 if column.get("width"):
                     widths[c_index] = max(widths.get(c_index, 0), float(column["width"]))
-            header_row = row_index
-            row_index += 1
-            for position, item in enumerate(members, start=1):
-                mine = people.get(item.id, [])
-                for c_index, column in enumerate(columns, start=1):
-                    key = column["key"]
-                    value = position if key == ROW_NUMBER else _text(registry, item, key, mine)
-                    cell = sheet.cell(row=row_index, column=c_index, value=value)
-                    if isinstance(value, date):
-                        cell.number_format = "DD.MM.YYYY"
-                    elif isinstance(value, float) and key != ROW_NUMBER:
-                        cell.number_format = "# ##0"
-                    if isinstance(value, str) and "\n" in value:
-                        cell.alignment = wrap
-                row_index += 1
-            if number == 0 and len(view.blocks or []) == 1:
-                sheet.freeze_panes = sheet.cell(row=header_row + 1, column=1)
-            row_index += 2
         for c_index, width in widths.items():
             sheet.column_dimensions[get_column_letter(c_index)].width = width
-    if not book.sheetnames:
+        if len(blocks) == 1:
+            header_row = 2 if blocks[0].get("title") else 1
+            sheet.freeze_panes = f"A{header_row + 1}"
+
+        def styled(value: Any, *, font=None, alignment=None, number_format=None, cell_fill=None) -> WriteOnlyCell:
+            cell = WriteOnlyCell(sheet, value=value)
+            if font is not None:
+                cell.font = font
+            if alignment is not None:
+                cell.alignment = alignment
+            if number_format is not None:
+                cell.number_format = number_format
+            if cell_fill is not None:
+                cell.fill = cell_fill
+            return cell
+
+        for number, block in enumerate(blocks):
+            columns = layouts[number]
+            if number:
+                sheet.append([])
+                sheet.append([])
+            if block.get("title"):
+                sheet.append([None, styled(block["title"], font=bold)])
+            sheet.append([
+                styled(column.get("label") or _title(registry, column["key"]), font=bold, alignment=wrap, cell_fill=fill)
+                for column in columns
+            ])
+            for position, item in enumerate(members[number], start=1):
+                mine = people.get(item.id, [])
+                row: list[Any] = []
+                for column in columns:
+                    key = column["key"]
+                    if key == ROW_NUMBER:
+                        row.append(position)
+                        continue
+                    value = _text(registry, item, key, mine)
+                    if isinstance(value, date):
+                        row.append(styled(value, number_format="DD.MM.YYYY"))
+                    elif isinstance(value, float):
+                        row.append(styled(value, number_format="# ##0"))
+                    elif isinstance(value, str) and "\n" in value:
+                        row.append(styled(value, alignment=wrap))
+                    else:
+                        row.append(value)
+                sheet.append(row)
+    if not views:
         book.create_sheet("Реестр")
     buffer = io.BytesIO()
     book.save(buffer)
