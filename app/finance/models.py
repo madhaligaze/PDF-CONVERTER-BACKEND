@@ -190,6 +190,12 @@ class Account(FinanceBase):
     #: Исключён из отчётов. Не удалён: удалить счёт с операциями нельзя, а
     #: «личная карта директора» в корпоративном cash flow не нужна.
     excluded_from_reports: Mapped[bool] = mapped_column(sa.Boolean, server_default=sa.text("false"))
+    #: Наше юрлицо, которому принадлежит расчётный счёт. Необязательно: у кассы
+    #: и у компании из одного ТОО его нет. Нужно, чтобы оплата находила договор
+    #: своего ТОО, а порог НДС считался по юрлицу, а не по компании целиком.
+    group_entity_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("group_entities.counterparty_id", ondelete="SET NULL")
+    )
     position: Mapped[int] = mapped_column(sa.Integer, server_default=sa.text("0"))
     archived_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -668,6 +674,11 @@ class Invoice(FinanceBase):
     comment: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("''"))
     operation_id: Mapped[uuid.UUID | None] = mapped_column(
         sa.Uuid, sa.ForeignKey("operations.id", ondelete="SET NULL")
+    )
+    #: Договор, по которому выставлен счёт. Необязательно и пока пусто у всех:
+    #: заполнится, когда начисления начнут выставлять счета сами.
+    contract_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("contracts.id", ondelete="SET NULL")
     )
     created_by: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("''"))
     created_at: Mapped[datetime] = mapped_column(

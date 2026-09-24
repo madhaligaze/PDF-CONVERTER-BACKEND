@@ -70,6 +70,7 @@ def init_finance_database() -> None:
     # при старте.
     from app.finance import accounts_model as _accounts  # noqa: F401
     from app.finance import models as _models  # noqa: F401
+    from app.finance.contracts import models as _contracts  # noqa: F401
 
     engine = get_engine()
     if engine.dialect.name != "sqlite":

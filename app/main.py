@@ -189,6 +189,35 @@ async def _bbc_refresh_loop() -> None:
         live.set_waker(None)
 
 
+async def _contract_amendments_loop() -> None:
+    """Раз в час: соглашения «с даты», чей день настал, становятся значением договора.
+
+    Первый проход — через минуту после старта, а не сразу: старт не должен
+    ждать базы ради того, что спокойно подождёт. Проход — один запрос по
+    индексу `(applied_at, effective_from)` на все компании; между проходами
+    ничего не держится в памяти. Удаляемый модуль: снимается вместе с
+    «Финансами».
+    """
+    from app.finance.contracts import service as contracts_service
+    from app.finance.db import finance_session
+
+    def one_pass() -> int:
+        with finance_session() as session:
+            return contracts_service.apply_due(session)
+
+    await asyncio.sleep(60)
+    while True:
+        try:
+            applied = await asyncio.to_thread(one_pass)
+            if applied:
+                log.info("finance: применено соглашений по договорам: %s", applied)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — фоновый проход не роняет приложение
+            log.warning("finance: соглашения по договорам не применились (%s)", exc)
+        await asyncio.sleep(3600)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     # Схема — первым делом, до всего остального.
@@ -239,11 +268,21 @@ async def lifespan(_: FastAPI):
     except Exception as exc:  # noqa: BLE001
         log.warning("BBC live refresh failed to start: %s", exc)
 
+    # Соглашения по договорам «с даты» (удаляемый модуль «Финансы»).
+    contracts_task: asyncio.Task | None = None
+    try:
+        from app.finance.config import finance_settings
+
+        if finance_settings.enabled:
+            contracts_task = asyncio.create_task(_contract_amendments_loop())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("finance: фоновая задача договоров не запустилась: %s", exc)
+
     log.info("Application startup complete")
     try:
         yield
     finally:
-        for task in (bot_task, autocall_task, bbc_task):
+        for task in (bot_task, autocall_task, bbc_task, contracts_task):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

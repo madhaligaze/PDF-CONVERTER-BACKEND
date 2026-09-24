@@ -20,6 +20,8 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parents[1]
 PACKAGE = BACKEND / "app" / "finance"
 ROUTES = BACKEND / "app" / "api" / "routes" / "finance.py"
+#: Маршруты реестра договоров — отдельным файлом, те же правила.
+CONTRACT_ROUTES = BACKEND / "app" / "api" / "routes" / "finance_contracts.py"
 
 #: Пакеты, на которые модуль имеет право ссылаться.
 #:
@@ -61,11 +63,13 @@ def _outside(names: set[str]) -> set[str]:
 
 
 def test_paket_ne_zavisit_ot_chuzhih_moduley() -> None:
+    """Весь пакет, с подпакетами: реестр договоров живёт в `finance/contracts/`,
+    и проверка только верхнего уровня пропустила бы утечку именно там."""
     leaks: dict[str, set[str]] = {}
-    for path in sorted(PACKAGE.glob("*.py")):
+    for path in sorted(PACKAGE.rglob("*.py")):
         outside = _outside(_imports(path))
         if outside:
-            leaks[path.name] = outside
+            leaks[str(path.relative_to(PACKAGE))] = outside
     assert not leaks, (
         "Пакет «Финансы» сослался на чужие модули: "
         + "; ".join(f"{name} → {', '.join(sorted(items))}" for name, items in leaks.items())
@@ -76,6 +80,18 @@ def test_marshruty_ne_zavisyat_ot_uchetok_bbc() -> None:
     """Главное отличие от первой версии: в маршрутах тоже нет `app.bbc`."""
     outside = _outside(_imports(ROUTES))
     assert not outside, f"маршруты «Финансов» импортируют чужое: {sorted(outside)}"
+    # Маршруты договоров вправе брать вход и компанию у маршрутов раздела.
+    contract_outside = _outside(_imports(CONTRACT_ROUTES)) - {"app.api.routes.finance"}
+    assert not contract_outside, f"маршруты договоров импортируют чужое: {sorted(contract_outside)}"
+
+
+def test_marshruty_dogovorov_zakryty_i_berut_kompaniyu_iz_sessii() -> None:
+    source = CONTRACT_ROUTES.read_text(encoding="utf-8")
+    assert "Depends(contract_member)" in source
+    assert "must_change_password" in source
+    assert "ensure_workspace" not in source
+    assert "_workspace(session, member)" in source
+    assert "from app.bbc" not in source
 
 
 def test_marshruty_zakryty_svoey_avtorizatsiey() -> None:

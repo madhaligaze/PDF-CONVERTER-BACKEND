@@ -51,6 +51,8 @@ _hasher = PasswordHasher()
 MIN_PASSWORD_LENGTH = 8
 SESSION_TTL = timedelta(days=30)
 COOKIE_NAME = "fin_session"
+#: Как часто обновлять «был в сети» у сессии.
+LAST_SEEN_STEP = timedelta(minutes=1)
 
 #: Почта проверяется грубо и намеренно: сложные выражения отсекают живые
 #: адреса, а подтверждение всё равно приходит письмом (когда оно появится).
@@ -307,8 +309,15 @@ def resolve(session: Session, token: str | None) -> Member | None:
             # оставляем доступ: контекст сбрасывается, человек выберет другую.
             workspace = None
 
-    row.last_seen_at = now
-    session.flush()
+    # «Был в сети» пишется не чаще раза в минуту. Реестр договоров опрашивает
+    # сервер раз в две секунды из каждой открытой вкладки, и запись на каждый
+    # запрос превращала бы чтение в поток обновлений одной строки.
+    seen = row.last_seen_at
+    if seen is not None and seen.tzinfo is None:
+        seen = seen.replace(tzinfo=UTC)
+    if seen is None or (now - seen) >= LAST_SEEN_STEP:
+        row.last_seen_at = now
+        session.flush()
     return _member_of(session, user, workspace, membership.role if membership else "viewer", token, row.id)
 
 

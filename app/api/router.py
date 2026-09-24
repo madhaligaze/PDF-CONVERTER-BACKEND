@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from app.api.routes.autocall import router as autocall_router
 from app.api.routes.books import router as books_router  # «Книги» (удаляемый модуль)
 from app.api.routes.finance import router as finance_router  # «Финансы» (удаляемый модуль)
+from app.api.routes.finance_contracts import router as finance_contracts_router  # реестр договоров «Финансов»
 from app.bbc.routes import router as bbc_router  # BBC Dashboard (removable module)
 from app.api.routes.health import router as health_router
 from app.api.routes.scanned import router as scanned_router
@@ -24,3 +25,4 @@ api_router.include_router(books_router)
 # «Финансы»: та же причина, что у «Книг» — маршруты снаружи пакета, потому что
 # пакет про учётки не знает, а раздел закрыт правом.
 api_router.include_router(finance_router)
+api_router.include_router(finance_contracts_router)
