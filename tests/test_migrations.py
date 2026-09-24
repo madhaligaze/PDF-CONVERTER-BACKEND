@@ -157,6 +157,94 @@ def test_books_revision_is_reversible(scratch_database: str) -> None:
     assert after_up, "повторный upgrade не восстановил схему books"
 
 
+def test_finance_roles_migrate_to_grants(scratch_database: str) -> None:
+    """Ревизия 0019: прежние роли становятся правами, равными прежним способностям.
+
+    Бухгалтер вёл учёт, но счета не заводил и людей не видел; наблюдатель
+    только смотрел. После ревизии оба — сотрудники с личными правами, у
+    каждого члена компании есть запись сотрудника, а совпавшее имя не
+    склеивается с чужой записью. Откат возвращает роли.
+    """
+    from alembic import command
+    import sqlalchemy as sa
+
+    config = _alembic_config(scratch_database)
+    command.upgrade(config, "head")
+    command.downgrade(config, "0018")
+
+    ws, owner, buh, viewer = (uuid.uuid4() for _ in range(4))
+    engine = sa.create_engine(scratch_database)
+    try:
+        with engine.begin() as connection:
+            run = lambda sql, **params: connection.execute(sa.text(sql), params)  # noqa: E731
+            run("INSERT INTO finance.workspaces (id, slug, title) VALUES (:id, 'bbc-test', 'BBC (тест)')", id=ws)
+            for user_id, email, name in (
+                (owner, "owner@bbc.kz", "Ермеков Нурболат"),
+                (buh, "buh@bbc.kz", "Сейтова Айдана"),
+                (viewer, "view@bbc.kz", ""),
+            ):
+                run(
+                    "INSERT INTO finance.users (id, email, email_normalized, password_hash, full_name) "
+                    "VALUES (:id, :e, :e, 'x', :n)",
+                    id=user_id, e=email, n=name,
+                )
+            for user_id, role in ((owner, "owner"), (buh, "accountant"), (viewer, "viewer")):
+                run(
+                    "INSERT INTO finance.memberships (id, workspace_id, user_id, role) VALUES (:id, :w, :u, :r)",
+                    id=uuid.uuid4(), w=ws, u=user_id, r=role,
+                )
+            # Ответственный из реестра договоров с тем же именем, что у бухгалтера.
+            run(
+                "INSERT INTO finance.employees (id, workspace_id, full_name, normalized_name) "
+                "VALUES (:id, :w, 'Сейтова Айдана', 'сейтова айдана')",
+                id=uuid.uuid4(), w=ws,
+            )
+            run(
+                "INSERT INTO finance.action_log (id, workspace_id, actor, kind, entity) "
+                "VALUES (:id, :w, 'buh@bbc.kz', 'contract.export', 'contract')",
+                id=uuid.uuid4(), w=ws,
+            )
+
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            roles = dict(connection.execute(sa.text(
+                "SELECT user_id, role FROM finance.memberships WHERE workspace_id = :w"), {"w": ws}).all())
+            employees = dict(connection.execute(sa.text(
+                "SELECT user_id, full_name FROM finance.employees WHERE workspace_id = :w AND user_id IS NOT NULL"),
+                {"w": ws}).all())
+            grants = {
+                (user_id, resource): level
+                for user_id, resource, level in connection.execute(sa.text(
+                    "SELECT e.user_id, g.resource, g.level FROM finance.access_grants AS g "
+                    "JOIN finance.employees AS e ON e.id = g.subject_id AND g.subject_kind = 'employee'"
+                )).all()
+            }
+            log = connection.execute(sa.text(
+                "SELECT category, user_id FROM finance.action_log WHERE workspace_id = :w"), {"w": ws}).one()
+
+        assert roles == {owner: "owner", buh: "employee", viewer: "employee"}
+        assert set(employees) == {owner, buh, viewer}, "у каждого члена компании — запись сотрудника"
+        assert employees[buh] == "Сейтова Айдана · buh@bbc.kz", "чужая запись с тем же именем не склеивается"
+        assert employees[viewer] == "view@bbc.kz"
+        assert grants[(buh, "journal")] == "edit" and grants[(buh, "contracts")] == "edit"
+        assert grants[(buh, "dictionaries")] == "view", "счета бухгалтер и раньше не заводил"
+        assert grants[(buh, "integrations")] == "view"
+        assert (buh, "people") not in grants and (buh, "audit") not in grants
+        assert grants[(viewer, "journal")] == "view" and grants[(viewer, "reports.debts")] == "view"
+        assert not any(level == "edit" for (user, _res), level in grants.items() if user == viewer)
+        assert not any(user == owner for user, _res in grants), "владельцу права не записываются"
+        assert log == ("export", buh), "старая запись журнала получила вид и автора"
+
+        command.downgrade(config, "0018")
+        with engine.connect() as connection:
+            back = dict(connection.execute(sa.text(
+                "SELECT user_id, role FROM finance.memberships WHERE workspace_id = :w"), {"w": ws}).all())
+        assert back == {owner: "owner", buh: "accountant", viewer: "viewer"}
+        command.upgrade(config, "head")
+    finally:
+        engine.dispose()
+
+
 def _schema_exists(connection, name: str) -> bool:
     import sqlalchemy as sa
 

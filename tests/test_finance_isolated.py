@@ -22,6 +22,8 @@ PACKAGE = BACKEND / "app" / "finance"
 ROUTES = BACKEND / "app" / "api" / "routes" / "finance.py"
 #: Маршруты реестра договоров — отдельным файлом, те же правила.
 CONTRACT_ROUTES = BACKEND / "app" / "api" / "routes" / "finance_contracts.py"
+#: Люди, права, журнал действий, уведомления — тоже отдельным файлом.
+PEOPLE_ROUTES = BACKEND / "app" / "api" / "routes" / "finance_people.py"
 
 #: Пакеты, на которые модуль имеет право ссылаться.
 #:
@@ -80,15 +82,22 @@ def test_marshruty_ne_zavisyat_ot_uchetok_bbc() -> None:
     """Главное отличие от первой версии: в маршрутах тоже нет `app.bbc`."""
     outside = _outside(_imports(ROUTES))
     assert not outside, f"маршруты «Финансов» импортируют чужое: {sorted(outside)}"
-    # Маршруты договоров вправе брать вход и компанию у маршрутов раздела.
-    contract_outside = _outside(_imports(CONTRACT_ROUTES)) - {"app.api.routes.finance"}
-    assert not contract_outside, f"маршруты договоров импортируют чужое: {sorted(contract_outside)}"
+    # Маршруты договоров и доступа вправе брать вход и компанию у маршрутов раздела.
+    for path in (CONTRACT_ROUTES, PEOPLE_ROUTES):
+        outside = _outside(_imports(path)) - {"app.api.routes.finance"}
+        assert not outside, f"{path.name} импортирует чужое: {sorted(outside)}"
 
 
 def test_marshruty_dogovorov_zakryty_i_berut_kompaniyu_iz_sessii() -> None:
+    """Двери реестра — право раздела «Договоры», а не просто вход.
+
+    Временный пароль отсекает сама `require_access` (одна дверь на раздел);
+    полный обход маршрутов с проверкой объявлений — `test_finance_access.py`.
+    """
     source = CONTRACT_ROUTES.read_text(encoding="utf-8")
     assert "Depends(contract_member)" in source
-    assert "must_change_password" in source
+    assert 'require_access("contracts", "view")' in source
+    assert 'require_access("contracts", "edit")' in source
     assert "ensure_workspace" not in source
     assert "_workspace(session, member)" in source
     assert "from app.bbc" not in source
@@ -97,16 +106,21 @@ def test_marshruty_dogovorov_zakryty_i_berut_kompaniyu_iz_sessii() -> None:
 def test_marshruty_zakryty_svoey_avtorizatsiey() -> None:
     """Обратная проверка: убрать чужую охрану мало, надо поставить свою.
 
-    Без неё тест выше можно «пройти», просто сняв все проверки прав.
+    Без неё тест выше можно «пройти», просто сняв все проверки прав. С
+    ревизии 0019 охрана — право раздела (`require_access`), а временный пароль
+    отсекается в ней же, одной проверкой на все двери.
     """
     source = ROUTES.read_text(encoding="utf-8")
-    assert "def current_member(" in source
-    assert 'require_ability("write")' in source
-    assert 'require_ability("accounts")' in source
+    assert "def signed_in(" in source
+    assert "def require_access(" in source
+    assert "must_change_password" in source
+    assert 'require_access("journal", "edit")' in source or 'require_access(("journal", "calendar"), "edit")' in source
+    assert 'require_access("dictionaries", "edit")' in source
     # Проверяем отсутствие ИМПОРТА, а не слова: слово есть в объяснении, почему
     # чужой охраны здесь больше нет, и это объяснение полезно.
     assert "from app.bbc" not in source
     assert "Depends(require_block_user" not in source
+    assert "require_ability(" not in source, "старая проверка по способности осталась в маршруте"
 
 
 def test_marshruty_berut_kompaniyu_iz_sessii() -> None:

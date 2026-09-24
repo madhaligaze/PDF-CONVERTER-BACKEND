@@ -164,6 +164,9 @@ class Employee(FinanceBase):
     __tablename__ = "employees"
     __table_args__ = (
         sa.UniqueConstraint("workspace_id", "normalized_name", name="uq_employees_name"),
+        # Одна учётка — один человек компании: права сотрудника пишутся на эту
+        # запись, и две записи на одну учётку давали бы два набора прав.
+        sa.UniqueConstraint("workspace_id", "user_id", name="uq_employees_workspace_user"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=_uuid)

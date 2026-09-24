@@ -131,10 +131,9 @@ class NotFound(FinanceError):
 class Access:
     """Что человеку можно в реестре.
 
-    До блока доступа это выводится из роли: владелец и администратор — всё,
-    бухгалтер — читать и править, наблюдатель — читать. Блок доступа
-    подставит сюда настоящие права отделов и людей, а сервис от этого не
-    изменится: он с первого дня спрашивает только этот объект.
+    Собирается из прав отдела и человека (`access_of`, `app/finance/access.py`);
+    сервис с первого дня спрашивает только этот объект, поэтому приход
+    настоящих прав его не изменил.
     """
 
     view: bool = False
@@ -154,14 +153,34 @@ class Access:
 
 
 def access_of(member: Any) -> Access:
-    role = getattr(member, "role", "viewer")
-    if role in ("owner", "admin"):
+    """Права на реестр из снимка вошедшего (`Member.rights`).
+
+    * владелец и администратор — всё, включая загрузку и настройку реестра;
+    * сотрудник — уровень раздела «Договоры» (видит / правит), область строк
+      (все / своего отдела / где он ответственный), юрлица и поля: «нет» —
+      поле скрыто и не сериализуется вовсе, «видит» — только чтение.
+    """
+    rights = getattr(member, "rights", None)
+    if rights is None:
+        return Access()
+    if rights.is_admin:
         return Access(view=True, edit=True, setup=True)
-    if member.can("write"):
-        return Access(view=True, edit=True)
-    if member.can("read"):
-        return Access(view=True)
-    return Access()
+    level = rights.level("contracts")
+    if level == "none":
+        return Access()
+    hidden = frozenset(key for key in rights.fields if rights.field_level(key) == "none")
+    readonly = frozenset(key for key in rights.fields if rights.field_level(key) == "view")
+    return Access(
+        view=True,
+        edit=level == "edit",
+        setup=False,
+        rows=rights.contract_rows,
+        department_ids=frozenset({rights.department_id}) if rights.department_id else frozenset(),
+        employee_id=rights.employee_id,
+        entity_ids=rights.contract_entities,
+        hidden=hidden,
+        readonly=readonly,
+    )
 
 
 # ── Контекст реестра ─────────────────────────────────────────────────────────
@@ -220,20 +239,48 @@ class Registry:
         )
         self.economic = economic_role_values(session, workspace.id)
         self._parties: dict[uuid.UUID, Counterparty] | None = None
+        self._party_cache: dict[uuid.UUID, Counterparty] = {}
         self._party_index: dict[str, dict[str, set[uuid.UUID]]] | None = None
         self._employees: dict[uuid.UUID, Employee] | None = None
         self._employee_by_name: dict[str, Employee] | None = None
+        self._employee_cache: dict[uuid.UUID, Employee] = {}
 
     # — стороны —
 
     @property
     def parties(self) -> dict[uuid.UUID, Counterparty]:
+        """Все контрагенты компании — для разбора текста в сторону.
+
+        Ответу они не нужны: сборка ответа берёт `parties_for` — только
+        стороны отданных договоров.
+        """
         if self._parties is None:
             rows = self.session.scalars(
                 sa.select(Counterparty).where(Counterparty.workspace_id == self.workspace.id)
             ).all()
             self._parties = {item.id: item for item in rows}
         return self._parties
+
+    def parties_for(self, ids: Iterable[uuid.UUID | None]) -> dict[uuid.UUID, Counterparty]:
+        """Только названные стороны.
+
+        Опрос `changes` идёт раз в две секунды из каждой открытой вкладки, и
+        при любой чужой правке каждая вкладка собирает ответ. Читать ради
+        двух сторон всех контрагентов компании (у BBC их тысячи) — значит
+        умножить одну правку на число открытых вкладок.
+        """
+        wanted = {item for item in ids if item}
+        if self._parties is not None:
+            return {pid: self._parties[pid] for pid in wanted if pid in self._parties}
+        missing = wanted - self._party_cache.keys()
+        if missing:
+            for row in self.session.scalars(
+                sa.select(Counterparty).where(
+                    Counterparty.workspace_id == self.workspace.id, Counterparty.id.in_(missing)
+                )
+            ):
+                self._party_cache[row.id] = row
+        return {pid: self._party_cache[pid] for pid in wanted if pid in self._party_cache}
 
     def _index(self) -> dict[str, dict[str, set[uuid.UUID]]]:
         if self._party_index is None:
@@ -398,6 +445,19 @@ class Registry:
         self._load_employees()
         assert self._employees is not None
         return self._employees
+
+    def employees_for(self, ids: Iterable[uuid.UUID | None]) -> dict[uuid.UUID, Employee]:
+        """Только названные сотрудники — по той же причине, что `parties_for`."""
+        wanted = {item for item in ids if item}
+        if self._employees is not None:
+            return {eid: self._employees[eid] for eid in wanted if eid in self._employees}
+        missing = wanted - self._employee_cache.keys()
+        if missing:
+            for row in self.session.scalars(
+                sa.select(Employee).where(Employee.workspace_id == self.workspace.id, Employee.id.in_(missing))
+            ):
+                self._employee_cache[row.id] = row
+        return {eid: self._employee_cache[eid] for eid in wanted if eid in self._employee_cache}
 
     def resolve_people(self, raw: Any, *, create: bool = True) -> list[Employee]:
         """Ответственные: список идентификаторов или текст «Елжас, Тимур»."""
@@ -817,7 +877,14 @@ class Output:
         for item in contracts:
             party_ids.update(pid for pid in (item.executor_id, item.customer_id) if pid)
             employee_ids.update(people.get(item.id, []))
-        party_names = {pid: party.name for pid, party in registry.parties.items()}
+        # Имена нужны сторонам этих договоров и договоров с тем же номером
+        # («номер уже есть у ТОО «Бета»») — не всем контрагентам компании.
+        number_parties = {
+            pid for entries in numbers.by_key.values() for _cid, pair in entries for pid in pair if pid
+        }
+        party_names = {
+            pid: party.name for pid, party in registry.parties_for(party_ids | number_parties).items()
+        }
         visible = [
             item.key
             for item in registry.fields
@@ -871,11 +938,9 @@ class Output:
 
     def parties(self, ids: Iterable[uuid.UUID]) -> dict[str, Any]:
         registry = self.registry
+        found = registry.parties_for(ids)
         out: dict[str, Any] = {}
-        for party_id in ids:
-            party = registry.parties.get(party_id)
-            if party is None:
-                continue
+        for party_id, party in found.items():
             own = registry.own.get(party_id)
             out[str(party_id)] = {
                 "id": str(party_id),
@@ -887,12 +952,8 @@ class Output:
         return out
 
     def people(self, ids: Iterable[uuid.UUID]) -> dict[str, Any]:
-        employees = self.registry.employees
         out: dict[str, Any] = {}
-        for employee_id in ids:
-            employee = employees.get(employee_id)
-            if employee is None:
-                continue
+        for employee_id, employee in self.registry.employees_for(ids).items():
             out[str(employee_id)] = {
                 "id": str(employee_id),
                 "name": employee.full_name,
@@ -930,6 +991,12 @@ def _live_contracts(session: Session, workspace_id: uuid.UUID):
 
 
 def list_all(session: Session, workspace: Workspace, access: Access) -> dict[str, Any]:
+    # Номер — до выборки строк, не после: правка, закоммиченная между ними,
+    # иначе попала бы под курсор и не пришла бы клиенту ни здесь, ни опросом.
+    # Счётчик держит блокировку до коммита, поэтому всё с номером ≤ seq_now
+    # уже видно следующему чтению.
+    seq_now = current(session, workspace.id, "contracts")
+    schema_now = current(session, workspace.id, "schema")
     registry = Registry(session, workspace)
     contracts = list(session.scalars(_live_contracts(session, workspace.id)))
     numbers = NumberIndex()
@@ -941,8 +1008,8 @@ def list_all(session: Session, workspace: Workspace, access: Access) -> dict[str
         "contracts": items,
         "parties": parties,
         "people": people,
-        "seq": current(session, workspace.id, "contracts"),
-        "schema_rev": current(session, workspace.id, "schema"),
+        "seq": seq_now,
+        "schema_rev": schema_now,
     }
 
 
@@ -979,13 +1046,16 @@ def changes(session: Session, workspace: Workspace, access: Access, since: int) 
     # Договор, ушедший из видимости (сменили отдел), для этого человека — убран.
     shown = {item["id"] for item in items}
     removed.extend(str(item.id) for item in live if str(item.id) not in shown)
+    # Курсор — номер, прочитанный ДО выборки. Строки, закоммиченные после него,
+    # могли попасть в выборку — придут ещё раз следующим опросом, это не
+    # страшно; перечитанный здесь номер перескочил бы через них навсегда.
     return {
         "contracts": items,
         "removed": removed,
         "parties": parties,
         "people": people,
-        "seq": current(session, workspace.id, "contracts"),
-        "schema_rev": current(session, workspace.id, "schema"),
+        "seq": seq_now,
+        "schema_rev": schema_now,
     }
 
 
@@ -1188,7 +1258,8 @@ def _label(registry: Registry, key: str, value: Any) -> str:
         return "—"
     try:
         if key in ("executor", "customer"):
-            party = registry.parties.get(uuid.UUID(str(value)))
+            party_id = uuid.UUID(str(value))
+            party = registry.parties_for([party_id]).get(party_id)
             return party.name if party else str(value)
         if key in LIST_KEYS:
             item = registry.values.get(uuid.UUID(str(value)))
@@ -1197,11 +1268,8 @@ def _label(registry: Registry, key: str, value: Any) -> str:
             item = registry.departments.get(uuid.UUID(str(value)))
             return item.code if item else str(value)
         if key == "people":
-            names = [
-                registry.employees[uuid.UUID(item)].full_name
-                for item in value
-                if uuid.UUID(item) in registry.employees
-            ]
+            found = registry.employees_for(uuid.UUID(str(item)) for item in value)
+            names = [found[uuid.UUID(str(item))].full_name for item in value if uuid.UUID(str(item)) in found]
             return ", ".join(names) or "—"
         if key == "amount":
             return f"{Decimal(str(value)):,.2f}".replace(",", " ").replace(".00", "")
@@ -1226,6 +1294,10 @@ def _check_access(registry: Registry, access: Access, keys: Iterable[str]) -> No
     for key in keys:
         if key not in registry.field_by_key:
             raise FinanceError(f"Поля «{key}» в реестре нет")
+        if key in access.hidden:
+            # Отказ без подписи поля: она не должна доезжать до того, от кого
+            # поле спрятано.
+            raise PermissionError("Это поле вам не открыто")
         if not access.can_edit_field(key):
             title = registry.field_by_key[key].title
             raise PermissionError(f"«{title}» вам можно только смотреть")
@@ -1575,7 +1647,8 @@ def acknowledge(
     registry = Registry(session, workspace)
     contract = get_contract(session, workspace, contract_id, for_update=True)
     numbers = number_index_for(session, workspace.id, [contract.number_key])
-    names = {pid: party.name for pid, party in registry.parties.items()}
+    named = {pid for entries in numbers.by_key.values() for _cid, pair in entries for pid in pair if pid}
+    names = {pid: party.name for pid, party in registry.parties_for(named).items()}
     current_issues = {issue["code"]: issue for issue in issues_of(contract, registry, numbers, names)}
     acked = dict(contract.acknowledged or {})
     if on:

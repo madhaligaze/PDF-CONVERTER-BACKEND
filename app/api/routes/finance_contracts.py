@@ -27,7 +27,8 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, Up
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from app.api.routes.finance import _workspace, current_member
+from app.api.routes.finance import _workspace, require_access
+from app.finance import heap, history
 from app.finance.auth import Member
 from app.finance.config import finance_settings
 from app.finance.contracts import amendments as amendments_module
@@ -41,17 +42,14 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/finance/contracts", tags=["finance-contracts"])
 
-
-def contract_member(member: Member = Depends(current_member)) -> Member:
-    """Вошедший, у которого пароль уже не временный.
-
-    Одна проверка на все двери реестра: временный пароль, продиктованный по
-    телефону и оставшийся в переписке, не должен открывать договоры (урок
-    дашборда BBC, где эту проверку забыли в одном маршруте).
-    """
-    if member.must_change_password:
-        raise HTTPException(status_code=403, detail="Сначала смените временный пароль")
-    return member
+#: Одна проверка на все двери реестра — раздел «Договоры» открыт на чтение
+#: или на правку. Временный пароль (`must_change_password`), продиктованный
+#: по телефону и оставшийся в переписке, не открывает договоры: его
+#: отсекает `require_access` в `routes/finance.py` — одна дверь для всего
+#: раздела, а не проверка по месту (урок дашборда BBC, где её забыли в одном
+#: маршруте). Строки и поля договоров режутся дальше, в сервисе, по `Access`.
+contract_member = require_access("contracts", "view")
+contract_editor = require_access("contracts", "edit")
 
 
 def _access(member: Member) -> service.Access:
@@ -62,7 +60,8 @@ def _access(member: Member) -> service.Access:
 
 
 def _actor(member: Member) -> service.Actor:
-    return service.Actor(member.user_id, member.email)
+    # Логин, а не почта: у сотрудника, входящего по номеру, почты нет.
+    return service.Actor(member.user_id, member.login)
 
 
 def _fail(exc: Exception, session=None, workspace=None, access=None) -> HTTPException | JSONResponse:
@@ -126,10 +125,13 @@ def get_changes(since: int = Query(0, ge=0), member: Member = Depends(contract_m
 def export_xlsx(views: str = Query(""), member: Member = Depends(contract_member)) -> Response:
     access = _access(member)
     keys = [key for key in views.split(",") if key] or None
-    with finance_session() as session:
-        workspace = _workspace(session, member)
-        data = export_module.build(session, workspace, access, _actor(member), keys)
-        title = workspace.title
+    try:
+        with finance_session() as session:
+            workspace = _workspace(session, member)
+            data = export_module.build(session, workspace, access, _actor(member), keys)
+            title = workspace.title
+    finally:
+        heap.trim()
     name = f"Реестр договоров — {title} — {datetime.now():%Y-%m-%d}.xlsx"
     return Response(
         content=data,
@@ -236,7 +238,7 @@ def _require_setup(access: service.Access) -> None:
 
 
 @router.post("/imports", status_code=201)
-def upload_registry(file: UploadFile = File(...), member: Member = Depends(contract_member)) -> dict[str, Any]:
+def upload_registry(file: UploadFile = File(...), member: Member = Depends(contract_editor)) -> dict[str, Any]:
     access = _access(member)
     _require_setup(access)
     limit = int(finance_settings.import_max_mb * 1024 * 1024)
@@ -246,13 +248,21 @@ def upload_registry(file: UploadFile = File(...), member: Member = Depends(contr
     name = file.filename or "реестр.xlsx"
     if not name.lower().endswith((".xlsx", ".xlsm")):
         raise HTTPException(status_code=400, detail="Реестр загружается из .xlsx")
-    with finance_session() as session:
-        workspace = _workspace(session, member)
-        try:
-            batch = importer.start(session, workspace, _actor(member), data, name)
-        except Exception as exc:  # noqa: BLE001
-            _raise(exc)
-        return _batch_out(batch)
+    try:
+        with finance_session() as session:
+            workspace = _workspace(session, member)
+            try:
+                batch = importer.start(session, workspace, _actor(member), data, name)
+            except Exception as exc:  # noqa: BLE001
+                _raise(exc)
+            history.write(
+                session, workspace, kind="contract.import.upload", entity="contract_import", entity_id=batch.id,
+                title=f"разбор реестра «{name}»", after={"file_name": name, "bytes": len(data)},
+            )
+            return _batch_out(batch)
+    finally:
+        del data
+        heap.trim()
 
 
 @router.get("/imports/{batch_id}")
@@ -268,7 +278,7 @@ def get_import(batch_id: UUID, member: Member = Depends(contract_member)) -> dic
 
 
 @router.post("/imports/{batch_id}/decide")
-def decide_import(batch_id: UUID, body: DecisionsIn, member: Member = Depends(contract_member)) -> dict[str, Any]:
+def decide_import(batch_id: UUID, body: DecisionsIn, member: Member = Depends(contract_editor)) -> dict[str, Any]:
     access = _access(member)
     _require_setup(access)
     with finance_session() as session:
@@ -280,19 +290,23 @@ def decide_import(batch_id: UUID, body: DecisionsIn, member: Member = Depends(co
 
 
 @router.post("/imports/{batch_id}/apply")
-def apply_import(batch_id: UUID, member: Member = Depends(contract_member)) -> dict[str, Any]:
+def apply_import(batch_id: UUID, member: Member = Depends(contract_editor)) -> dict[str, Any]:
     access = _access(member)
-    with finance_session() as session:
-        workspace = _workspace(session, member)
-        try:
-            result = importer.apply(session, workspace, access, _actor(member), batch_id)
-        except Exception as exc:  # noqa: BLE001
-            _raise(exc)
-        return {"result": result}
+    _require_setup(access)
+    try:
+        with finance_session() as session:
+            workspace = _workspace(session, member)
+            try:
+                result = importer.apply(session, workspace, access, _actor(member), batch_id)
+            except Exception as exc:  # noqa: BLE001
+                _raise(exc)
+            return {"result": result}
+    finally:
+        heap.trim()
 
 
 @router.post("/imports/{batch_id}/cancel")
-def cancel_import(batch_id: UUID, member: Member = Depends(contract_member)) -> dict[str, Any]:
+def cancel_import(batch_id: UUID, member: Member = Depends(contract_editor)) -> dict[str, Any]:
     access = _access(member)
     _require_setup(access)
     with finance_session() as session:
@@ -301,6 +315,10 @@ def cancel_import(batch_id: UUID, member: Member = Depends(contract_member)) -> 
             importer.cancel(session, workspace, batch_id)
         except Exception as exc:  # noqa: BLE001
             _raise(exc)
+        history.write(
+            session, workspace, kind="contract.import.cancel", entity="contract_import", entity_id=batch_id,
+            title="разбор реестра отменён",
+        )
         return {"ok": True}
 
 
@@ -355,15 +373,26 @@ class FilterIn(BaseModel):
     filter: dict[str, Any] = Field(default_factory=dict)
 
 
-def _setup_call(member: Member, action):
+def _setup_call(member: Member, action, what: str, kind: str):
+    """Настройка реестра — только владелец и администратор; каждая — событие журнала.
+
+    Поле, список, лист, юрлицо меняют то, как читается весь реестр, и
+    «кто добавил этот лист» должно быть видно так же, как правка договора.
+    """
     access = _access(member)
     _require_setup(access)
     with finance_session() as session:
         workspace = _workspace(session, member)
         try:
-            return action(session, workspace, access)
+            result = action(session, workspace, access)
         except Exception as exc:  # noqa: BLE001
             _raise(exc)
+        history.write(
+            session, workspace, kind=f"contracts.setup.{kind}", entity="contract_setup",
+            title=f"настройка реестра: {what}",
+            after=result if isinstance(result, dict) and len(str(result)) < 4000 else {},
+        )
+        return result
 
 
 def _data(model: BaseModel) -> dict[str, Any]:
@@ -371,42 +400,41 @@ def _data(model: BaseModel) -> dict[str, Any]:
 
 
 @router.post("/setup/fields", status_code=201)
-def add_field(body: FieldIn, member: Member = Depends(contract_member)) -> dict[str, Any]:
+def add_field(body: FieldIn, member: Member = Depends(contract_editor)) -> dict[str, Any]:
     def action(session, workspace, access):
         item = setup.add_field(session, workspace, title=body.title or "", type=body.type or "text", after=body.after)
         return {"key": item.key}
 
-    return _setup_call(member, action)
+    return _setup_call(member, action, "поле добавлено", "field_add")
 
 
 @router.patch("/setup/fields/{key}")
-def update_field(key: str, body: FieldIn, member: Member = Depends(contract_member)) -> dict[str, Any]:
-    return _setup_call(member, lambda s, w, a: {"key": setup.update_field(s, w, key, _data(body)).key})
+def update_field(key: str, body: FieldIn, member: Member = Depends(contract_editor)) -> dict[str, Any]:
+    return _setup_call(member, lambda s, w, a: {"key": setup.update_field(s, w, key, _data(body)).key}, "поле изменено", "field_update")
 
 
 @router.post("/setup/lists/{field_key}", status_code=201)
-def add_value(field_key: str, body: ValueIn, member: Member = Depends(contract_member)) -> dict[str, Any]:
+def add_value(field_key: str, body: ValueIn, member: Member = Depends(contract_editor)) -> dict[str, Any]:
     return _setup_call(
-        member, lambda s, w, a: {"id": str(setup.add_value(s, w, field_key, body.value or "", body.meaning).id)}
-    )
+        member, lambda s, w, a: {"id": str(setup.add_value(s, w, field_key, body.value or "", body.meaning).id)}, "значение списка добавлено", "value_add")
 
 
 @router.patch("/setup/values/{value_id}")
-def update_value(value_id: UUID, body: ValueIn, member: Member = Depends(contract_member)) -> dict[str, Any]:
-    return _setup_call(member, lambda s, w, a: {"id": str(setup.update_value(s, w, value_id, _data(body)).id)})
+def update_value(value_id: UUID, body: ValueIn, member: Member = Depends(contract_editor)) -> dict[str, Any]:
+    return _setup_call(member, lambda s, w, a: {"id": str(setup.update_value(s, w, value_id, _data(body)).id)}, "значение списка изменено", "value_update")
 
 
 @router.post("/setup/values/merge")
-def merge_values(body: MergeIn, member: Member = Depends(contract_member)) -> dict[str, Any]:
+def merge_values(body: MergeIn, member: Member = Depends(contract_editor)) -> dict[str, Any]:
     def action(session, workspace, access):
         setup.merge_values(session, workspace, keep=body.keep, drop=body.drop)
         return {"ok": True}
 
-    return _setup_call(member, action)
+    return _setup_call(member, action, "значения списка объединены", "value_merge")
 
 
 @router.post("/setup/entities", status_code=201)
-def add_entity(body: EntityIn, member: Member = Depends(contract_member)) -> dict[str, Any]:
+def add_entity(body: EntityIn, member: Member = Depends(contract_editor)) -> dict[str, Any]:
     def action(session, workspace, access):
         entity = setup.add_entity(
             session, workspace, name=body.name or body.code or "", code=body.code or "",
@@ -414,45 +442,43 @@ def add_entity(body: EntityIn, member: Member = Depends(contract_member)) -> dic
         )
         return {"id": str(entity.counterparty_id)}
 
-    return _setup_call(member, action)
+    return _setup_call(member, action, "наше юрлицо добавлено", "entity_add")
 
 
 @router.patch("/setup/entities/{party_id}")
-def update_entity(party_id: UUID, body: EntityIn, member: Member = Depends(contract_member)) -> dict[str, Any]:
+def update_entity(party_id: UUID, body: EntityIn, member: Member = Depends(contract_editor)) -> dict[str, Any]:
     return _setup_call(
-        member, lambda s, w, a: {"id": str(setup.update_entity(s, w, party_id, _data(body)).counterparty_id)}
-    )
+        member, lambda s, w, a: {"id": str(setup.update_entity(s, w, party_id, _data(body)).counterparty_id)}, "наше юрлицо изменено", "entity_update")
 
 
 @router.post("/setup/parties/merge")
-def merge_parties(body: MergeIn, member: Member = Depends(contract_member)) -> dict[str, Any]:
+def merge_parties(body: MergeIn, member: Member = Depends(contract_editor)) -> dict[str, Any]:
     def action(session, workspace, access):
         setup.merge_parties(session, workspace, keep=body.keep, drop=body.drop)
         return {"ok": True}
 
-    return _setup_call(member, action)
+    return _setup_call(member, action, "контрагенты объединены", "party_merge")
 
 
 @router.post("/setup/departments", status_code=201)
-def add_department(body: DepartmentIn, member: Member = Depends(contract_member)) -> dict[str, Any]:
-    return _setup_call(member, lambda s, w, a: {"id": str(setup.upsert_department(s, w, _data(body)).id)})
+def add_department(body: DepartmentIn, member: Member = Depends(contract_editor)) -> dict[str, Any]:
+    return _setup_call(member, lambda s, w, a: {"id": str(setup.upsert_department(s, w, _data(body)).id)}, "отдел добавлен", "department_add")
 
 
 @router.patch("/setup/departments/{department_id}")
-def update_department(department_id: UUID, body: DepartmentIn, member: Member = Depends(contract_member)) -> dict[str, Any]:
+def update_department(department_id: UUID, body: DepartmentIn, member: Member = Depends(contract_editor)) -> dict[str, Any]:
     return _setup_call(
-        member, lambda s, w, a: {"id": str(setup.upsert_department(s, w, _data(body), department_id).id)}
-    )
+        member, lambda s, w, a: {"id": str(setup.upsert_department(s, w, _data(body), department_id).id)}, "отдел изменён", "department_update")
 
 
 @router.post("/setup/views", status_code=201)
-def add_view(body: ViewIn, member: Member = Depends(contract_member)) -> dict[str, Any]:
-    return _setup_call(member, lambda s, w, a: setup.view_out(setup.upsert_view(s, w, _data(body))))
+def add_view(body: ViewIn, member: Member = Depends(contract_editor)) -> dict[str, Any]:
+    return _setup_call(member, lambda s, w, a: setup.view_out(setup.upsert_view(s, w, _data(body))), "лист добавлен", "view_add")
 
 
 @router.patch("/setup/views/{view_id}")
-def update_view(view_id: UUID, body: ViewIn, member: Member = Depends(contract_member)) -> dict[str, Any]:
-    return _setup_call(member, lambda s, w, a: setup.view_out(setup.upsert_view(s, w, _data(body), view_id)))
+def update_view(view_id: UUID, body: ViewIn, member: Member = Depends(contract_editor)) -> dict[str, Any]:
+    return _setup_call(member, lambda s, w, a: setup.view_out(setup.upsert_view(s, w, _data(body), view_id)), "лист изменён", "view_update")
 
 
 @router.post("/setup/views/preview")
@@ -492,7 +518,7 @@ class PieceIn(BaseModel):
 
 
 @router.post("", status_code=201)
-def create_contract(body: CreateIn, member: Member = Depends(contract_member)):
+def create_contract(body: CreateIn, member: Member = Depends(contract_editor)):
     access = _access(member)
     with finance_session() as session:
         workspace = _workspace(session, member)
@@ -521,7 +547,7 @@ def get_contract(contract_id: UUID, member: Member = Depends(contract_member)):
 
 
 @router.patch("/{contract_id}")
-def patch_contract(contract_id: UUID, body: PatchIn, member: Member = Depends(contract_member)):
+def patch_contract(contract_id: UUID, body: PatchIn, member: Member = Depends(contract_editor)):
     access = _access(member)
     with finance_session() as session:
         workspace = _workspace(session, member)
@@ -540,7 +566,7 @@ def patch_contract(contract_id: UUID, body: PatchIn, member: Member = Depends(co
 
 
 @router.delete("/{contract_id}")
-def delete_contract(contract_id: UUID, member: Member = Depends(contract_member)):
+def delete_contract(contract_id: UUID, member: Member = Depends(contract_editor)):
     access = _access(member)
     with finance_session() as session:
         workspace = _workspace(session, member)
@@ -553,7 +579,7 @@ def delete_contract(contract_id: UUID, member: Member = Depends(contract_member)
 
 
 @router.post("/{contract_id}/acknowledge")
-def acknowledge(contract_id: UUID, body: AcknowledgeIn, member: Member = Depends(contract_member)):
+def acknowledge(contract_id: UUID, body: AcknowledgeIn, member: Member = Depends(contract_editor)):
     access = _access(member)
     with finance_session() as session:
         workspace = _workspace(session, member)
@@ -600,7 +626,7 @@ def parse_amendments(contract_id: UUID, member: Member = Depends(contract_member
 
 
 @router.post("/{contract_id}/amendments/confirm")
-def confirm_amendment(contract_id: UUID, body: PieceIn, member: Member = Depends(contract_member)):
+def confirm_amendment(contract_id: UUID, body: PieceIn, member: Member = Depends(contract_editor)):
     access = _access(member)
     with finance_session() as session:
         workspace = _workspace(session, member)
@@ -613,7 +639,7 @@ def confirm_amendment(contract_id: UUID, body: PieceIn, member: Member = Depends
 
 
 @router.delete("/{contract_id}/amendments/{amendment_id}")
-def remove_amendment(contract_id: UUID, amendment_id: UUID, member: Member = Depends(contract_member)):
+def remove_amendment(contract_id: UUID, amendment_id: UUID, member: Member = Depends(contract_editor)):
     access = _access(member)
     with finance_session() as session:
         workspace = _workspace(session, member)

@@ -116,6 +116,9 @@ IMPORT_STATUSES = ("preview", "applied", "cancelled")
 #: пустая), `failed` — операция, но данных не хватило.
 IMPORT_ROW_STATES = ("imported", "skipped", "failed", "duplicate")
 PLAN_METHODS = ("cash", "accrual")
+#: Вид записи журнала действий. Откат бывает только у `data`; `view` живут
+#: 180 дней, остальные — всегда.
+ACTION_CATEGORIES = ("data", "auth", "admin", "view", "export", "import")
 
 
 def _in(column: str, values: tuple[str, ...]) -> str:
@@ -767,10 +770,24 @@ class ActionLog(FinanceBase):
 
     `undone_at` не даёт отменить дважды: вторая отмена вернула бы уже
     отменённое и выглядела бы как новая правка.
+
+    С ревизии 0019 это журнал действий компании целиком: кроме правок данных
+    — входы, администрирование, просмотры, выгрузки и загрузки (`category`).
+    Автор записан идентификатором (`user_id`), а не только почтой: у
+    сотрудника, входящего по телефону, почты нет, и лента «кто что делал»
+    фильтруется по человеку. Откат — только у `data`. Просмотры живут 180
+    дней, остальное — всегда; API на правку или удаление записей нет.
     """
 
     __tablename__ = "action_log"
-    __table_args__ = (sa.Index("ix_action_log_workspace_at", "workspace_id", "at"),)
+    __table_args__ = (
+        sa.Index("ix_action_log_workspace_at", "workspace_id", "at"),
+        sa.Index("ix_action_log_workspace_user_at", "workspace_id", "user_id", "at"),
+        sa.Index("ix_action_log_entity_id", "entity_id"),
+        # Очистка просмотров старше 180 дней идёт раз в час по этому индексу.
+        sa.Index("ix_action_log_category_at", "category", "at"),
+        sa.CheckConstraint(_in("category", ACTION_CATEGORIES), name="action_log_category"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=_uuid)
     workspace_id: Mapped[uuid.UUID] = mapped_column(
@@ -788,6 +805,17 @@ class ActionLog(FinanceBase):
     before: Mapped[dict] = mapped_column(JSONB, server_default=sa.text("'{}'"))
     after: Mapped[dict] = mapped_column(JSONB, server_default=sa.text("'{}'"))
     undone_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    #: Кто. Пусто у фоновых задач («система») и у приёма от подключений.
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("users.id", ondelete="SET NULL")
+    )
+    #: Из какого сеанса. Без внешнего ключа: сеанс удаляется при выходе, а
+    #: запись журнала остаётся навсегда.
+    session_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid)
+    ip: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("''"))
+    user_agent: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("''"))
+    #: `data` / `auth` / `admin` / `view` / `export` / `import`.
+    category: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("'data'"))
 
 
 class Integration(FinanceBase):
@@ -852,6 +880,7 @@ __all__ = [
     "INTEGRATION_KINDS",
     "CATEGORY_NATURES",
     "ActionLog",
+    "ACTION_CATEGORIES",
     "ACCOUNT_KINDS",
     "Account",
     "CATEGORY_SIDES",

@@ -197,13 +197,22 @@ async def _contract_amendments_loop() -> None:
     индексу `(applied_at, effective_from)` на все компании; между проходами
     ничего не держится в памяти. Удаляемый модуль: снимается вместе с
     «Финансами».
+
+    Тем же проходом журнал действий теряет просмотры старше 180 дней — одно
+    `DELETE` по индексу `(category, at)`. Своего вечного цикла у журнала нет:
+    фоновая нагрузка не должна расти от каждого нового правила хранения.
     """
+    from app.finance import audit as finance_audit
     from app.finance.contracts import service as contracts_service
     from app.finance.db import finance_session
 
     def one_pass() -> int:
         with finance_session() as session:
-            return contracts_service.apply_due(session)
+            applied = contracts_service.apply_due(session)
+            purged = finance_audit.purge_views(session)
+            if purged:
+                log.info("finance: из журнала действий убрано старых просмотров: %s", purged)
+            return applied
 
     await asyncio.sleep(60)
     while True:

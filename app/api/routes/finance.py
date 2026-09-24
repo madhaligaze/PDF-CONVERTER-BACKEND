@@ -43,12 +43,14 @@ from fastapi import (
 from pydantic import BaseModel, Field
 
 from app.finance import (
+    access as access_module,
     auth,
     autotag,
     grid as grid_module,
     history,
     integrations as integrations_module,
     invoices as invoices_module,
+    notifications,
     recurring,
     reports,
     rules,
@@ -68,6 +70,7 @@ from app.finance.models import (
     Operation,
     Plan,
     Project,
+    Rule,
     Tag,
 )
 from app.finance import export as export_module
@@ -118,40 +121,139 @@ def _set_cookie(request: Request, response: Response, token: str) -> None:
     )
 
 
-def current_member(request: Request) -> Member:
-    """Вошедший в «Финансы». Нет сессии — 401 с текстом, а не пустой экран."""
+def client_ip(request: Request) -> str:
+    """Адрес человека. Справочно: его ставит прокси Next заголовком `x-client-ip`.
+
+    Прямой запрос к API может прислать любой заголовок, поэтому адрес — это
+    подпись в журнале и ключ ограничителя перебора, но не доказательство.
+    """
+    value = (request.headers.get("x-client-ip") or "").split(",")[0].strip()
+    if not value and request.client is not None:
+        value = request.client.host or ""
+    return value[:64]
+
+
+def _agent(request: Request) -> str:
+    return (request.headers.get("user-agent") or "")[:400]
+
+
+def signed_in(request: Request) -> Member:
+    """Вошедший — любой, включая временный пароль. Нет сессии — 401 с текстом.
+
+    Сама по себе не открывает ничего: маршруты берут одну из зависимостей
+    ниже, и временный пароль пускают только к смене пароля.
+    """
     _guard()
     with finance_session() as session:
-        member = auth.resolve(session, request.cookies.get(auth.COOKIE_NAME))
+        member = auth.resolve(
+            session,
+            request.cookies.get(auth.COOKIE_NAME),
+            ip=client_ip(request),
+            user_agent=_agent(request),
+        )
     if member is None:
         raise HTTPException(status_code=401, detail="Войдите в «Финансы»")
     return member
 
 
-def require_ability(ability: str):
-    """Зависимость «этому можно вот это».
+TEMPORARY_PASSWORD = "Сначала смените временный пароль"
 
-    Права спрашиваются по способности (`write`, `accounts`, `people`), а не по
-    названию роли: добавление роли не должно требовать правки каждого маршрута.
+
+def _enter(member: Member) -> None:
+    """Автор, сеанс и адрес — в контекст запроса: их возьмёт каждая запись журнала."""
+    history.set_context(
+        history.AuditContext(
+            user_id=member.user_id,
+            session_id=member.session_id,
+            ip=member.ip,
+            user_agent=member.user_agent,
+            actor=member.login,
+        )
+    )
+
+
+def _declare(dependency, kind: str, value: Any):
+    """Пометить зависимость: тест обхода маршрутов читает эту пометку."""
+    dependency.__finance_access__ = (kind, value)
+    return dependency
+
+
+def _denied(resources: tuple[str, ...], level: str, member: Member) -> str:
+    title = access_module.resource_title(resources[0])
+    if level == "edit" and member.rights.can_any(resources, "view"):
+        return f"В разделе «{title}» вам можно только смотреть"
+    return f"Раздел «{title}» вам не открыт"
+
+
+def require_access(resource: str | tuple[str, ...], level: str = "view"):
+    """Зависимость «раздел открыт на этом уровне» — объявление права маршрута.
+
+    Каждый маршрут `/finance/*` объявляет свой раздел: чтение — `view`,
+    изменение — `edit` (проверяет `tests/test_finance_access.py`, обходя все
+    маршруты приложения). Несколько разделов — «любой из них»: справочники
+    нужны формам и журнала, и счетов.
+
+    Проверка асинхронная намеренно: только так автор, сеанс и адрес,
+    записанные в контекст, доезжают до обработчика в пуле потоков (см.
+    `history.py`).
     """
+    resources = (resource,) if isinstance(resource, str) else tuple(resource)
+    for key in resources:
+        if key not in access_module.RESOURCE_BY_KEY:
+            raise ValueError(f"неизвестный раздел прав: {key}")
+    if level not in ("view", "edit"):
+        raise ValueError(f"неизвестный уровень: {level}")
 
-    def _dependency(member: Member = Depends(current_member)) -> Member:
-        if member.must_change_password and ability != "read":
-            raise HTTPException(status_code=403, detail="Сначала смените временный пароль")
-        if not member.can(ability):
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "read": "Этот раздел вам не открыт",
-                    "write": "Ваша роль позволяет только смотреть",
-                    "accounts": "Счета заводит владелец или администратор",
-                    "people": "Людей добавляет владелец или администратор",
-                    "company": "Это может только владелец компании",
-                }.get(ability, "Недостаточно прав"),
-            )
+    async def _dependency(member: Member = Depends(signed_in)) -> Member:
+        if member.must_change_password:
+            raise HTTPException(status_code=403, detail=TEMPORARY_PASSWORD)
+        if member.workspace_id is None:
+            raise HTTPException(status_code=409, detail="Выберите компанию")
+        if not member.rights.can_any(resources, level):
+            raise HTTPException(status_code=403, detail=_denied(resources, level, member))
+        _enter(member)
         return member
 
-    return _dependency
+    return _declare(_dependency, "resource", (resources, level))
+
+
+def require_role(*roles: str):
+    """Только владелец (или владелец и администратор) — то, чего нет в правах разделов."""
+
+    async def _dependency(member: Member = Depends(signed_in)) -> Member:
+        if member.must_change_password:
+            raise HTTPException(status_code=403, detail=TEMPORARY_PASSWORD)
+        if member.workspace_id is None:
+            raise HTTPException(status_code=409, detail="Выберите компанию")
+        if member.role not in roles:
+            raise HTTPException(
+                status_code=403,
+                detail="Это может только владелец компании" if roles == ("owner",)
+                else "Это может владелец или администратор",
+            )
+        _enter(member)
+        return member
+
+    return _declare(_dependency, "role", roles)
+
+
+async def _self(member: Member = Depends(signed_in)) -> Member:
+    if member.must_change_password:
+        raise HTTPException(status_code=403, detail=TEMPORARY_PASSWORD)
+    _enter(member)
+    return member
+
+
+async def _password_change(member: Member = Depends(signed_in)) -> Member:
+    _enter(member)
+    return member
+
+
+#: Своё: профиль, сеансы, свои действия. Права раздела не нужны, но временный
+#: пароль не пускает и сюда. Список таких маршрутов закрыт в тесте обхода.
+current_member = _declare(_self, "self", "own")
+#: Единственная дверь, открытая временному паролю, — сменить его.
+password_member = _declare(_password_change, "self", "password")
 
 
 def _workspace(session, member: Member):
@@ -170,8 +272,8 @@ def _workspace(session, member: Member):
 
 
 def _actor(member: Any) -> str:
-    """Подпись под операцией — почта, а не имя: имя меняют, почта это логин."""
-    return getattr(member, "email", "") or ""
+    """Подпись под операцией — логин (почта или телефон), а не имя: имя меняют."""
+    return getattr(member, "login", "") or getattr(member, "email", "") or ""
 
 
 def _fail(exc: FinanceError) -> HTTPException:
@@ -224,12 +326,45 @@ class LoginIn(BaseModel):
     password: str
 
 
-def _me_payload(member: Member, companies: list[dict[str, Any]]) -> dict[str, Any]:
+def _me_payload(session, member: Member) -> dict[str, Any]:
+    """Кто вошёл и что ему открыто — `me` и ответ входа.
+
+    `access` — все разделы с уровнем (`none` / `view` / `edit`), `role`,
+    `contracts_scope` и `pending_requests` (число открытых просьб для рамы
+    того, кто правит людей). `abilities` — прежние способности для экранов,
+    ещё не переведённых на `access`.
+    """
+    from app.finance.contracts.models import Department, Employee
+
+    rights = member.rights
+    pending = 0
+    employee_out = None
+    if member.workspace_id is not None:
+        if rights.can("people", "edit"):
+            pending = notifications.pending_count(session, member.workspace_id)
+        row = session.execute(
+            sa.select(Employee, Department)
+            .outerjoin(Department, Department.id == Employee.department_id)
+            .where(Employee.workspace_id == member.workspace_id, Employee.user_id == member.user_id)
+        ).first()
+        if row is not None:
+            employee, department = row
+            employee_out = {
+                "id": str(employee.id),
+                "full_name": employee.full_name,
+                "job_title": employee.job_title or "",
+                "department": (
+                    {"id": str(department.id), "code": department.code, "title": department.title or department.code}
+                    if department is not None
+                    else None
+                ),
+            }
     return {
         "authenticated": True,
         "user": {
             "id": str(member.user_id),
             "email": member.email,
+            "phone": member.phone,
             "full_name": member.full_name,
             "must_change_password": member.must_change_password,
         },
@@ -238,13 +373,20 @@ def _me_payload(member: Member, companies: list[dict[str, Any]]) -> dict[str, An
             if member.workspace_id
             else None
         ),
-        "companies": companies,
-        "abilities": sorted(
-            ability
-            for ability in ("read", "write", "accounts", "people", "company")
-            if member.can(ability)
-        ),
+        "companies": auth.companies_of(session, member.user_id),
+        "abilities": sorted(rights.abilities()),
+        "role": member.role or None,
+        "access": rights.access_map(),
+        "contracts_scope": rights.contracts_scope(),
+        "pending_requests": pending,
+        "employee": employee_out,
     }
+
+
+def _auth_fail(exc: AuthError, status: int) -> HTTPException:
+    if isinstance(exc, auth.TooManyAttempts):
+        return HTTPException(status_code=429, detail=str(exc))
+    return HTTPException(status_code=status, detail=str(exc))
 
 
 @router.post("/auth/register", status_code=201)
@@ -259,11 +401,12 @@ def auth_register(body: RegisterIn, request: Request, response: Response) -> dic
                 password=body.password,
                 company=body.company,
                 full_name=body.full_name,
-                user_agent=request.headers.get("user-agent", ""),
+                user_agent=_agent(request),
+                ip=client_ip(request),
             )
         except AuthError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        payload = _me_payload(member, auth.companies_of(session, member.user_id))
+        payload = _me_payload(session, member)
     _set_cookie(request, response, token)
     return payload
 
@@ -271,28 +414,114 @@ def auth_register(body: RegisterIn, request: Request, response: Response) -> dic
 @router.post("/auth/login")
 def auth_login(body: LoginIn, request: Request, response: Response) -> dict[str, Any]:
     _guard()
+    # Неудача пишет событие и счётчик — это должно сохраниться и при отказе,
+    # поэтому ошибка поднимается после выхода из транзакции.
+    failure: AuthError | None = None
     with finance_session() as session:
         try:
             member, token = auth.login(
                 session,
                 email=body.email,
                 password=body.password,
-                user_agent=request.headers.get("user-agent", ""),
+                user_agent=_agent(request),
+                ip=client_ip(request),
             )
+            payload = _me_payload(session, member)
         except AuthError as exc:
-            # 401, а не 400: фронт по коду решает, показывать форму входа снова
-            # или сообщение о недостатке прав.
-            raise HTTPException(status_code=401, detail=str(exc)) from exc
-        payload = _me_payload(member, auth.companies_of(session, member.user_id))
+            failure = exc
+    if failure is not None:
+        # 401, а не 400: фронт по коду решает, показывать форму входа снова
+        # или сообщение о недостатке прав.
+        raise _auth_fail(failure, 401) from failure
     _set_cookie(request, response, token)
     return payload
+
+
+# ── Вход сотрудника по номеру ───────────────────────────────────────────────
+
+
+class PhoneIn(BaseModel):
+    phone: str
+
+
+class PhonePasswordIn(BaseModel):
+    phone: str
+    password: str
+
+
+@router.post("/auth/phone/start")
+def auth_phone_start(body: PhoneIn, request: Request) -> dict[str, str]:
+    """Первый шаг: `{"step": "password" | "set_password"}`.
+
+    Незнакомый номер получает `password`, как и знакомый.
+    """
+    _guard()
+    with finance_session() as session:
+        try:
+            step = auth.phone_start(session, phone=body.phone, ip=client_ip(request))
+        except AuthError as exc:
+            raise _auth_fail(exc, 400) from exc
+    return {"step": step}
+
+
+@router.post("/auth/phone/login")
+def auth_phone_login(body: PhonePasswordIn, request: Request, response: Response) -> dict[str, Any]:
+    """Номер и пароль → сеанс. Ответ — как у `me`."""
+    _guard()
+    failure: AuthError | None = None
+    with finance_session() as session:
+        try:
+            member, token = auth.phone_login(
+                session, phone=body.phone, password=body.password,
+                user_agent=_agent(request), ip=client_ip(request),
+            )
+            payload = _me_payload(session, member)
+        except AuthError as exc:
+            failure = exc
+    if failure is not None:
+        raise _auth_fail(failure, 401) from failure
+    _set_cookie(request, response, token)
+    return payload
+
+
+@router.post("/auth/phone/set-password")
+def auth_phone_set_password(body: PhonePasswordIn, request: Request) -> dict[str, bool]:
+    """Задать пароль в окне ожидания. В сеанс не пускает — дальше обычный вход."""
+    _guard()
+    failure: AuthError | None = None
+    with finance_session() as session:
+        try:
+            auth.phone_set_password(
+                session, phone=body.phone, password=body.password,
+                user_agent=_agent(request), ip=client_ip(request),
+            )
+        except AuthError as exc:
+            failure = exc
+    if failure is not None:
+        raise _auth_fail(failure, 400) from failure
+    return {"ok": True}
+
+
+@router.post("/auth/phone/forgot")
+def auth_phone_forgot(body: PhoneIn, request: Request) -> dict[str, bool]:
+    """«Забыл пароль»: просьба администратору. Ответ одинаковый, есть номер или нет."""
+    _guard()
+    with finance_session() as session:
+        try:
+            auth.phone_forgot(session, phone=body.phone, user_agent=_agent(request), ip=client_ip(request))
+        except AuthError as exc:
+            # Неверный формат номера — не тайна: его видит и сама форма.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True}
 
 
 @router.post("/auth/logout")
 def auth_logout(request: Request, response: Response) -> dict[str, bool]:
     _guard()
     with finance_session() as session:
-        auth.logout(session, request.cookies.get(auth.COOKIE_NAME))
+        auth.logout(
+            session, request.cookies.get(auth.COOKIE_NAME), ip=client_ip(request), user_agent=_agent(request)
+        )
     response.delete_cookie(auth.COOKIE_NAME, path="/")
     return {"ok": True}
 
@@ -306,10 +535,12 @@ def auth_me(request: Request) -> dict[str, Any]:
     """
     _guard()
     with finance_session() as session:
-        member = auth.resolve(session, request.cookies.get(auth.COOKIE_NAME))
+        member = auth.resolve(
+            session, request.cookies.get(auth.COOKIE_NAME), ip=client_ip(request), user_agent=_agent(request)
+        )
         if member is None:
             return {"authenticated": False}
-        return _me_payload(member, auth.companies_of(session, member.user_id))
+        return _me_payload(session, member)
 
 
 class SwitchIn(BaseModel):
@@ -317,16 +548,21 @@ class SwitchIn(BaseModel):
 
 
 @router.post("/auth/switch")
-def auth_switch(body: SwitchIn, request: Request) -> dict[str, Any]:
+def auth_switch(body: SwitchIn, request: Request, member: Member = Depends(current_member)) -> dict[str, Any]:
     """Сменить компанию в текущей сессии."""
     _guard()
     token = request.cookies.get(auth.COOKIE_NAME)
     with finance_session() as session:
         try:
-            member = auth.switch_company(session, token or "", body.company_id)
+            switched = auth.switch_company(session, token or "", body.company_id)
         except AuthError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
-        return _me_payload(member, auth.companies_of(session, member.user_id))
+        history.write(
+            session, None, workspace_id=body.company_id, kind="auth.switch",  # type: ignore[arg-type]
+            entity="workspace", entity_id=body.company_id,
+            title=f"вход в компанию «{switched.workspace_title}»",
+        )
+        return _me_payload(session, switched)
 
 
 class CompanyIn(BaseModel):
@@ -349,27 +585,34 @@ def auth_add_company(
 
 @router.patch("/auth/company")
 def auth_rename_company(
-    body: CompanyIn, member: Member = Depends(require_ability("company"))
+    body: CompanyIn, member: Member = Depends(require_role("owner"))
 ) -> dict[str, Any]:
     _guard()
     with finance_session() as session:
         workspace = _workspace(session, member)
+        before = workspace.title
         try:
             service.rename_workspace(session, workspace, title=body.title)
         except FinanceError as exc:
             raise _fail(exc) from exc
+        history.write(
+            session, workspace, kind="company.rename", entity="workspace", entity_id=workspace.id,
+            title=f"компания переименована: «{before}» → «{workspace.title}»",
+            before={"title": before}, after={"title": workspace.title},
+        )
         return {"id": str(workspace.id), "title": workspace.title}
 
 
 class InviteIn(BaseModel):
     email: str
     password: str
+    #: `admin` | `employee`; прежние `accountant`/`viewer` принимаются.
     role: str = "accountant"
     full_name: str = ""
 
 
 @router.get("/auth/members")
-def auth_members(member: Member = Depends(require_ability("people"))) -> dict[str, Any]:
+def auth_members(member: Member = Depends(require_access("people", "view"))) -> dict[str, Any]:
     _guard()
     with finance_session() as session:
         workspace = _workspace(session, member)
@@ -378,7 +621,7 @@ def auth_members(member: Member = Depends(require_ability("people"))) -> dict[st
 
 @router.post("/auth/members", status_code=201)
 def auth_invite(
-    body: InviteIn, member: Member = Depends(require_ability("people"))
+    body: InviteIn, member: Member = Depends(require_access("people", "edit"))
 ) -> dict[str, Any]:
     """Добавить человека в компанию с временным паролем."""
     _guard()
@@ -402,7 +645,7 @@ class RoleIn(BaseModel):
 
 @router.patch("/auth/members/{user_id}")
 def auth_change_role(
-    user_id: UUID, body: RoleIn, member: Member = Depends(require_ability("people"))
+    user_id: UUID, body: RoleIn, member: Member = Depends(require_access("people", "edit"))
 ) -> dict[str, bool]:
     _guard()
     with finance_session() as session:
@@ -415,7 +658,7 @@ def auth_change_role(
 
 @router.delete("/auth/members/{user_id}")
 def auth_remove_member(
-    user_id: UUID, member: Member = Depends(require_ability("people"))
+    user_id: UUID, member: Member = Depends(require_access("people", "edit"))
 ) -> dict[str, bool]:
     _guard()
     with finance_session() as session:
@@ -433,24 +676,30 @@ class PasswordIn(BaseModel):
 
 @router.post("/auth/password")
 def auth_password(
-    body: PasswordIn, member: Member = Depends(current_member)
-) -> dict[str, bool]:
-    """Смена своего пароля. Доступна и тем, у кого пароль временный."""
+    body: PasswordIn, member: Member = Depends(password_member)
+) -> dict[str, Any]:
+    """Смена своего пароля. Доступна и тем, у кого пароль временный.
+
+    Остальные сеансы закрываются: `sessions_closed` — сколько.
+    """
     _guard()
     with finance_session() as session:
         try:
-            auth.set_password(session, member, old=body.old_password, new=body.new_password)
+            closed = auth.set_password(session, member, old=body.old_password, new=body.new_password)
         except AuthError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"ok": True}
+        return {"ok": True, "sessions_closed": closed}
 
 
 @router.get("/auth/sessions")
 def auth_sessions(member: Member = Depends(current_member)) -> dict[str, Any]:
-    """Свои открытые сессии — чтобы увидеть чужой вход и отозвать его."""
+    """Свои открытые сессии — чтобы увидеть чужой вход и отозвать его.
+
+    У каждой: `user_agent`, `ip`, `created_at`, `last_seen_at`, `current`.
+    """
     _guard()
     with finance_session() as session:
-        return {"items": auth.sessions_of(session, member.user_id)}
+        return {"items": auth.sessions_of(session, member.user_id, current=member.session_id)}
 
 
 @router.delete("/auth/sessions/{session_id}")
@@ -466,11 +715,43 @@ def auth_revoke_session(
         return {"ok": True}
 
 
+@router.post("/auth/sessions/end-others")
+def auth_end_other_sessions(member: Member = Depends(current_member)) -> dict[str, int]:
+    """«Завершить все, кроме этого»."""
+    _guard()
+    with finance_session() as session:
+        closed = auth.end_sessions(session, member.user_id, keep=member.session_id)
+        if member.workspace_id is not None:
+            history.write(
+                session, None, workspace_id=member.workspace_id,  # type: ignore[arg-type]
+                kind="auth.sessions_end", entity="user", entity_id=member.user_id,
+                title=f"остальные сеансы завершены: {closed}", after={"sessions_closed": closed},
+            )
+        return {"closed": closed}
+
+
+class ProfileIn(BaseModel):
+    full_name: str | None = None
+    phone: str | None = None
+
+
+@router.patch("/auth/profile")
+def auth_profile(body: ProfileIn, member: Member = Depends(require_role("owner", "admin"))) -> dict[str, Any]:
+    """Свои ФИО и телефон — владельцу и администратору; сотруднику их задаёт администратор."""
+    _guard()
+    with finance_session() as session:
+        try:
+            user = auth.set_profile(session, member, full_name=body.full_name, phone=body.phone)
+        except AuthError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"id": str(user.id), "full_name": user.full_name, "phone": user.phone or ""}
+
+
 # ── Обзор ────────────────────────────────────────────────────────────────────
 
 
 @router.get("/overview")
-def overview(member: Member = Depends(current_member)) -> dict[str, Any]:
+def overview(member: Member = Depends(require_access("journal"))) -> dict[str, Any]:
     """Первый экран: счета, остатки и ближайшие ожидания.
 
     Один запрос, а не четыре: раздел открывают десятки раз в день, и каждый
@@ -516,7 +797,7 @@ def overview(member: Member = Depends(current_member)) -> dict[str, Any]:
 
 
 @router.get("/dictionaries")
-def dictionaries(member: Member = Depends(current_member)) -> dict[str, Any]:
+def dictionaries(member: Member = Depends(require_access(access_module.MONEY_RESOURCES))) -> dict[str, Any]:
     """Все справочники разом — ими наполняются выпадающие списки форм."""
     _guard()
     with finance_session() as session:
@@ -567,7 +848,7 @@ class AccountIn(BaseModel):
 
 
 @router.post("/accounts")
-def create_account(body: AccountIn, member: Member = Depends(require_ability("accounts"))) -> dict[str, Any]:
+def create_account(body: AccountIn, member: Member = Depends(require_access("dictionaries", "edit"))) -> dict[str, Any]:
     _guard()
     with finance_session() as session:
         workspace = _workspace(session, member)
@@ -584,6 +865,12 @@ def create_account(body: AccountIn, member: Member = Depends(require_ability("ac
             )
         except FinanceError as exc:
             raise _fail(exc) from exc
+        history.write(
+            session, workspace, kind="account.create", entity="account", entity_id=account.id,
+            title=f"счёт заведён: «{account.name}»",
+            after={"name": account.name, "kind": account.kind, "currency": account.currency,
+                   "starting_balance": str(account.starting_balance), "number": account.number or ""},
+        )
         return {"id": str(account.id), "name": account.name, "number": account.number}
 
 
@@ -602,7 +889,7 @@ class StartingBalanceIn(BaseModel):
 def patch_account_balance(
     account_id: UUID,
     body: StartingBalanceIn,
-    member: Member = Depends(require_ability("accounts")),
+    member: Member = Depends(require_access("dictionaries", "edit")),
 ) -> dict[str, Any]:
     """Начальный остаток счёта. Меняет остаток во всех отчётах задним числом.
 
@@ -644,7 +931,7 @@ class AccountNumberIn(BaseModel):
 def put_account_number(
     account_id: UUID,
     body: AccountNumberIn,
-    member: Member = Depends(require_ability("accounts")),
+    member: Member = Depends(require_access("dictionaries", "edit")),
 ) -> dict[str, Any]:
     """Номер счёта в банке. Пустая строка снимает номер.
 
@@ -674,7 +961,7 @@ def put_account_number(
 
 
 @router.post("/dictionaries/{kind}")
-def create_entry(kind: str, body: EntryIn, member: Member = Depends(require_ability("write"))) -> dict[str, Any]:
+def create_entry(kind: str, body: EntryIn, member: Member = Depends(require_access(("dictionaries", "journal", "table"), "edit"))) -> dict[str, Any]:
     """Создать статью, контрагента, проект или тег.
 
     Счёт сюда не попадает намеренно: он требует прав администратора и заводится
@@ -697,11 +984,24 @@ def create_entry(kind: str, body: EntryIn, member: Member = Depends(require_abil
             item = service.ensure_tag(session, workspace.id, body.name)
         if item is None:
             raise HTTPException(status_code=422, detail="Пустое название")
+        history.write(
+            session, workspace, kind="dictionary.create", entity=kind, entity_id=item.id,
+            title=f"{_DICTIONARY_TITLES[kind]} «{item.name}»", after={"name": item.name},
+        )
         return {"id": str(item.id), "name": item.name}
 
 
+_DICTIONARY_TITLES = {
+    "accounts": "счёт",
+    "categories": "статья",
+    "counterparties": "контрагент",
+    "projects": "проект",
+    "tags": "тег",
+}
+
+
 @router.delete("/dictionaries/{kind}/{item_id}")
-def archive_entry(kind: str, item_id: UUID, member: Member = Depends(require_ability("accounts"))) -> dict[str, bool]:
+def archive_entry(kind: str, item_id: UUID, member: Member = Depends(require_access("dictionaries", "edit"))) -> dict[str, bool]:
     """Убрать запись справочника из списков (архив, не удаление)."""
     _guard()
     models = {
@@ -719,6 +1019,11 @@ def archive_entry(kind: str, item_id: UUID, member: Member = Depends(require_abi
             service.archive(session, models[kind], workspace.id, item_id)
         except FinanceError as exc:
             raise _fail(exc) from exc
+        item = session.get(models[kind], item_id)
+        history.write(
+            session, workspace, kind="dictionary.archive", entity=kind, entity_id=item_id,
+            title=f"{_DICTIONARY_TITLES[kind]} «{getattr(item, 'name', '')}» убран в архив",
+        )
         return {"ok": True}
 
 
@@ -728,7 +1033,7 @@ class NatureIn(BaseModel):
 
 @router.patch("/dictionaries/categories/{item_id}/nature")
 def set_category_nature(
-    item_id: UUID, body: NatureIn, member: Member = Depends(require_ability("accounts"))
+    item_id: UUID, body: NatureIn, member: Member = Depends(require_access("dictionaries", "edit"))
 ) -> dict[str, Any]:
     """Природа статьи: себестоимость, операционный расход, проценты, амортизация…
 
@@ -741,8 +1046,14 @@ def set_category_nature(
         category = session.get(Category, item_id)
         if category is None or category.workspace_id != workspace.id:
             raise HTTPException(status_code=404, detail="Статья не найдена")
+        before = category.nature
         category.nature = body.nature
         session.flush()
+        history.write(
+            session, workspace, kind="category.nature", entity="categories", entity_id=category.id,
+            title=f"природа статьи «{category.name}»: {before or '—'} → {category.nature}",
+            before={"nature": before}, after={"nature": category.nature},
+        )
         return {"id": str(category.id), "nature": category.nature}
 
 
@@ -856,7 +1167,7 @@ def _filter(
 
 @router.get("/operations")
 def list_operations(
-    member: Member = Depends(current_member),
+    member: Member = Depends(require_access("journal")),
     date_from: str | None = None,
     date_to: str | None = None,
     kinds: str | None = None,
@@ -900,7 +1211,7 @@ def list_operations(
 
 @router.get("/export/journal.xlsx")
 def export_journal(
-    member: Member = Depends(current_member),
+    member: Member = Depends(require_access("journal")),
     date_from: str | None = None,
     date_to: str | None = None,
     kinds: str | None = None,
@@ -923,9 +1234,14 @@ def export_journal(
             account_id, category_id, counterparty_id, project_id,
         )
         try:
-            data, _count = export_module.journal_xlsx(session, workspace, flt)
+            data, count = export_module.journal_xlsx(session, workspace, flt)
         except FinanceError as exc:
             raise _fail(exc) from exc
+        history.write(
+            session, workspace, kind="journal.export", entity="operations",
+            title=f"выгрузка журнала · {count} операций",
+            after={"count": count, "date_from": date_from, "date_to": date_to},
+        )
         title = workspace.title
     name = f"Журнал — {title} — {date.today():%d.%m.%Y}.xlsx"
     return Response(
@@ -972,7 +1288,7 @@ class OperationIn(BaseModel):
 
 
 @router.post("/operations")
-def create_operation(body: OperationIn, member: Member = Depends(require_ability("write"))) -> dict[str, Any]:
+def create_operation(body: OperationIn, member: Member = Depends(require_access(("journal", "calendar"), "edit"))) -> dict[str, Any]:
     _guard()
     with finance_session() as session:
         workspace = _workspace(session, member)
@@ -1037,7 +1353,7 @@ class OperationPatch(BaseModel):
 
 @router.patch("/operations/{operation_id}")
 def patch_operation(
-    operation_id: UUID, body: OperationPatch, member: Member = Depends(require_ability("write"))
+    operation_id: UUID, body: OperationPatch, member: Member = Depends(require_access(("journal", "calendar"), "edit"))
 ) -> dict[str, Any]:
     _guard()
     changes: dict[str, Any] = {}
@@ -1093,7 +1409,7 @@ def patch_operation(
 
 
 @router.delete("/operations/{operation_id}")
-def delete_operation(operation_id: UUID, member: Member = Depends(require_ability("write"))) -> dict[str, bool]:
+def delete_operation(operation_id: UUID, member: Member = Depends(require_access(("journal", "calendar"), "edit"))) -> dict[str, bool]:
     _guard()
     with finance_session() as session:
         workspace = _workspace(session, member)
@@ -1120,7 +1436,7 @@ def delete_operation(operation_id: UUID, member: Member = Depends(require_abilit
 
 @router.get("/grid")
 def read_grid(
-    member: Member = Depends(current_member),
+    member: Member = Depends(require_access("table")),
     date_from: str | None = None,
     date_to: str | None = None,
     limit: int | None = None,
@@ -1149,10 +1465,19 @@ class CellPatch(BaseModel):
 
 
 @router.patch("/grid/cell")
-def patch_cell(body: CellPatch, member: Member = Depends(require_ability("write"))) -> dict[str, Any]:
+def patch_cell(body: CellPatch, member: Member = Depends(require_access("table", "edit"))) -> dict[str, Any]:
     _guard()
     with finance_session() as session:
         workspace = _workspace(session, member)
+        # Правка ячейки — та же правка операции, что из карточки, и пишется в
+        # журнал так же: с состоянием до и после и с откатом. Раньше лист
+        # менял операцию молча, и «кто поменял сумму» по нему было не узнать.
+        existing = session.get(Operation, body.operation_id)
+        before = (
+            history.snapshot(existing)
+            if existing is not None and existing.workspace_id == workspace.id
+            else {}
+        )
         try:
             operation = grid_module.apply_cell(
                 session, workspace, body.operation_id, body.column, body.value,
@@ -1160,6 +1485,12 @@ def patch_cell(body: CellPatch, member: Member = Depends(require_ability("write"
             )
         except FinanceError as exc:
             raise _fail(exc) from exc
+        after = history.snapshot(operation)
+        if after != before:
+            history.write(
+                session, workspace, kind="operation.update", entity="operation", entity_id=operation.id,
+                title=f"правка в таблице: {body.column}", before=before, after=after,
+            )
         names = _names(session, workspace.id)
         splits = service.operation_projects(session, [operation.id])
         tags = service.operation_tags(session, [operation.id])
@@ -1176,7 +1507,7 @@ class GridRowIn(BaseModel):
 
 
 @router.post("/grid/row")
-def add_grid_row(body: GridRowIn, member: Member = Depends(require_ability("write"))) -> dict[str, Any]:
+def add_grid_row(body: GridRowIn, member: Member = Depends(require_access("table", "edit"))) -> dict[str, Any]:
     """Новая операция из строки, набранной внизу листа."""
     _guard()
     with finance_session() as session:
@@ -1185,6 +1516,10 @@ def add_grid_row(body: GridRowIn, member: Member = Depends(require_ability("writ
             operation = grid_module.append_row(session, workspace, body.cells, actor=_actor(member))
         except FinanceError as exc:
             raise _fail(exc) from exc
+        history.write(
+            session, workspace, kind="operation.create", entity="operation", entity_id=operation.id,
+            title="операция заведена строкой таблицы", after=history.snapshot(operation),
+        )
         names = _names(session, workspace.id)
         splits = service.operation_projects(session, [operation.id])
         return {
@@ -1235,7 +1570,7 @@ def _period(date_from: str | None, date_to: str | None) -> tuple[date, date]:
 
 @router.get("/reports/cash-flow")
 def report_cash_flow(
-    member: Member = Depends(current_member),
+    member: Member = Depends(require_access("reports.cash")),
     date_from: str | None = None,
     date_to: str | None = None,
     group: str = Query(default="category", pattern="^(category|counterparty|project)$"),
@@ -1249,7 +1584,7 @@ def report_cash_flow(
 
 @router.get("/reports/profit")
 def report_profit(
-    member: Member = Depends(current_member),
+    member: Member = Depends(require_access("reports.profit")),
     date_from: str | None = None,
     date_to: str | None = None,
     group: str = Query(default="category", pattern="^(category|counterparty|project)$"),
@@ -1262,7 +1597,7 @@ def report_profit(
 
 
 @router.get("/reports/debts")
-def report_debts(member: Member = Depends(current_member), as_of: str | None = None) -> dict[str, Any]:
+def report_debts(member: Member = Depends(require_access("reports.debts")), as_of: str | None = None) -> dict[str, Any]:
     _guard()
     with finance_session() as session:
         workspace = _workspace(session, member)
@@ -1271,7 +1606,7 @@ def report_debts(member: Member = Depends(current_member), as_of: str | None = N
 
 @router.get("/reports/projects")
 def report_projects(
-    member: Member = Depends(current_member), date_from: str | None = None, date_to: str | None = None
+    member: Member = Depends(require_access("reports.projects")), date_from: str | None = None, date_to: str | None = None
 ) -> dict[str, Any]:
     _guard()
     start, end = _period(date_from, date_to)
@@ -1282,7 +1617,7 @@ def report_projects(
 
 @router.get("/reports/calendar")
 def report_calendar(
-    member: Member = Depends(current_member),
+    member: Member = Depends(require_access("calendar")),
     year: int = Query(default=0, ge=0, le=2200),
     month: int = Query(default=0, ge=0, le=12),
 ) -> dict[str, Any]:
@@ -1295,7 +1630,7 @@ def report_calendar(
 
 @router.get("/reports/plan-actual")
 def report_plan_actual(
-    member: Member = Depends(current_member),
+    member: Member = Depends(require_access("reports.plan")),
     date_from: str | None = None,
     date_to: str | None = None,
     method: str = Query(default="cash", pattern="^(cash|accrual)$"),
@@ -1318,7 +1653,7 @@ class PlanIn(BaseModel):
 
 
 @router.post("/plans")
-def upsert_plan(body: PlanIn, member: Member = Depends(require_ability("write"))) -> dict[str, Any]:
+def upsert_plan(body: PlanIn, member: Member = Depends(require_access("reports.plan", "edit"))) -> dict[str, Any]:
     """Поставить или изменить план на месяц по статье."""
     _guard()
     month = _parse_date(body.month, field="month")
@@ -1351,6 +1686,7 @@ def upsert_plan(body: PlanIn, member: Member = Depends(require_ability("write"))
             service.check_date(month, field="Месяц плана")
         except FinanceError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        before = {"amount": str(existing.amount), "comment": existing.comment} if existing is not None else {}
         if existing is None:
             existing = Plan(
                 workspace_id=workspace.id,
@@ -1368,6 +1704,11 @@ def upsert_plan(body: PlanIn, member: Member = Depends(require_ability("write"))
             existing.amount = amount
             existing.comment = body.comment
         session.flush()
+        history.write(
+            session, workspace, kind="plan.set", entity="plan", entity_id=existing.id,
+            title=f"план на {month:%m.%Y}: {before.get('amount', '—')} → {existing.amount}",
+            before=before, after={"amount": str(existing.amount), "comment": existing.comment},
+        )
         return {"id": str(existing.id), "month": month.isoformat(), "amount": str(existing.amount)}
 
 
@@ -1383,7 +1724,7 @@ class RuleIn(BaseModel):
 
 
 @router.get("/rules")
-def list_rules(member: Member = Depends(current_member)) -> dict[str, Any]:
+def list_rules(member: Member = Depends(require_access("rules"))) -> dict[str, Any]:
     """Правила компании вместе со счётчиком срабатываний.
 
     Счётчик важнее, чем кажется: правило, которое не совпало ни разу, выглядит
@@ -1410,7 +1751,7 @@ def list_rules(member: Member = Depends(current_member)) -> dict[str, Any]:
 
 
 @router.post("/rules", status_code=201)
-def create_rule(body: RuleIn, member: Member = Depends(require_ability("write"))) -> dict[str, Any]:
+def create_rule(body: RuleIn, member: Member = Depends(require_access("rules", "edit"))) -> dict[str, Any]:
     _guard()
     with finance_session() as session:
         workspace = _workspace(session, member)
@@ -1426,18 +1767,33 @@ def create_rule(body: RuleIn, member: Member = Depends(require_ability("write"))
             )
         except rules.RuleError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        history.write(
+            session, workspace, kind="rule.create", entity="rule", entity_id=rule.id,
+            title=f"правило «{rule.name}» заведено",
+            after={"name": rule.name, "conditions": rule.conditions, "actions": rule.actions, "match": rule.match},
+        )
         return {"id": str(rule.id), "name": rule.name}
 
 
 @router.delete("/rules/{rule_id}")
-def delete_rule(rule_id: UUID, member: Member = Depends(require_ability("write"))) -> dict[str, bool]:
+def delete_rule(rule_id: UUID, member: Member = Depends(require_access("rules", "edit"))) -> dict[str, bool]:
     _guard()
     with finance_session() as session:
         workspace = _workspace(session, member)
+        existing = session.get(Rule, rule_id)
+        before = (
+            {"name": existing.name, "conditions": existing.conditions, "actions": existing.actions}
+            if existing is not None and existing.workspace_id == workspace.id
+            else {}
+        )
         try:
             rules.delete_rule(session, workspace.id, rule_id)
         except rules.RuleError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        history.write(
+            session, workspace, kind="rule.delete", entity="rule", entity_id=rule_id,
+            title=f"правило «{before.get('name', '')}» удалено", before=before,
+        )
         return {"ok": True}
 
 
@@ -1447,7 +1803,7 @@ class RuleToggleIn(BaseModel):
 
 @router.patch("/rules/{rule_id}")
 def toggle_rule(
-    rule_id: UUID, body: RuleToggleIn, member: Member = Depends(require_ability("write"))
+    rule_id: UUID, body: RuleToggleIn, member: Member = Depends(require_access("rules", "edit"))
 ) -> dict[str, Any]:
     _guard()
     with finance_session() as session:
@@ -1456,6 +1812,11 @@ def toggle_rule(
             rule = rules.toggle_rule(session, workspace.id, rule_id, body.active)
         except rules.RuleError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        history.write(
+            session, workspace, kind="rule.toggle", entity="rule", entity_id=rule.id,
+            title=f"правило «{rule.name}» {'включено' if rule.active else 'выключено'}",
+            after={"active": rule.active},
+        )
         return {"id": str(rule.id), "active": rule.active}
 
 
@@ -1467,19 +1828,25 @@ class RuleApplyIn(BaseModel):
 
 @router.post("/rules/apply")
 def apply_rules(
-    body: RuleApplyIn, member: Member = Depends(require_ability("write"))
+    body: RuleApplyIn, member: Member = Depends(require_access("rules", "edit"))
 ) -> dict[str, Any]:
     """Применить правила к уже заведённым операциям."""
     _guard()
     with finance_session() as session:
         workspace = _workspace(session, member)
-        return rules.apply_to_operations(
+        done = rules.apply_to_operations(
             session, workspace.id, only_uncategorized=body.only_uncategorized
         )
+        history.write(
+            session, workspace, kind="rules.apply", entity="operations",
+            title=f"правила применены: {done.get('updated', 0)} операций",
+            after={"updated": done.get("updated", 0), "only_uncategorized": body.only_uncategorized},
+        )
+        return done
 
 
 @router.get("/rules/suggest")
-def suggest_rules(member: Member = Depends(current_member)) -> dict[str, Any]:
+def suggest_rules(member: Member = Depends(require_access("rules"))) -> dict[str, Any]:
     """С чего начать разметку: частые слова в неразмеченных операциях."""
     _guard()
     with finance_session() as session:
@@ -1491,7 +1858,7 @@ def suggest_rules(member: Member = Depends(current_member)) -> dict[str, Any]:
 
 
 @router.get("/autotag")
-def autotag_preview(member: Member = Depends(current_member)) -> dict[str, Any]:
+def autotag_preview(member: Member = Depends(require_access("rules"))) -> dict[str, Any]:
     """Что разметится по тексту операций — группами, ничего не записывая."""
     _guard()
     with finance_session() as session:
@@ -1509,7 +1876,7 @@ class AutotagIn(BaseModel):
 
 
 @router.post("/autotag")
-def autotag_apply(body: AutotagIn, member: Member = Depends(require_ability("write"))) -> dict[str, Any]:
+def autotag_apply(body: AutotagIn, member: Member = Depends(require_access("rules", "edit"))) -> dict[str, Any]:
     """Разметить выбранные группы. Одна запись в истории — одна отмена на всё."""
     _guard()
     with finance_session() as session:
@@ -1518,16 +1885,16 @@ def autotag_apply(body: AutotagIn, member: Member = Depends(require_ability("wri
             done = autotag.apply(session, workspace, [(item.side, item.category) for item in body.groups])
         except FinanceError as exc:
             raise _fail(exc) from exc
-        if done["updated"]:
-            history.write(
-                session,
-                workspace,
-                kind="autotag.apply",
-                entity="operations",
-                title=f"авторазметка: {done['updated']} операций",
-                after={"items": done["items"]},
-                actor=_actor(member),
-            )
+        history.write(
+            session,
+            workspace,
+            kind="autotag.apply",
+            entity="operations",
+            title=f"авторазметка: {done['updated']} операций",
+            # Пустая разметка — тоже действие человека, но откатывать в ней нечего.
+            after={"items": done["items"]} if done["updated"] else {"updated": 0},
+            actor=_actor(member),
+        )
         return {"updated": done["updated"], "by_category": done["by_category"]}
 
 
@@ -1536,7 +1903,7 @@ def autotag_apply(body: AutotagIn, member: Member = Depends(require_ability("wri
 
 @router.post("/import/preview")
 def import_preview(
-    member: Member = Depends(require_ability("write")),
+    member: Member = Depends(require_access("import", "edit")),
     file: UploadFile = File(...),
     date_order: str | None = Query(default=None, pattern="^(dmy|mdy)$"),
     default_account: str | None = None,
@@ -1596,6 +1963,11 @@ def _preview_response(
     файл, — и «сколько строк отложено» стало бы зависеть от того, откуда данные.
     """
     batch = service.save_preview(session, workspace, preview, actor=_actor(member))
+    history.write(
+        session, workspace, kind="import.preview", entity="import_batch", entity_id=batch.id,
+        title=f"разбор «{preview.file_name}»: {len(preview.rows)} строк",
+        after={"file_name": preview.file_name, "rows": len(preview.rows)},
+    )
     return {
         "batch_id": str(batch.id),
         "file_name": preview.file_name,
@@ -1649,7 +2021,7 @@ class InvoiceIn(BaseModel):
 
 @router.get("/invoices")
 def list_invoices(
-    member: Member = Depends(current_member),
+    member: Member = Depends(require_access("invoices")),
     kind: str | None = Query(default=None, pattern="^(out|in)$"),
 ) -> dict[str, Any]:
     """Счета и их сводка: сколько выставлено, сколько не оплачено, сколько просрочено."""
@@ -1663,7 +2035,7 @@ def list_invoices(
 
 
 @router.post("/invoices", status_code=201)
-def create_invoice(body: InvoiceIn, member: Member = Depends(require_ability("write"))) -> dict[str, Any]:
+def create_invoice(body: InvoiceIn, member: Member = Depends(require_access("invoices", "edit"))) -> dict[str, Any]:
     """Выставить счёт. Ожидание по нему появляется сразу — это и есть долг."""
     _guard()
     issued_at = _parse_date(body.issued_at, field="issued_at")
@@ -1705,7 +2077,7 @@ def create_invoice(body: InvoiceIn, member: Member = Depends(require_ability("wr
 
 
 @router.get("/invoices/{invoice_id}")
-def read_invoice(invoice_id: UUID, member: Member = Depends(current_member)) -> dict[str, Any]:
+def read_invoice(invoice_id: UUID, member: Member = Depends(require_access("invoices"))) -> dict[str, Any]:
     _guard()
     with finance_session() as session:
         workspace = _workspace(session, member)
@@ -1716,7 +2088,7 @@ def read_invoice(invoice_id: UUID, member: Member = Depends(current_member)) -> 
 
 
 @router.post("/invoices/{invoice_id}/void")
-def void_invoice(invoice_id: UUID, member: Member = Depends(require_ability("write"))) -> dict[str, Any]:
+def void_invoice(invoice_id: UUID, member: Member = Depends(require_access("invoices", "edit"))) -> dict[str, Any]:
     """Отменить счёт вместе с его ожиданием."""
     _guard()
     with finance_session() as session:
@@ -1757,7 +2129,7 @@ class RecurrenceIn(BaseModel):
 
 
 @router.get("/recurrences")
-def list_recurrences(member: Member = Depends(current_member)) -> dict[str, Any]:
+def list_recurrences(member: Member = Depends(require_access("recurrences"))) -> dict[str, Any]:
     _guard()
     with finance_session() as session:
         workspace = _workspace(session, member)
@@ -1766,7 +2138,7 @@ def list_recurrences(member: Member = Depends(current_member)) -> dict[str, Any]
 
 @router.post("/recurrences", status_code=201)
 def create_recurrence(
-    body: RecurrenceIn, member: Member = Depends(require_ability("write"))
+    body: RecurrenceIn, member: Member = Depends(require_access("recurrences", "edit"))
 ) -> dict[str, Any]:
     """Создать повторение и сразу разложить ожидания на горизонт вперёд."""
     _guard()
@@ -1810,12 +2182,19 @@ def create_recurrence(
 
 
 @router.post("/recurrences/materialize")
-def materialize_recurrences(member: Member = Depends(require_ability("write"))) -> dict[str, Any]:
+def materialize_recurrences(member: Member = Depends(require_access("recurrences", "edit"))) -> dict[str, Any]:
     """Продлить горизонт ожиданий. Повторный вызов ничего не удваивает."""
     _guard()
     with finance_session() as session:
         workspace = _workspace(session, member)
         created = recurring.materialize(session, workspace, actor=_actor(member))
+        # Экран зовёт продление при каждом открытии; пустой проход ничего не
+        # менял, и строка «продлено: 0» в журнале была бы шумом.
+        if created:
+            history.write(
+                session, workspace, kind="recurrence.materialize", entity="recurrence",
+                title=f"ожидания повторений продлены: {created}", after={"created": created},
+            )
         return {"created": created}
 
 
@@ -1823,7 +2202,7 @@ def materialize_recurrences(member: Member = Depends(require_ability("write"))) 
 def toggle_recurrence(
     recurrence_id: UUID,
     active: bool = Query(...),
-    member: Member = Depends(require_ability("write")),
+    member: Member = Depends(require_access("recurrences", "edit")),
 ) -> dict[str, Any]:
     _guard()
     with finance_session() as session:
@@ -1832,6 +2211,11 @@ def toggle_recurrence(
             rule = recurring.set_active(session, workspace.id, recurrence_id, active)
         except FinanceError as exc:
             raise _fail(exc) from exc
+        history.write(
+            session, workspace, kind="recurrence.toggle", entity="recurrence", entity_id=rule.id,
+            title=f"повторение «{rule.title}» {'включено' if rule.active else 'выключено'}",
+            after={"active": rule.active},
+        )
         return {"id": str(rule.id), "active": rule.active}
 
 
@@ -1839,7 +2223,7 @@ def toggle_recurrence(
 def delete_recurrence(
     recurrence_id: UUID,
     with_future: bool = Query(default=True),
-    member: Member = Depends(require_ability("write")),
+    member: Member = Depends(require_access("recurrences", "edit")),
 ) -> dict[str, Any]:
     """Удалить повторение. Будущие неоплаченные ожидания уходят вместе с ним."""
     _guard()
@@ -1866,7 +2250,7 @@ def delete_recurrence(
 
 @router.get("/history")
 def read_history(
-    member: Member = Depends(current_member), limit: int = Query(default=100, ge=1, le=500)
+    member: Member = Depends(require_access(("audit", "journal"))), limit: int = Query(default=100, ge=1, le=500)
 ) -> dict[str, Any]:
     """Кто и что менял. Отменяемые записи помечены `can_undo`."""
     _guard()
@@ -1875,16 +2259,38 @@ def read_history(
         return {"items": history.listing(session, workspace.id, limit=limit)}
 
 
-@router.post("/history/{entry_id}/undo")
-def undo_action(entry_id: UUID, member: Member = Depends(require_ability("write"))) -> dict[str, Any]:
-    """Отменить действие — вернуть состояние «до», а не сделать обратное."""
-    _guard()
+#: Разделы, правка которых откатывается из журнала. Какой нужен именно для
+#: этой записи, решает `audit.undo_resources` по её сущности.
+UNDO_RESOURCES = ("journal", "table", "calendar", "dictionaries", "rules")
+
+
+def undo_entry(member: Member, entry_id: UUID) -> dict[str, Any]:
+    """Откат записи журнала — с правом правки того раздела, чья это запись.
+
+    Чужая компания и несуществующая запись отвечают одинаково — 404.
+    """
+    from app.finance import audit
+    from app.finance.models import ActionLog
+
     with finance_session() as session:
         workspace = _workspace(session, member)
+        entry = session.get(ActionLog, entry_id)
+        if entry is None or entry.workspace_id != workspace.id:
+            raise HTTPException(status_code=404, detail="Запись истории не найдена")
+        resources = audit.undo_resources(entry)
+        if resources and not member.rights.can_any(resources, "edit"):
+            raise HTTPException(status_code=403, detail=_denied(resources, "edit", member))
         try:
             return history.undo(session, workspace, entry_id, actor=_actor(member))
         except FinanceError as exc:
             raise _fail(exc) from exc
+
+
+@router.post("/history/{entry_id}/undo")
+def undo_action(entry_id: UUID, member: Member = Depends(require_access(UNDO_RESOURCES, "edit"))) -> dict[str, Any]:
+    """Отменить действие — вернуть состояние «до», а не сделать обратное."""
+    _guard()
+    return undo_entry(member, entry_id)
 
 
 # ── Интеграции ──────────────────────────────────────────────────────────────
@@ -1899,7 +2305,7 @@ class IntegrationIn(BaseModel):
 
 
 @router.get("/integrations")
-def list_integrations(member: Member = Depends(current_member)) -> dict[str, Any]:
+def list_integrations(member: Member = Depends(require_access("integrations"))) -> dict[str, Any]:
     """Подключения компании и справочник банков с логотипами."""
     _guard()
     with finance_session() as session:
@@ -1919,7 +2325,7 @@ def list_integrations(member: Member = Depends(current_member)) -> dict[str, Any
 
 @router.post("/integrations", status_code=201)
 def create_integration(
-    body: IntegrationIn, member: Member = Depends(require_ability("accounts"))
+    body: IntegrationIn, member: Member = Depends(require_access("integrations", "edit"))
 ) -> dict[str, Any]:
     """Подключить источник. Для приёма по адресу токен возвращается один раз."""
     _guard()
@@ -1956,7 +2362,7 @@ def create_integration(
 
 @router.post("/integrations/{integration_id}/token")
 def rotate_integration_token(
-    integration_id: UUID, member: Member = Depends(require_ability("accounts"))
+    integration_id: UUID, member: Member = Depends(require_access("integrations", "edit"))
 ) -> dict[str, Any]:
     _guard()
     with finance_session() as session:
@@ -1965,6 +2371,10 @@ def rotate_integration_token(
             token = integrations_module.rotate_token(session, workspace.id, integration_id)
         except FinanceError as exc:
             raise _fail(exc) from exc
+        history.write(
+            session, workspace, kind="integration.token", entity="integration", entity_id=integration_id,
+            title="токен подключения заменён",
+        )
         return {"token": token}
 
 
@@ -1972,7 +2382,7 @@ def rotate_integration_token(
 def set_integration_state(
     integration_id: UUID,
     state: str = Query(pattern="^(active|off)$"),
-    member: Member = Depends(require_ability("accounts")),
+    member: Member = Depends(require_access("integrations", "edit")),
 ) -> dict[str, Any]:
     _guard()
     with finance_session() as session:
@@ -1981,12 +2391,17 @@ def set_integration_state(
             integration = integrations_module.set_state(session, workspace.id, integration_id, state)
         except FinanceError as exc:
             raise _fail(exc) from exc
+        history.write(
+            session, workspace, kind="integration.state", entity="integration", entity_id=integration.id,
+            title=f"подключение «{integration.title}» {'включено' if state == 'active' else 'выключено'}",
+            after={"state": state},
+        )
         return integrations_module.to_dict(integration)
 
 
 @router.delete("/integrations/{integration_id}")
 def delete_integration(
-    integration_id: UUID, member: Member = Depends(require_ability("accounts"))
+    integration_id: UUID, member: Member = Depends(require_access("integrations", "edit"))
 ) -> dict[str, bool]:
     _guard()
     with finance_session() as session:
@@ -1995,6 +2410,10 @@ def delete_integration(
             integrations_module.remove(session, workspace.id, integration_id)
         except FinanceError as exc:
             raise _fail(exc) from exc
+        history.write(
+            session, workspace, kind="integration.delete", entity="integration", entity_id=integration_id,
+            title="подключение удалено",
+        )
         return {"ok": True}
 
 
@@ -2101,7 +2520,7 @@ def integration_inbox(
 
 @router.get("/reports/balance")
 def report_balance(
-    member: Member = Depends(current_member), as_of: str | None = None
+    member: Member = Depends(require_access("reports.balance")), as_of: str | None = None
 ) -> dict[str, Any]:
     """Чем компания владеет и что должна — на дату."""
     _guard()
@@ -2112,7 +2531,7 @@ def report_balance(
 
 @router.get("/reports/indicators")
 def report_indicators(
-    member: Member = Depends(current_member),
+    member: Member = Depends(require_access("reports.indicators")),
     date_from: str | None = None,
     date_to: str | None = None,
 ) -> dict[str, Any]:
@@ -2127,7 +2546,7 @@ def report_indicators(
 @router.get("/reports/statement")
 def report_account_statement(
     account_id: UUID,
-    member: Member = Depends(current_member),
+    member: Member = Depends(require_access("reports.statement")),
     date_from: str | None = None,
     date_to: str | None = None,
 ) -> dict[str, Any]:
@@ -2146,7 +2565,7 @@ def report_account_statement(
 
 
 @router.get("/sheets/books")
-def sheets_books(member: Member = Depends(current_member)) -> dict[str, Any]:
+def sheets_books(member: Member = Depends(require_access("sheets"))) -> dict[str, Any]:
     """Книги Google, открытые сервисному аккаунту программы.
 
     Неготовность доступа — не ошибка экрана: `configured: false` показывается
@@ -2162,7 +2581,7 @@ def sheets_books(member: Member = Depends(current_member)) -> dict[str, Any]:
 
 
 @router.get("/sheets/books/{book_id}")
-def sheets_book(book_id: str, member: Member = Depends(current_member)) -> dict[str, Any]:
+def sheets_book(book_id: str, member: Member = Depends(require_access("sheets"))) -> dict[str, Any]:
     """Вкладки книги и ссылка на неё саму."""
     _guard()
     try:
@@ -2181,7 +2600,7 @@ class SheetImportIn(BaseModel):
 @router.post("/sheets/preview")
 def sheets_preview(
     body: SheetImportIn,
-    member: Member = Depends(require_ability("write")),
+    member: Member = Depends(require_access("sheets", "edit")),
 ) -> dict[str, Any]:
     """Разобрать вкладку книги — тем же разбором, что и загруженный файл."""
     _guard()
@@ -2214,7 +2633,7 @@ def sheets_preview(
 
 
 @router.get("/import/batches")
-def list_batches(member: Member = Depends(current_member), limit: int = Query(default=20, ge=1, le=100)) -> dict[str, Any]:
+def list_batches(member: Member = Depends(require_access("import")), limit: int = Query(default=20, ge=1, le=100)) -> dict[str, Any]:
     """Прошлые загрузки: что за файл, сколько завелось, сколько отложено."""
     _guard()
     with finance_session() as session:
@@ -2246,7 +2665,7 @@ def list_batches(member: Member = Depends(current_member), limit: int = Query(de
 
 
 @router.get("/import/batches/{batch_id}")
-def read_batch(batch_id: UUID, member: Member = Depends(current_member)) -> dict[str, Any]:
+def read_batch(batch_id: UUID, member: Member = Depends(require_access("import"))) -> dict[str, Any]:
     """Строки партии: заведённые, отложенные и почему."""
     _guard()
     with finance_session() as session:
@@ -2291,7 +2710,7 @@ class ApplyIn(BaseModel):
 
 
 @router.post("/import/batches/{batch_id}/apply")
-def apply_batch(batch_id: UUID, body: ApplyIn, member: Member = Depends(require_ability("write"))) -> dict[str, Any]:
+def apply_batch(batch_id: UUID, body: ApplyIn, member: Member = Depends(require_access(("import", "sheets"), "edit"))) -> dict[str, Any]:
     """Завести готовые строки партии.
 
     Отложенные строки остаются в партии и не мешают: файл из двухсот строк с
@@ -2311,6 +2730,12 @@ def apply_batch(batch_id: UUID, body: ApplyIn, member: Member = Depends(require_
             )
         except FinanceError as exc:
             raise _fail(exc) from exc
+        batch = session.get(ImportBatch, batch_id)
+        history.write(
+            session, workspace, kind="import.apply", entity="import_batch", entity_id=batch_id,
+            title=f"загрузка «{batch.file_name if batch else ''}» · заведено {done.get('imported', 0)}",
+            after={key: done.get(key) for key in ("imported", "failed", "skipped", "duplicate", "total")},
+        )
         remembered = done.get("remembered")
         if remembered:
             # Номер записан счёту сам, по выписке, — это видно в истории и
@@ -2334,7 +2759,7 @@ class RowFixIn(BaseModel):
 
 
 @router.patch("/import/batches/{batch_id}/rows/{line}")
-def fix_row(batch_id: UUID, line: int, body: RowFixIn, member: Member = Depends(require_ability("write"))) -> dict[str, Any]:
+def fix_row(batch_id: UUID, line: int, body: RowFixIn, member: Member = Depends(require_access(("import", "sheets"), "edit"))) -> dict[str, Any]:
     """Поправить отложенную строку, не перезагружая файл."""
     _guard()
     with finance_session() as session:
