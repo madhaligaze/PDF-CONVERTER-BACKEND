@@ -23,6 +23,13 @@ def _init_bbc() -> None:
     the API from booting.
     """
     try:
+        from app.bbc.config import bbc_settings
+
+        # Выключенный раздел (BBC_DASHBOARD_ENABLED=false) не трогает базу
+        # вовсе: схему заведёт первый старт после включения.
+        if not bbc_settings.enabled:
+            log.info("BBC Dashboard выключен — схема не заводится")
+            return
         from app.bbc.db import init_bbc_database
 
         init_bbc_database()

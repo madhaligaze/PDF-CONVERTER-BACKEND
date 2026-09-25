@@ -84,7 +84,21 @@ from app.bbc.sheets import BbcError
 
 log = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/bbc")
+
+def _module_switch(request: Request) -> None:
+    """Выключатель раздела: `BBC_DASHBOARD_ENABLED=false` — все двери закрыты.
+
+    Открыт только `/bbc/status`: по нему фронт узнаёт, что раздел выключен,
+    и убирает его плитку и страницу (`src/lib/features.ts`). Остальное
+    отвечает 404, как будто раздела нет: выключенный раздел не должен ни
+    ходить в Google, ни держать сеансы, ни отдавать файлы.
+    """
+    if bbc_settings.enabled or request.url.path.endswith("/bbc/status"):
+        return
+    raise HTTPException(status_code=404, detail="BBC Dashboard выключен")
+
+
+router = APIRouter(prefix="/bbc", dependencies=[Depends(_module_switch)])
 
 #: Сколько живёт cookie доступа к файлам. Час: она нужна на время просмотра
 #: журнала, а не на срок ссылки — та бессрочна по умолчанию.
