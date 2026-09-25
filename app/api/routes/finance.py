@@ -50,6 +50,7 @@ from app.finance import (
     history,
     integrations as integrations_module,
     invoices as invoices_module,
+    live as live_module,
     notifications,
     recurring,
     reports,
@@ -1441,10 +1442,15 @@ def read_grid(
     date_to: str | None = None,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    """Журнал как лист: шапка, строки и значения для выпадающих списков."""
+    """Журнал как лист: шапка, строки и значения для выпадающих списков.
+
+    `seq` — номер изменения журнала, с которого лист начинает опрос
+    (`/grid/changes`); читается до выборки строк, как у реестра договоров.
+    """
     _guard()
     with finance_session() as session:
         workspace = _workspace(session, member)
+        seq = live_module.current_seq(session, workspace.id)
         flt = service.OperationFilter(
             date_from=_parse_date(date_from, field="date_from"),
             date_to=_parse_date(date_to, field="date_to"),
@@ -1454,7 +1460,21 @@ def read_grid(
         )
         payload = grid_module.build_grid(session, workspace, operations)
         payload["total"] = total
+        payload["seq"] = seq
         return payload
+
+
+@router.get("/grid/changes")
+def grid_changes(since: int = Query(0, ge=0), member: Member = Depends(require_access("table"))) -> dict[str, Any]:
+    """Живой режим листа «Таблица»: строки, изменённые после `since`, и снятые.
+
+    Лист опрашивает раз в 2 с, пока вкладка видна; почти всегда ответ пустой —
+    два чтения счётчика.
+    """
+    _guard()
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        return live_module.changes(session, workspace, since)
 
 
 class CellPatch(BaseModel):

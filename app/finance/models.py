@@ -345,12 +345,18 @@ class Operation(FinanceBase):
         sa.Index("ix_operations_workspace_id_paid_at", "workspace_id", "paid_at"),
         sa.Index("ix_operations_workspace_id_accrued_at", "workspace_id", "accrued_at"),
         sa.Index("ix_operations_workspace_id_status", "workspace_id", "status"),
+        sa.Index("ix_operations_workspace_id_seq", "workspace_id", "seq"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=_uuid)
     workspace_id: Mapped[uuid.UUID] = mapped_column(
         sa.Uuid, sa.ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
     )
+    #: Номер изменения журнала (счётчик компании «operations»). Лист «Таблица»
+    #: опрашивает всё, что изменилось после номера, — живой режим, как у
+    #: реестра договоров. Ставит его `app/finance/live.py` в конце транзакции,
+    #: на любой путь записи.
+    seq: Mapped[int] = mapped_column(sa.BigInteger, server_default=sa.text("0"))
     kind: Mapped[str] = mapped_column(sa.Text)
     status: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("'fact'"))
 
@@ -411,6 +417,28 @@ class Operation(FinanceBase):
     #: Номер правки. Растёт на каждое изменение; фронт присылает его обратно,
     #: и правка по устаревшей версии отклоняется, а не перетирает чужую.
     version: Mapped[int] = mapped_column(sa.Integer, server_default=sa.text("1"))
+
+
+class OperationRemoval(FinanceBase):
+    """Операция, удалённая насовсем, — чтобы открытый лист её убрал.
+
+    Журнал удаляет мягко (`deleted_at`), и такая операция приходит в опрос
+    сама. Но план из счёта и из повторения удаляются `DELETE`: строки нет —
+    сказать открытому листу «её больше нет» нечем. Запись здесь — только это.
+    """
+
+    __tablename__ = "operation_removals"
+    __table_args__ = (sa.Index("ix_operation_removals_workspace_id_seq", "workspace_id", "seq"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=_uuid)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid, sa.ForeignKey("workspaces.id", ondelete="CASCADE")
+    )
+    operation_id: Mapped[uuid.UUID] = mapped_column(sa.Uuid)
+    seq: Mapped[int] = mapped_column(sa.BigInteger, server_default=sa.text("0"))
+    removed_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now()
+    )
 
 
 class OperationProject(FinanceBase):

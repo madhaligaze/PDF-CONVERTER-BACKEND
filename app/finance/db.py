@@ -87,6 +87,11 @@ def get_finance_session_factory() -> sessionmaker[Session]:
         _session_factory = sessionmaker(
             bind=finance_engine(), autoflush=False, autocommit=False, future=True
         )
+        # Номер изменения у каждой записанной операции — для живого режима
+        # листа «Таблица» (см. `app/finance/live.py`).
+        from app.finance import live
+
+        live.register(_session_factory)
     init_finance_database()
     return _session_factory
 
