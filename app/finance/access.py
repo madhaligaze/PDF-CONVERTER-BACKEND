@@ -72,6 +72,11 @@ RESOURCES: tuple[Resource, ...] = (
     Resource("recurrences", "Повторения", "Учёт"),
     Resource("import", "Загрузка", "Учёт"),
     Resource("sheets", "Книги Google", "Учёт"),
+    # Сводка в колонке разделов: остатки по счетам, «нам должны», «мы должны».
+    # Своим правом, а не заодно с журналом: кассиру открывают журнал, чтобы он
+    # вносил операции, а не чтобы знал, сколько у компании денег. Пока сводку
+    # показывали каждому с любым денежным разделом, остатки видели все.
+    Resource("reports.summary", "Остатки и долги", "Отчёты", VIEW_ONLY, note="колонка слева"),
     Resource("reports.cash", "Деньги", "Отчёты", VIEW_ONLY, note="весь журнал"),
     Resource("reports.profit", "Прибыль", "Отчёты", VIEW_ONLY, note="весь журнал"),
     Resource("reports.debts", "Долги", "Отчёты", VIEW_ONLY, note="весь журнал"),
@@ -89,8 +94,9 @@ RESOURCES: tuple[Resource, ...] = (
 )
 RESOURCE_BY_KEY: dict[str, Resource] = {item.key: item for item in RESOURCES}
 #: Разделы с деньгами — им нужны справочники (счета, статьи) для форм.
+#: Сводке справочники не нужны: у неё нет ни формы, ни пункта в колонке.
 MONEY_RESOURCES: tuple[str, ...] = tuple(
-    item.key for item in RESOURCES if item.key not in ("contracts", "people", "audit")
+    item.key for item in RESOURCES if item.key not in ("contracts", "people", "audit", "reports.summary")
 )
 
 #: Прежние роли → личные права, равные прежним способностям (ревизия 0019

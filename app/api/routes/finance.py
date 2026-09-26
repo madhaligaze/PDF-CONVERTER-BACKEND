@@ -763,11 +763,14 @@ def auth_profile(body: ProfileIn, member: Member = Depends(require_role("owner",
 
 
 @router.get("/overview")
-def overview(member: Member = Depends(require_access("journal"))) -> dict[str, Any]:
-    """Первый экран: счета, остатки и ближайшие ожидания.
+def overview(member: Member = Depends(require_access("reports.summary"))) -> dict[str, Any]:
+    """Сводка в колонке разделов: счета, остатки и ближайшие ожидания.
 
     Один запрос, а не четыре: раздел открывают десятки раз в день, и каждый
     лишний круг до сервера человек ощущает как «подвисло».
+
+    Своё право, а не журнал: раньше сводку получал любой с журналом, и
+    сотрудник, которому открыли журнал и таблицу, видел остатки всех счетов.
     """
     _guard()
     with finance_session() as session:
@@ -810,8 +813,14 @@ def overview(member: Member = Depends(require_access("journal"))) -> dict[str, A
 
 @router.get("/dictionaries")
 def dictionaries(member: Member = Depends(require_access(access_module.MONEY_RESOURCES))) -> dict[str, Any]:
-    """Все справочники разом — ими наполняются выпадающие списки форм."""
+    """Все справочники разом — ими наполняются выпадающие списки форм.
+
+    Начальный остаток счёта — только тем, кому остатки открыты: вместе с
+    журналом он даёт остаток на сегодня, то есть ту же сводку, которую
+    закрывает право «Остатки и долги». Формам журнала нужно только имя счёта.
+    """
     _guard()
+    sees_balances = member.rights.can_any(("dictionaries", "reports.summary"))
     with finance_session() as session:
         workspace = _workspace(session, member)
         return {
@@ -821,7 +830,7 @@ def dictionaries(member: Member = Depends(require_access(access_module.MONEY_RES
                     "name": item.name,
                     "kind": item.kind,
                     "currency": item.currency,
-                    "starting_balance": str(item.starting_balance),
+                    "starting_balance": str(item.starting_balance) if sees_balances else None,
                     "excluded_from_reports": item.excluded_from_reports,
                     "number": item.number or "",
                 }

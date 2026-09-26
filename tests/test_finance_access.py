@@ -358,6 +358,35 @@ def test_bez_prava_na_razdel_403_i_na_chtenii(app: FastAPI) -> None:
     assert me["abilities"] == ["read"]
 
 
+def test_svodka_ostatkov_svoim_pravom(app: FastAPI) -> None:
+    """Журнал и таблица не открывают остатков: ни сводкой, ни начальным остатком.
+
+    Раньше сводку отдавали любому с журналом, и кассир видел в колонке, сколько
+    денег на каждом счёте компании.
+    """
+    owner = register(app)
+    card = employee(owner, "Нурланова Асель", "+77071112233")
+    grant(owner, "employee", card["id"], {"journal": "edit", "table": "edit"})
+    person = activate(app, "+77071112233")
+
+    assert person.get(f"{BASE}/auth/me").json()["access"]["reports.summary"] == "none"
+    denied = person.get(f"{BASE}/overview")
+    assert denied.status_code == 403 and "Остатки и долги" in denied.json()["detail"]
+    # Формам журнала счета нужны — по имени, без остатка.
+    accounts = person.get(f"{BASE}/dictionaries").json()["accounts"]
+    assert accounts and all(item["starting_balance"] is None for item in accounts)
+
+    grant(owner, "employee", card["id"], {"reports.summary": "view"})
+    assert person.get(f"{BASE}/overview").status_code == 200
+    accounts = person.get(f"{BASE}/dictionaries").json()["accounts"]
+    assert all(item["starting_balance"] is not None for item in accounts)
+    # Сводка — отчёт: правки у неё нет.
+    wrong = owner.put(f"{BASE}/access/employee/{card['id']}", json={"changes": {"reports.summary": "edit"}})
+    assert wrong.status_code == 400
+    # Владельцу запись не нужна.
+    assert owner.get(f"{BASE}/overview").status_code == 200
+
+
 def test_lichnoe_poverh_otdelskogo(app: FastAPI) -> None:
     owner = register(app)
     obo = department(owner, "ОБО")
