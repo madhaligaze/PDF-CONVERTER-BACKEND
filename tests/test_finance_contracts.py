@@ -286,6 +286,9 @@ def test_smysl_daty_okonchaniya_ne_skhlopyvaetsya(space):
                           type="Разовая услуга", end_date="01.04.2025")
         unclear = _make(session, space, executor="BBC", customer="ТОО В", status="действующий",
                         type="Абонентское обслуживание", end_date="01.04.2025")
+        # Статус — закрытый список: своё значение сначала добавляют в настройке,
+        # и без смысла оно горит замечанием.
+        setup.add_value(session, workspace, "status", "нужно закрыть по бух")
         odd = _make(session, space, executor="BBC", customer="ТОО Г", status="нужно закрыть по бух")
         registry = service.Registry(session, workspace)
         codes = {issue["code"] for issue in service.issues_of(odd, registry, service.NumberIndex(), {})}

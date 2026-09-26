@@ -33,7 +33,7 @@ from app.finance.auth import Member
 from app.finance.config import finance_settings
 from app.finance.contracts import amendments as amendments_module
 from app.finance.contracts import export as export_module
-from app.finance.contracts import importer, service, setup
+from app.finance.contracts import importer, payments, service, setup
 from app.finance.contracts.views import FilterError
 from app.finance.db import finance_session
 from app.finance.service import FinanceError
@@ -127,6 +127,19 @@ def get_changes(since: int = Query(0, ge=0), member: Member = Depends(contract_m
     return Response(content=body, media_type="application/json")
 
 
+@router.get("/payments")
+def list_payments(member: Member = Depends(contract_member)) -> dict[str, Any]:
+    """«Оплачено/Остаток по выписке» видимых договоров. Объявлен до
+    `/{contract_id}`: иначе «payments» разбирался бы как идентификатор."""
+    access = _access(member)
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        try:
+            return payments.summaries(session, workspace, access)
+        except Exception as exc:  # noqa: BLE001
+            return _raise(exc)
+
+
 @router.get("/export.xlsx")
 def export_xlsx(views: str = Query(""), member: Member = Depends(contract_member)) -> Response:
     access = _access(member)
@@ -213,12 +226,22 @@ def similar_parties(name: str = Query(""), bin: str = Query(""), member: Member 
 
 @router.get("/people")
 def list_people(member: Member = Depends(contract_member)) -> dict[str, Any]:
+    """Справочник ответственных — действующие сотрудники из личного кабинета.
+
+    Ушедшие в архив в выбор не попадают; подпись у старых договоров, где они
+    стоят, приходит вместе с договорами.
+    """
     _access(member)
     with finance_session() as session:
         workspace = _workspace(session, member)
         registry = service.Registry(session, workspace)
         output = service.Output(session, registry, service.Access(view=True))
-        return {"people": list(output.people(list(registry.employees)).values())}
+        active = sorted(
+            (item for item in registry.employees.values() if item.archived_at is None),
+            key=lambda item: (item.position, item.full_name),
+        )
+        found = output.people([item.id for item in active])
+        return {"people": [found[str(item.id)] for item in active if str(item.id) in found]}
 
 
 # ── Загрузка Excel ───────────────────────────────────────────────────────────
@@ -338,6 +361,7 @@ class FieldIn(BaseModel):
     hidden: bool | None = None
     required: bool | None = None
     archived: bool | None = None
+    fill: str | None = None
 
 
 class ValueIn(BaseModel):
@@ -345,6 +369,8 @@ class ValueIn(BaseModel):
     meaning: dict[str, Any] | None = None
     position: int | None = None
     archived: bool | None = None
+    #: «Это разные»: значение того же списка, которое не двойник этого.
+    distinct: UUID | None = None
 
 
 class MergeIn(BaseModel):
@@ -592,6 +618,36 @@ def acknowledge(contract_id: UUID, body: AcknowledgeIn, member: Member = Depends
         try:
             contract = service.acknowledge(session, workspace, access, _actor(member), contract_id, body.code, on=body.on)
             return service.one(session, workspace, access, contract)
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            return _raise(exc)
+
+
+class PaymentIn(BaseModel):
+    operation_id: UUID
+    action: str
+
+
+@router.get("/{contract_id}/payments")
+def contract_payments(contract_id: UUID, member: Member = Depends(contract_member)):
+    access = _access(member)
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        try:
+            return payments.of_contract(session, workspace, access, contract_id)
+        except Exception as exc:  # noqa: BLE001
+            return _raise(exc)
+
+
+@router.post("/{contract_id}/payments")
+def decide_payment(contract_id: UUID, body: PaymentIn, member: Member = Depends(contract_editor)):
+    access = _access(member)
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        try:
+            return payments.decide(
+                session, workspace, access, _actor(member), contract_id, body.operation_id, body.action
+            )
         except Exception as exc:  # noqa: BLE001
             session.rollback()
             return _raise(exc)

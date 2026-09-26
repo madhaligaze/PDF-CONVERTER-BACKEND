@@ -224,6 +224,11 @@ def confirm(
         if effect == "amount":
             amount, terms = read_money(value, field="Сумма")
             after = {"amount": _plain(amount), "amount_terms": terms}
+        elif registry.fill(effect) == "own" and not registry.is_own(
+            contract.customer_id if effect == "executor" else contract.executor_id
+        ):
+            party = registry.pick_own(value, title=registry.title(effect))
+            after = {effect: str(party.id) if party else None}
         else:
             resolved = registry.resolve_party(value, slot=effect)
             if resolved.ambiguous or resolved.party is None:

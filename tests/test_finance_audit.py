@@ -330,6 +330,14 @@ def test_kazhdyy_izmenyayushchiy_marshrut_pishet_sobytie(app: FastAPI) -> None:
     twin = owner.post(f"{BASE}/contracts", json=contract_values("ТОО Бета", "ЮО/141")).json()["contract"]["id"]
     walk.call(owner, "PATCH", "/contracts/{contract_id}", contract_id=first, json={"values": {"note": "звонили"}})
     walk.call(owner, "POST", "/contracts/{contract_id}/acknowledge", contract_id=twin, json={"code": "number_taken"})
+    customer = owner.get(f"{BASE}/contracts/{first}").json()["contract"]["values"]["customer"]
+    payment = owner.post(
+        f"{BASE}/operations",
+        json={"kind": "income", "paid_at": "2026-09-02", "amount": "500000", "account_to_id": cash,
+              "counterparty_id": customer},
+    ).json()["id"]
+    walk.call(owner, "POST", "/contracts/{contract_id}/payments", contract_id=first,
+              json={"operation_id": payment, "action": "link"})
     dated = owner.patch(
         f"{BASE}/contracts/{first}",
         json={"values": {"amount": "750000"}, "mode": {"kind": "from_date", "effective_from": "2026-01-01"}},

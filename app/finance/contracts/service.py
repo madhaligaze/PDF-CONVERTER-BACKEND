@@ -41,6 +41,7 @@ from app.finance.contracts import views as views_module
 from app.finance.contracts.fields import (
     ENTITY,
     FIELD_BY_KEY,
+    LIVE_FIELDS,
     MODE_FIELDS,
     SNAPSHOT_FIELDS,
     SYSTEM_KEYS,
@@ -50,6 +51,7 @@ from app.finance.contracts.fields import (
     economic_role_values,
     ensure_registry,
     fields_of,
+    fill_of,
     number_key,
     party_key,
     subject_meaning,
@@ -127,6 +129,80 @@ class NotFound(FinanceError):
     """Договора нет — или он не открыт этому человеку. Ответ одинаковый."""
 
 
+class NotInList(FinanceError):
+    """Значения нет в закрытом списке поля.
+
+    Закрытый список не заводит новое из напечатанного: опечатка в статусе
+    («им») раньше становилась ещё одним статусом, и договор с ним выпадал из
+    всех листов, где отбор шёл по статусу.
+
+    `kind`: `missing` — не нашлось; `ambiguous` — подходит несколько;
+    `archived` — нашлось только в архиве.
+    """
+
+    def __init__(self, text: str, kind: str = "missing"):
+        super().__init__(text)
+        self.kind = kind
+
+
+_ORG_PREFIX = re.compile(r"^(тоо|ип|ао)")
+
+
+def _pick_closed(
+    text: str,
+    items: Sequence[Any],
+    names: Any,
+    *,
+    key: Any,
+    title: str,
+    missing: str,
+    archived: Sequence[Any] = (),
+) -> Any:
+    """Одно из `items` по напечатанному: точное написание, иначе однозначное начало.
+
+    Начало — это «Дей» → «Действующий», «Наталья П.» → «Наталья Петровна»,
+    «Omar» → «Omar Development & Consulting». Кандидатов больше одного — отказ со
+    списком: выбирать между ними за человека нельзя (правило «не угадывать»).
+    """
+    needle = key(text)
+    if not needle:
+        # «ип» без имени — не пустое значение, а ничего не найдено: пустым
+        # оно стёрло бы поле.
+        raise NotInList(missing)
+    exact =[item for item in items if any(key(name) == needle for name in names(item) if name)]
+    if len(exact) == 1:
+        return exact[0]
+    pool = exact or [
+        item for item in items if any(key(name).startswith(needle) for name in names(item) if name)
+    ]
+    if len(pool) == 1:
+        return pool[0]
+    if pool:
+        shown = ", ".join(f"«{next(n for n in names(item) if n)}»" for item in pool[:3])
+        more = f" и ещё {len(pool) - 3}" if len(pool) > 3 else ""
+        raise NotInList(
+            f"{title}: под «{text}» подходит несколько — {shown}{more}. Выберите из списка", "ambiguous"
+        )
+    if any(any(key(name) == needle for name in names(item) if name) for item in archived):
+        raise NotInList(f"{title}: «{text}» в архиве — выберите действующее значение", "archived")
+    raise NotInList(missing)
+
+
+def _list_key(value: Any) -> str:
+    return norm(value)
+
+
+def _person_key(value: Any) -> str:
+    # «Наталья П.» — начало «Наталья Петровна», если точку не считать буквой.
+    return norm(str(value or "").replace(".", " ")).strip()
+
+
+def _own_key(value: Any) -> str:
+    # «Omar» — начало «Omar Development», в каком бы виде ни была записана
+    # организационная форма: «ТОО «BBC Astana»» и «BBC Astana» — одно имя.
+    return _ORG_PREFIX.sub("", party_key(value))
+
+
 # ── Права ────────────────────────────────────────────────────────────────────
 
 
@@ -172,6 +248,10 @@ def access_of(member: Any) -> Access:
     if level == "none":
         return Access()
     hidden = frozenset(key for key in rights.fields if rights.field_level(key) == "none")
+    # «Оплачено/Остаток по выписке» — суммы из журнала операций: кому журнал
+    # не открыт, тому и эти поля.
+    if rights.level("journal") == "none":
+        hidden = hidden | frozenset(LIVE_FIELDS)
     readonly = frozenset(key for key in rights.fields if rights.field_level(key) == "view")
     return Access(
         view=True,
@@ -504,6 +584,174 @@ class Registry:
                 out.append(employee)
         return out
 
+    # — ручной ввод по способу заполнения —
+
+    def fill(self, key: str) -> str:
+        """Способ заполнения поля (`fields.fill_of`); у поля без списка — пусто."""
+        item = self.field_by_key.get(key)
+        return fill_of(item) if item is not None else ""
+
+    def title(self, key: str) -> str:
+        item = self.field_by_key.get(key)
+        return item.title if item is not None else key
+
+    def pick_value(self, field_key: str, raw: Any) -> ListValue | None:
+        """Значение закрытого списка — без заведения нового."""
+        if isinstance(raw, dict):
+            raw = raw.get("id") or raw.get("value")
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        try:
+            found = self.values.get(uuid.UUID(text))
+        except ValueError:
+            found = None
+        if found is not None and found.field_key == field_key:
+            return found
+        values = list(self.values_by_field.get(field_key, {}).values())
+        title = self.title(field_key)
+        return _pick_closed(
+            text,
+            sorted((item for item in values if item.archived_at is None), key=lambda item: item.position),
+            lambda item: (item.value,),
+            key=_list_key,
+            title=title,
+            missing=f"«{text}» нет в списке «{title}» — список пополняют в настройке реестра",
+            archived=[item for item in values if item.archived_at is not None],
+        )
+
+    def pick_department(self, raw: Any) -> Department | None:
+        """Отдел из списка отделов — без заведения нового."""
+        if isinstance(raw, dict):
+            raw = raw.get("id") or raw.get("code")
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        try:
+            found = self.departments.get(uuid.UUID(text))
+        except ValueError:
+            found = None
+        if found is not None:
+            return found
+        items = sorted(self.departments.values(), key=lambda item: item.position)
+        return _pick_closed(
+            text,
+            [item for item in items if item.archived_at is None],
+            lambda item: (item.code, item.title),
+            key=_list_key,
+            title=self.title("department"),
+            missing=f"Отдела «{text}» нет в списке — отделы заводят в личном кабинете, вкладка «Люди»",
+            archived=[item for item in items if item.archived_at is not None],
+        )
+
+    def input_people(self, raw: Any, *, closed: bool, title: str) -> list[Employee]:
+        """Ответственные из листа или карточки.
+
+        Идентификатор принимается любой — так карточка пересылает уже стоящих
+        людей, даже ушедших в архив. Текст ищется среди действующих: полное
+        имя, «Наталья П.» (так лист и список показывают людей коротко) или
+        однозначное начало. Не нашёлся — в закрытом списке отказ, в открытом —
+        новый человек. Похожих несколько — отказ в обоих: третий «Асхат» из
+        короткого имени хуже вопроса.
+        """
+        self._load_employees()
+        assert self._employees is not None and self._employee_by_name is not None
+        if raw is None or raw == "":
+            return []
+        items = list(raw) if isinstance(raw, (list, tuple)) else re.split(r"[,;\n/]+", str(raw))
+        active = sorted(
+            (item for item in self._employees.values() if item.archived_at is None),
+            key=lambda item: (item.position, item.full_name),
+        )
+        archived = [item for item in self._employees.values() if item.archived_at is not None]
+        out: list[Employee] = []
+        for item in items:
+            if isinstance(item, dict):
+                item = item.get("id") or item.get("name")
+            text = str(item or "").strip()
+            if not text:
+                continue
+            employee: Employee | None = None
+            try:
+                employee = self._employees.get(uuid.UUID(text))
+                if employee is None:
+                    raise NotInList(f"{title}: такого сотрудника нет")
+            except ValueError:
+                try:
+                    employee = _pick_closed(
+                        text,
+                        active,
+                        lambda person: (person.full_name,),
+                        key=_person_key,
+                        title=title,
+                        missing=f"«{text}» нет среди сотрудников — их заводят в личном кабинете, вкладка «Люди»",
+                        archived=archived,
+                    )
+                except NotInList as exc:
+                    if closed or exc.kind != "missing":
+                        raise
+                    employee = self.resolve_people([text])[0]
+            if employee is not None and employee not in out:
+                out.append(employee)
+        return out
+
+    def pick_own(self, raw: Any, *, title: str) -> Counterparty | None:
+        """Сторона только из наших юрлиц: идентификатор, имя, код или полное имя."""
+        if isinstance(raw, dict):
+            raw = raw.get("id") or raw.get("name")
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        own = [
+            party
+            for entity in sorted(self.own.values(), key=lambda row: (row.position, row.code))
+            if (party := self.parties.get(entity.counterparty_id)) is not None
+        ]
+        if not own:
+            raise NotInList(
+                f"{title}: наших юрлиц ещё нет — их заводят в настройке реестра, вкладка «Наши юрлица»"
+            )
+        found = self._by_id(text)
+        if found is not None:
+            if self.is_own(found.id):
+                return found
+            raise NotInList(f"«{found.name}» — не наше юрлицо, а в «{title}» стоят только наши")
+        return _pick_closed(
+            text,
+            own,
+            lambda party: (party.name, self.own[party.id].code, self.own[party.id].full_name),
+            key=_own_key,
+            title=title,
+            missing=f"«{text}» — не наше юрлицо, а в «{title}» стоят только наши",
+        )
+
+    def check_closed(self, key: str, raw: Any, *, other_own: bool = False) -> None:
+        """Проверить значение закрытого поля, ничего не записывая.
+
+        Правка стороны сначала спрашивает «опечатка или с даты» — и отказ
+        «не наше юрлицо» после ответа выглядел бы издёвкой. Поэтому закрытые
+        поля проверяются до вопроса. `other_own` — напротив уже стоит наше
+        юрлицо: эта сторона может быть чужой (см. `_OTHER_SIDE`).
+        """
+        fill = self.fill(key)
+        if fill not in ("list", "own") or (fill == "own" and other_own):
+            return
+        item = self.field_by_key.get(key)
+        kind = item.type if item is not None else ""
+        title = self.title(key)
+        if fill == "own":
+            self.pick_own(raw, title=title)
+        elif kind == "department":
+            self.pick_department(raw)
+        elif kind == "person":
+            self.input_people(raw, closed=True, title=title)
+        elif kind == "multi_list":
+            parts = raw if isinstance(raw, list) else re.split(r"[,;\n]+", str(raw or ""))
+            for part in parts:
+                self.pick_value(key, part)
+        else:
+            self.pick_value(key, raw)
+
     # — смыслы —
 
     def meaning(self, value_id: uuid.UUID | None) -> dict[str, Any]:
@@ -617,6 +865,9 @@ def value_of(contract: Contract, key: str, people: Sequence[uuid.UUID] = ()) -> 
         return _plain(getattr(contract, key))
     if key in ("paid_snapshot", "remaining_snapshot"):
         return (contract.file_snapshot or {}).get(key.replace("_snapshot", ""))
+    if key in LIVE_FIELDS:
+        # Считаются из журнала (`payments.py`) и приходят своим запросом.
+        return None
     if key in SYSTEM_KEYS:
         return getattr(contract, key, None)
     return (contract.attrs or {}).get(key)
@@ -711,8 +962,17 @@ def number_index_for(session: Session, workspace_id: uuid.UUID, keys: Iterable[s
     return index
 
 
+#: Поля, у которых пустота уже названа своим замечанием («Не указан
+#: исполнитель»): «обязательное» не должно говорить о них второй раз.
+_OWN_EMPTY_ISSUES = frozenset({"executor", "customer", "signed_at"})
+
+
 def issues_of(
-    contract: Contract, registry: Registry, numbers: NumberIndex, party_names: dict[uuid.UUID, str]
+    contract: Contract,
+    registry: Registry,
+    numbers: NumberIndex,
+    party_names: dict[uuid.UUID, str],
+    people: Sequence[uuid.UUID] | None = None,
 ) -> list[dict[str, Any]]:
     """Замечания к договору. Код, поле, текст и ссылка на то, о чём речь.
 
@@ -770,9 +1030,31 @@ def issues_of(
         add("type_unknown", "type", f"Вид «{value.value if value else ''}» без смысла — неясно, как начислять")
     if contract.end_date is not None and contract.end_kind in ("", "unknown"):
         add("end_kind_unknown", "end_date", "Непонятно, расторжение это или исполнение")
-    for key, text in ((contract.attrs or {}).get(RAW_KEY) or {}).items():
+    unread = (contract.attrs or {}).get(RAW_KEY) or {}
+    for key, text in unread.items():
         title = registry.field_by_key[key].title if key in registry.field_by_key else key
-        add(f"unread_{key}", key, f"«{str(text)[:60]}» в поле «{title}» не прочитано", ref=str(text))
+        shown = str(text)[:60]
+        fill = registry.fill(key)
+        if fill == "own":
+            message = f"«{shown}» — не наше юрлицо, а в «{title}» стоят только наши"
+        elif fill == "list":
+            message = f"«{shown}» нет в списке «{title}»"
+        else:
+            message = f"«{shown}» в поле «{title}» не прочитано"
+        add(f"unread_{key}", key, message, ref=str(text))
+    # «Обязательное» в настройке полей — замечание у пустого поля. Не запрет:
+    # договор набирают по ячейке, и первая же ячейка новой строки иначе
+    # упиралась бы в пустые остальные.
+    for item in registry.fields:
+        if not item.required or item.hidden or item.key in _OWN_EMPTY_ISSUES or item.key in unread:
+            continue
+        if item.key in SNAPSHOT_FIELDS or item.key in LIVE_FIELDS:
+            continue
+        if item.key == "people" and people is None:
+            continue
+        value = value_of(contract, item.key, people or ())
+        if value in (None, "", []):
+            add(f"required_{item.key}", item.key, f"Не заполнено: «{item.title}»")
     return out
 
 
@@ -947,7 +1229,7 @@ class Output:
                     "provenance": item.provenance or {},
                     "issues": [
                         issue
-                        for issue in issues_of(item, registry, numbers, party_names)
+                        for issue in issues_of(item, registry, numbers, party_names, mine)
                         if issue["field"] not in self.access.hidden
                     ],
                     "views": views_module.membership(facts_of(item, registry, mine), registry.views),
@@ -1323,25 +1605,43 @@ def _set_field(
     registry: Registry,
     *,
     people_out: dict[str, list[Employee]],
+    strict: bool = False,
 ) -> Any:
-    """Разобрать значение поля и записать в договор. Возвращает новое значение API."""
+    """Разобрать значение поля и записать в договор. Возвращает новое значение API.
+
+    `strict` — ручной ввод (лист, карточка, API): поле заполняется по своему
+    способу (`Registry.fill`), закрытый список не заводит новое из опечатки.
+    Загрузка Excel идёт без него — там незнакомое решает протокол разбора.
+    """
     title = registry.field_by_key.get(key).title if key in registry.field_by_key else key
+    fill = registry.fill(key) if strict else ""
     if key in SNAPSHOT_FIELDS:
         raise FinanceError(f"«{title}» — как было в файле, только чтение")
-    if key in ("executor", "customer"):
+    if key in LIVE_FIELDS:
+        raise FinanceError(f"«{title}» считается по выписке — только чтение")
+    if key in ("executor", "customer") and fill == "own" and not registry.is_own(
+        getattr(contract, COLUMN_OF[_OTHER_SIDE[key]])
+    ):
+        party = registry.pick_own(raw, title=title)
+        setattr(contract, COLUMN_OF[key], party.id if party else None)
+    elif key in ("executor", "customer"):
         resolved = registry.resolve_party(raw, slot=key)
         if resolved.ambiguous:
             names = ", ".join(item.name for item in resolved.ambiguous[:3])
             raise FinanceError(f"{title}: подходит несколько — {names}. Выберите в карточке")
         setattr(contract, COLUMN_OF[key], resolved.party.id if resolved.party else None)
     elif key in ("type", "subject", "status", "economic_role"):
-        value = registry.resolve_value(key, raw)
+        value = registry.pick_value(key, raw) if fill == "list" else registry.resolve_value(key, raw)
         setattr(contract, COLUMN_OF[key], value.id if value else None)
     elif key == "department":
-        department = registry.resolve_department(raw)
+        department = registry.pick_department(raw) if fill == "list" else registry.resolve_department(raw)
         contract.department_id = department.id if department else None
     elif key == "people":
-        people_out["people"] = registry.resolve_people(raw)
+        people_out["people"] = (
+            registry.input_people(raw, closed=fill == "list", title=title)
+            if strict
+            else registry.resolve_people(raw)
+        )
     elif key == "amount":
         amount, terms = read_money(raw, field=title)
         contract.amount = amount
@@ -1367,7 +1667,7 @@ def _set_field(
     elif key in TEXT_KEYS:
         setattr(contract, key, str(raw or "").strip())
     else:
-        contract.attrs = {**(contract.attrs or {}), key: _custom_value(registry, key, raw)}
+        contract.attrs = {**(contract.attrs or {}), key: _custom_value(registry, key, raw, fill=fill, strict=strict)}
     # Значение прочиталось — прежний непрочитанный текст этого поля больше не
     # замечание.
     raw_texts = (contract.attrs or {}).get(RAW_KEY) or {}
@@ -1378,8 +1678,8 @@ def _set_field(
     return None
 
 
-def _custom_value(registry: Registry, key: str, raw: Any) -> Any:
-    """Значение своего поля по его типу."""
+def _custom_value(registry: Registry, key: str, raw: Any, *, fill: str = "", strict: bool = False) -> Any:
+    """Значение своего поля по его типу и способу заполнения."""
     item = registry.field_by_key.get(key)
     if item is None:
         raise FinanceError(f"Поля «{key}» в реестре нет")
@@ -1398,20 +1698,27 @@ def _custom_value(registry: Registry, key: str, raw: Any) -> Any:
         return value.isoformat() if value else None
     if kind == "bool":
         return str(raw).strip().lower() in ("1", "true", "да", "yes", "✓", "истина")
+    closed = fill == "list"
     if kind == "list":
-        value = registry.resolve_value(key, raw)
+        value = registry.pick_value(key, raw) if closed else registry.resolve_value(key, raw)
         return str(value.id) if value else None
     if kind == "multi_list":
         parts = raw if isinstance(raw, list) else re.split(r"[,;\n]+", str(raw))
-        values = [registry.resolve_value(key, part) for part in parts]
+        values = [registry.pick_value(key, part) if closed else registry.resolve_value(key, part) for part in parts]
         return [str(value.id) for value in values if value is not None]
     if kind == "person":
-        return [str(employee.id) for employee in registry.resolve_people(raw)]
+        people = (
+            registry.input_people(raw, closed=closed, title=item.title) if strict else registry.resolve_people(raw)
+        )
+        return [str(employee.id) for employee in people]
     if kind == "party":
+        if fill == "own":
+            party = registry.pick_own(raw, title=item.title)
+            return str(party.id) if party else None
         resolved = registry.resolve_party(raw, slot="customer")
         return str(resolved.party.id) if resolved.party else None
     if kind == "department":
-        department = registry.resolve_department(raw)
+        department = registry.pick_department(raw) if closed else registry.resolve_department(raw)
         return str(department.id) if department else None
     return str(raw)
 
@@ -1542,10 +1849,17 @@ def create(
         if key in defaults:
             provenance[key] = "block"
     contract.provenance = provenance
-    user_keys = [key for key in values if key not in ("id",)]
+    user_keys = _party_order(registry, [key for key in values if key not in ("id",)])
     _check_access(registry, access, user_keys)
     for key in user_keys:
-        _set_field(contract, key, values[key], registry, people_out=people)
+        try:
+            _set_field(contract, key, values[key], registry, people_out=people, strict=True)
+        except NotInList:
+            # Строка листа с «им» в статусе всё равно договор: он заводится, а
+            # напечатанное остаётся замечанием у поля — ««им» нет в списке». Отказ
+            # целиком стёр бы набранную строку из-за одной ячейки.
+            _keep_unread(contract, key, values[key])
+            continue
         changed.add(key)
         if key in ("billing", "economic_role", "end_kind"):
             contract.provenance = {**(contract.provenance or {}), key: "manual"}
@@ -1586,6 +1900,45 @@ def create(
     return contract
 
 
+#: «Наша сторона — только наши юрлица» относится к той стороне, где стоит
+#: наше юрлицо. В реестре BBC есть и покупки: в листе «Заказчик ГК» наше ТОО —
+#: заказчик, а исполнитель — «Халык Актив». Если напротив уже стоит наше
+#: юрлицо, эта сторона может быть чужой: иначе покупку нельзя было бы завести
+#: руками вовсе.
+_OTHER_SIDE = {"executor": "customer", "customer": "executor"}
+
+
+def _party_order(registry: Registry, keys: Iterable[str]) -> list[str]:
+    """Сначала сторона, открытая для всех, потом закрытая на наши: закрытой
+    нужно знать, наша ли сторона напротив."""
+    return sorted(keys, key=lambda key: 1 if key in _OTHER_SIDE and registry.fill(key) == "own" else 0)
+
+
+def _other_own(registry: Registry, contract: Contract, key: str, values: dict[str, Any]) -> bool:
+    """Стоит ли напротив стороны `key` наше юрлицо — после этой правки."""
+    other = _OTHER_SIDE.get(key)
+    if other is None:
+        return False
+    if other not in values:
+        return registry.is_own(getattr(contract, COLUMN_OF[other]))
+    try:
+        # Тем же поиском, что и сама закрытая сторона: «BBCA», «omar».
+        return registry.pick_own(values[other], title=registry.title(other)) is not None
+    except NotInList:
+        return False
+
+
+def _keep_unread(contract: Contract, key: str, raw: Any) -> None:
+    """Запомнить непринятое значение поля — оно станет замечанием `unread_<поле>`."""
+    text = ", ".join(str(item) for item in raw) if isinstance(raw, (list, tuple)) else str(raw or "")
+    text = text.strip()
+    if not text:
+        return
+    attrs = dict(contract.attrs or {})
+    attrs[RAW_KEY] = {**(attrs.get(RAW_KEY) or {}), key: text[:200]}
+    contract.attrs = attrs
+
+
 def _block_defaults(registry: Registry, view_key: str | None, block: int | None) -> dict[str, Any]:
     if not view_key:
         return {}
@@ -1618,8 +1971,10 @@ def patch(
     people_now = people_of(session, [contract.id]).get(contract.id, [])
     if not visible_to(contract, registry, access, people_now):
         raise NotFound("Договор не найден")
-    keys = list(values)
+    keys = _party_order(registry, values)
     _check_access(registry, access, keys)
+    for key in keys:
+        registry.check_closed(key, values[key], other_own=_other_own(registry, contract, key, values))
     if known_seq is not None:
         field_seq = contract.field_seq or {}
         conflicts = [key for key in keys if int(field_seq.get(key, 0)) > known_seq]
@@ -1639,7 +1994,7 @@ def patch(
     for key in keys:
         if dated and key in moded:
             continue
-        _set_field(contract, key, values[key], registry, people_out=people)
+        _set_field(contract, key, values[key], registry, people_out=people, strict=True)
         if key in DERIVED:
             contract.provenance = {**(contract.provenance or {}), key: "manual"}
         touched.add(key)
@@ -1734,7 +2089,7 @@ def _amend(
     """
     before_value = value_of(contract, key)
     scratch = Contract(attrs={}, provenance={}, file_snapshot={})
-    _set_field(scratch, key, raw, registry, people_out={})
+    _set_field(scratch, key, raw, registry, people_out={}, strict=True)
     after_value = value_of(scratch, key)
     effect = key if key in ("executor", "customer", "amount") else "other"
     amendment = ContractAmendment(
@@ -1839,7 +2194,10 @@ def acknowledge(
     numbers = number_index_for(session, workspace.id, [contract.number_key])
     named = {pid for entries in numbers.by_key.values() for _cid, pair in entries for pid in pair if pid}
     names = {pid: party.name for pid, party in registry.parties_for(named).items()}
-    current_issues = {issue["code"]: issue for issue in issues_of(contract, registry, numbers, names)}
+    people_now = people_of(session, [contract.id]).get(contract.id, [])
+    current_issues = {
+        issue["code"]: issue for issue in issues_of(contract, registry, numbers, names, people_now)
+    }
     acked = dict(contract.acknowledged or {})
     if on:
         issue = current_issues.get(code)

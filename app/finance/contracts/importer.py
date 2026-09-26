@@ -44,6 +44,7 @@ from app.finance import history
 from app.finance.contracts import setup
 from app.finance.contracts.fields import (
     ENTITY,
+    LIVE_FIELDS,
     SNAPSHOT_FIELDS,
     SYSTEM_KEYS,
     bump,
@@ -51,6 +52,7 @@ from app.finance.contracts.fields import (
     fields_of,
     number_key,
     party_key,
+    with_live_columns,
 )
 from app.finance.contracts.models import Contract, ContractImport, ContractPerson, EntityField, EntityView
 from app.finance.contracts.service import (
@@ -209,6 +211,9 @@ class FieldNames:
 def field_names(fields: Sequence[EntityField]) -> list[FieldNames]:
     out = []
     for item in fields:
+        if item.key in LIVE_FIELDS:
+            # Считаются из журнала — в файле такой колонки быть не может.
+            continue
         names = {norm(name) for name in (item.names or [])} | {norm(item.title)}
         names.discard("")
         out.append(FieldNames(item.key, item.title, names, {squash(name) for name in names}))
@@ -2009,7 +2014,7 @@ def _build_views(
                     "title": block["title"],
                     "filter": rule_filter,
                     "roles": roles,
-                    "columns": columns,
+                    "columns": with_live_columns(columns),
                     "defaults": defaults,
                 }
             )

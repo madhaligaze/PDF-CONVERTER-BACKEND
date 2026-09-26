@@ -18,6 +18,7 @@ from app.finance.contracts.fields import (
     CHOICES,
     ENTITY,
     FIELD_BY_KEY,
+    FILL_OPTIONS,
     MODE_FIELDS,
     SYSTEM_KEYS,
     FieldView,
@@ -25,7 +26,9 @@ from app.finance.contracts.fields import (
     current,
     ensure_registry,
     fields_of,
+    fill_of,
     party_key,
+    similar_values,
     slug_for,
 )
 from app.finance.contracts.models import (
@@ -62,7 +65,8 @@ def schema(session: Session, workspace: Workspace, access: Access) -> dict[str, 
     for item in registry.fields:
         if item.key in access.hidden:
             continue
-        readonly = item.key in ("paid_snapshot", "remaining_snapshot")
+        # «Как было в файле» и «по выписке» — только чтение у всех.
+        readonly = item.system and item.key in FIELD_BY_KEY and FIELD_BY_KEY[item.key].readonly
         fields.append(
             FieldView(
                 key=item.key,
@@ -73,17 +77,27 @@ def schema(session: Session, workspace: Workspace, access: Access) -> dict[str, 
                 required=item.required,
                 hidden=item.hidden,
                 position=item.position,
+                fill=fill_of(item),
             ).to_dict()
         )
     lists: dict[str, list[dict[str, Any]]] = {}
     # Архивные значения выборы не предлагают, но подписать ими старый договор
     # нужно: иначе карточка показала бы вместо «Аренда» голый идентификатор.
     archived_values: dict[str, list[dict[str, Any]]] = {}
+    # Двойники в списке («Абонентское обслуживаниее» рядом с
+    # «Абонентское обслуживание») — подсказка «похоже на …» во вкладке
+    # «Списки»; сводит человек.
+    by_field: dict[str, list[ListValue]] = {}
+    for value in registry.values.values():
+        if value.archived_at is None:
+            by_field.setdefault(value.field_key, []).append(value)
+    similar = {later: earlier for items in by_field.values() for later, earlier in similar_values(items).items()}
     for value in sorted(registry.values.values(), key=lambda row: (row.field_key, row.position)):
         target = lists if value.archived_at is None else archived_values
-        target.setdefault(value.field_key, []).append(
-            {"id": str(value.id), "value": value.value, "meaning": value.meaning or {}, "position": value.position}
-        )
+        item = {"id": str(value.id), "value": value.value, "meaning": value.meaning or {}, "position": value.position}
+        if value.id in similar:
+            item["similar"] = str(similar[value.id])
+        target.setdefault(value.field_key, []).append(item)
     parties = {pid: party for pid, party in registry.parties.items()}
     own = []
     for entity in sorted(registry.own.values(), key=lambda row: (row.position, row.code)):
@@ -375,14 +389,29 @@ def update_field(session: Session, workspace: Workspace, key: str, data: dict[st
         item.title, item.names = clean, names
     if "hidden" in data:
         item.hidden = bool(data["hidden"])
-    if "required" in data:
+    if "required" in data and bool(data["required"]) != bool(item.required):
         item.required = bool(data["required"])
+        # «Не заполнено» — замечание договора, а договоры клиент берёт опросом по
+        # номеру изменения: без сдвига номера новое правило проявилось бы у
+        # каждого договора только после его следующей правки.
+        _touch_all_contracts(session, workspace)
     if "type" in data and data["type"] != item.type:
         if item.system:
             raise FinanceError("Тип системного поля не меняется: на нём держатся начисления и долги")
         if data["type"] not in CUSTOM_TYPES:
             raise FinanceError("Такого типа поля нет")
         item.type = data["type"]
+        # Способ заполнения принадлежит типу: у текста списка нет вовсе.
+        if (item.fill or "") not in FILL_OPTIONS.get(item.type, ()):
+            item.fill = ""
+    if "fill" in data:
+        wanted = str(data["fill"] or "")
+        options = FILL_OPTIONS.get(item.type, ())
+        if not options:
+            raise FinanceError(f"«{item.title}» заполняется как есть — выбора из списка у этого типа нет")
+        if wanted not in options:
+            raise FinanceError("Такого способа заполнения у этого поля нет")
+        item.fill = wanted
     if "after" in data:
         others = [row for row in fields_of(session, workspace.id) if row.key != key]
         item.position = _position_after(others, data["after"]) if data["after"] else (
@@ -415,6 +444,11 @@ def _check_meaning(field_key: str, meaning: dict[str, Any]) -> dict[str, Any]:
             raise FinanceError("Такого хозяйственного смысла нет")
         if key == "handover" and value not in ("accounting",):
             raise FinanceError("Передача — только бухгалтеру")
+        if key == "distinct":
+            if not isinstance(value, list):
+                raise FinanceError("«Это разные» — список значений")
+            clean[key] = [str(item) for item in value]
+            continue
         if key == "roles":
             if not isinstance(value, dict):
                 raise FinanceError("Подписи сторон: ждём исполнителя и заказчика")
@@ -463,7 +497,18 @@ def update_value(session: Session, workspace: Workspace, value_id: uuid.UUID, da
         meaning = _check_meaning(item.field_key, data["meaning"] or {})
         if base and meaning.get("system") != (item.meaning or {}).get("system"):
             raise FinanceError(f"«{item.value}» — системный смысл: по нему считаются выручка и порог НДС")
+        # «Это разные» — не смысл значения, а решение о паре: правка фазы или
+        # начисления его не стирает.
+        kept = (item.meaning or {}).get("distinct")
+        if kept and "distinct" not in meaning:
+            meaning["distinct"] = kept
         item.meaning = meaning
+    if data.get("distinct"):
+        other = session.get(ListValue, uuid.UUID(str(data["distinct"])))
+        if other is None or other.workspace_id != workspace.id or other.field_key != item.field_key:
+            raise FinanceError("Сравнивать можно значения одного списка")
+        apart = sorted({*((item.meaning or {}).get("distinct") or []), str(other.id)})
+        item.meaning = {**(item.meaning or {}), "distinct": apart}
     if "position" in data:
         item.position = int(data["position"])
     if "archived" in data:
@@ -550,6 +595,17 @@ def _base_economic(session: Session, workspace: Workspace, value: ListValue) -> 
     from app.finance.contracts.fields import economic_role_values
 
     return any(item.id == value.id for item in economic_role_values(session, workspace.id).values())
+
+
+def _touch_all_contracts(session: Session, workspace: Workspace) -> None:
+    from app.finance.contracts.models import Contract
+
+    seq = bump(session, workspace.id, "contracts")
+    session.execute(
+        sa.update(Contract)
+        .where(Contract.workspace_id == workspace.id, Contract.deleted_at.is_(None))
+        .values(seq=seq)
+    )
 
 
 def _touch_contracts_with_value(session: Session, workspace: Workspace, value: ListValue) -> None:

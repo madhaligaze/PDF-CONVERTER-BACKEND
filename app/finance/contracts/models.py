@@ -70,6 +70,12 @@ FIELD_TYPES = (
     "text", "number", "money", "date", "bool", "list", "multi_list",
     "url", "person", "party", "department", "choice",
 )
+#: Как поле заполняют руками — в листе, карточке, через API. `list` — только
+#: из списка; `hint` — из списка или своё (новое значение заводится само);
+#: `own` — сторона только из наших юрлиц. Пусто — по умолчанию поля
+#: (`fields.fill_of`). Загрузку Excel настройка не ограничивает: у файла свой
+#: протокол, где незнакомое значение решает человек.
+FILLS = ("list", "hint", "own")
 CONTRACT_IMPORT_STATUSES = ("preview", "applied", "cancelled")
 
 
@@ -250,6 +256,8 @@ class EntityField(FinanceBase):
     names: Mapped[list] = mapped_column(JSONB, server_default=sa.text("'[]'"))
     required: Mapped[bool] = mapped_column(sa.Boolean, server_default=sa.text("false"))
     hidden: Mapped[bool] = mapped_column(sa.Boolean, server_default=sa.text("false"))
+    #: Способ заполнения (`FILLS`); пусто — умолчание поля.
+    fill: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("''"))
     position: Mapped[int] = mapped_column(sa.Integer, server_default=sa.text("0"))
     archived_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -478,6 +486,38 @@ class ContractAmendment(FinanceBase):
     )
 
 
+class ContractPayment(FinanceBase):
+    """Решение человека: эта операция журнала — оплата по этому договору.
+
+    Разнесение само по себе не хранится — оно считается при чтении
+    (`payments.py`), как принадлежность договора к листам: храни мы «оплата
+    лежит в договоре» колонкой, новая выписка или правка договора оставляли бы
+    старые метки. Хранится только то, чего система решить не может: у клиента
+    два договора с одним нашим ТОО, и платёж подходит к обоим. `contract_id`
+    пустой — «ни к одному»: платёж не по договору (возврат, ошибка банка).
+    """
+
+    __tablename__ = "contract_payments"
+    __table_args__ = (sa.UniqueConstraint("operation_id", name="uq_contract_payments_operation"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=_uuid)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid, sa.ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    operation_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid, sa.ForeignKey("operations.id", ondelete="CASCADE")
+    )
+    contract_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("contracts.id", ondelete="CASCADE"), index=True
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("users.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now()
+    )
+
+
 class Counter(FinanceBase):
     """Счётчик компании: номер изменения реестра (`seq`).
 
@@ -507,6 +547,7 @@ __all__ = [
     "Contract",
     "ContractAmendment",
     "ContractImport",
+    "ContractPayment",
     "ContractPerson",
     "Counter",
     "CounterpartyName",
@@ -517,6 +558,7 @@ __all__ = [
     "EntityField",
     "EntityView",
     "FIELD_TYPES",
+    "FILLS",
     "GroupEntity",
     "ListValue",
     "STATUS_PHASES",
