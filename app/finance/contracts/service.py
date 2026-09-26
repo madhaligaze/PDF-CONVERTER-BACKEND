@@ -1004,9 +1004,11 @@ def visible_to(
     """Открыт ли договор этому человеку — по строкам и юрлицам."""
     if not access.view:
         return False
-    if access.entity_ids and not (
-        {contract.executor_id, contract.customer_id} & set(access.entity_ids)
-    ):
+    # Договор без сторон — черновик, у которого юрлица ещё нет: по юрлицу его
+    # не отнести ни к «своим», ни к чужим. Отсекай его отбор — он пропадал бы
+    # у автора сразу после создания, до того как тот выберет сторону.
+    parties = {contract.executor_id, contract.customer_id} - {None}
+    if access.entity_ids and parties and not (parties & set(access.entity_ids)):
         return False
     if access.rows == "department":
         return contract.department_id in access.department_ids
@@ -1548,6 +1550,26 @@ def create(
         if key in ("billing", "economic_role", "end_kind"):
             contract.provenance = {**(contract.provenance or {}), key: "manual"}
     _derive(contract, registry, changed | {"type", "subject", "executor", "customer", "end_date"})
+    # Договор, заведённый при узкой области строк, остаётся в этой области.
+    # Иначе он пропадал у автора сразу после создания, и следующая правка поля
+    # получала «Договор не найден»: «где ответственный» — автор становится
+    # ответственным, «своего отдела» — договор получает его отдел.
+    if access.rows == "own" and access.employee_id is not None:
+        listed = people.get("people")
+        if listed is None:
+            listed = [
+                employee
+                for employee_id in people_of(session, [contract.id]).get(contract.id, [])
+                if (employee := session.get(Employee, employee_id)) is not None
+            ]
+        if all(employee.id != access.employee_id for employee in listed):
+            author = session.get(Employee, access.employee_id)
+            if author is not None:
+                people["people"] = [*listed, author]
+                changed.add("people")
+    if access.rows == "department" and access.department_ids and contract.department_id not in access.department_ids:
+        contract.department_id = next(iter(access.department_ids))
+        changed.add("department")
     if "people" in people:
         _write_people(session, contract, people["people"])
     _finish(session, registry, contract, actor, changed | {"billing", "economic_role", "end_kind"})

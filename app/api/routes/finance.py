@@ -387,13 +387,22 @@ def _me_payload(session, member: Member) -> dict[str, Any]:
 def _auth_fail(exc: AuthError, status: int) -> HTTPException:
     if isinstance(exc, auth.TooManyAttempts):
         return HTTPException(status_code=429, detail=str(exc))
+    if isinstance(exc, auth.NeedsPassword):
+        # 409, а не 401: экран по нему переходит к «Придумайте пароль».
+        return HTTPException(status_code=409, detail=str(exc))
     return HTTPException(status_code=status, detail=str(exc))
 
 
 @router.post("/auth/register", status_code=201)
 def auth_register(body: RegisterIn, request: Request, response: Response) -> dict[str, Any]:
-    """Регистрация компании: почта, пароль, название — и человек внутри."""
+    """Регистрация компании: почта, пароль, название, имя — и человек внутри.
+
+    Имя обязательно: без него владелец везде подписан почтой — в раме, в
+    списке сотрудников, автором каждой записи журнала.
+    """
     _guard()
+    if len(body.full_name.strip()) < 2:
+        raise HTTPException(status_code=400, detail="Укажите своё имя")
     with finance_session() as session:
         try:
             member, token = auth.register(
@@ -486,21 +495,23 @@ def auth_phone_login(body: PhonePasswordIn, request: Request, response: Response
 
 
 @router.post("/auth/phone/set-password")
-def auth_phone_set_password(body: PhonePasswordIn, request: Request) -> dict[str, bool]:
-    """Задать пароль в окне ожидания. В сеанс не пускает — дальше обычный вход."""
+def auth_phone_set_password(body: PhonePasswordIn, request: Request, response: Response) -> dict[str, Any]:
+    """Задать пароль в окне ожидания и сразу войти. Ответ — как у `me`."""
     _guard()
     failure: AuthError | None = None
     with finance_session() as session:
         try:
-            auth.phone_set_password(
+            member, token = auth.phone_set_password(
                 session, phone=body.phone, password=body.password,
                 user_agent=_agent(request), ip=client_ip(request),
             )
+            payload = _me_payload(session, member)
         except AuthError as exc:
             failure = exc
     if failure is not None:
         raise _auth_fail(failure, 400) from failure
-    return {"ok": True}
+    _set_cookie(request, response, token)
+    return payload
 
 
 @router.post("/auth/phone/forgot")

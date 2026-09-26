@@ -23,7 +23,7 @@ from uuid import UUID
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from app.api.routes.finance import (
     UNDO_RESOURCES,
@@ -275,6 +275,10 @@ def employee_sessions(employee_id: UUID, member: Member = Depends(require_access
 
 
 class GrantsIn(BaseModel):
+    #: Чужой ключ — отказ, а не «200 и ничего не записано»: тело
+    #: `{"contracts": …}` без `changes` раньше проходило молча.
+    model_config = ConfigDict(extra="forbid")
+
     #: `{ресурс: "none"|"view"|"edit" | {level, scope} | null}`. `null` у
     #: человека — «как у отдела».
     changes: dict[str, Any] | None = None

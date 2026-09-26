@@ -88,8 +88,10 @@ class FinanceUser(FinanceBase):
         # Телефон — второй логин. Номер, занятый в другой компании, не
         # заводится: вход по номеру не спрашивает компанию.
         sa.UniqueConstraint("phone", name="uq_users_phone"),
+        # Без логина — только закрытая учётка: номер ушёл новому человеку
+        # (ревизия 0021), а подписи под прошлыми действиями остаются.
         sa.CheckConstraint(
-            "email_normalized IS NOT NULL OR phone IS NOT NULL", name="user_login"
+            "email_normalized IS NOT NULL OR phone IS NOT NULL OR status = 'blocked'", name="user_login"
         ),
         sa.CheckConstraint(_in("status", USER_STATUSES), name="user_status"),
     )

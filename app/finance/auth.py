@@ -94,6 +94,7 @@ WRONG_PHONE_OR_PASSWORD = "Неверный номер или пароль"
 TOO_MANY_PHONE = "Слишком много попыток. Попробуйте через 10 минут."
 WINDOW_EXPIRED = "Время задать пароль прошло. Попросите администратора открыть его снова."
 NO_PENDING = "Задать пароль по этому номеру нельзя. Войдите с паролем или попросите администратора открыть вход."
+NEEDS_PASSWORD = "Пароль ещё не задан — придумайте его"
 
 
 class AuthError(Exception):
@@ -102,6 +103,16 @@ class AuthError(Exception):
 
 class TooManyAttempts(AuthError):
     """Перебор: отвечаем 429, а не 401 — это не «неверный пароль»."""
+
+
+class NeedsPassword(AuthError):
+    """Учётка ждёт пароль, а человек на шаге «пароль»: экран должен перейти к
+    «Придумайте пароль», а не отвечать «неверный пароль» на пароль, которого нет.
+
+    Бывает, когда номер ввели раньше, чем администратор открыл вход, или после
+    сброса — экран так и стоит на шаге «пароль». Тайны тут нет: то же самое
+    `phone_start` говорит любому, кто введёт номер.
+    """
 
 
 @dataclass(frozen=True)
@@ -152,13 +163,18 @@ _WINDOW = 60.0
 PHONE_WINDOW = 600.0
 #: Неудач с одного адреса за окно — перебор многих номеров с одной машины.
 IP_LIMIT = 30
+#: Первых шагов входа по номеру с одного адреса за окно. Считается каждый
+#: шаг, а не неудача: ответ «задайте пароль» сам по себе находка для того, кто
+#: ищет учётки в окне ожидания. Офис за одним адресом входит раз в месяц на
+#: человека, так что шестьдесят за десять минут живому входу не мешают.
+START_LIMIT = 60
 #: С какого размера словаря выбрасывать остывшие ключи. Перебор по списку
 #: адресов — это новый ключ на каждую попытку, и назад его никто не спросит.
 _SWEEP_AT = 1024
 
 
 def _window_of(key: str) -> float:
-    return PHONE_WINDOW if key.startswith(("phone:", "ip:")) else _WINDOW
+    return PHONE_WINDOW if key.startswith(("phone:", "ip:", "start:")) else _WINDOW
 
 
 def _too_many_attempts(key: str, limit: int = _MAX_ATTEMPTS) -> bool:
@@ -475,8 +491,12 @@ def phone_start(session: Session, *, phone: str, ip: str = "") -> str:
     ждущая пароль, — ей этот шаг и нужен.
     """
     clean = normalize_phone(phone)
-    if ip and _too_many_attempts(f"ip:{ip}", IP_LIMIT):
+    if ip and (_too_many_attempts(f"ip:{ip}", IP_LIMIT) or _too_many_attempts(f"start:{ip}", START_LIMIT)):
         raise TooManyAttempts(TOO_MANY_PHONE)
+    # Каждый шаг в счёт: без этого перебор номеров в поисках «задайте пароль»
+    # не упирался ни во что — неудачей первый шаг не бывает никогда.
+    if ip:
+        _note_failure(f"start:{ip}")
     user = session.scalar(sa.select(FinanceUser).where(FinanceUser.phone == clean))
     if user is not None and user.status == "pending":
         return "set_password"
@@ -491,6 +511,18 @@ def phone_login(
     if _too_many_attempts(key) or (ip and _too_many_attempts(f"ip:{ip}", IP_LIMIT)):
         raise TooManyAttempts(TOO_MANY_PHONE)
     user = session.scalar(sa.select(FinanceUser).where(FinanceUser.phone == clean))
+    if user is not None and user.status == "pending":
+        # Пароля у учётки нет вовсе — «неверный пароль» тут ложь, из-за которой
+        # человек сбрасывает то, что сбрасывать не нужно. Ответ говорит то же,
+        # что первый шаг, поэтому и считается с ним вместе.
+        if ip:
+            if _too_many_attempts(f"start:{ip}", START_LIMIT):
+                raise TooManyAttempts(TOO_MANY_PHONE)
+            _note_failure(f"start:{ip}")
+        until = _aware(user.pending_until)
+        if until is None or until <= _now():
+            raise AuthError(WINDOW_EXPIRED)
+        raise NeedsPassword(NEEDS_PASSWORD)
     if user is None or not verify_password(user.password_hash, password or ""):
         _failure(session, user, key=key, ip=ip, user_agent=user_agent, login_text=clean)
         raise AuthError(WRONG_PHONE_OR_PASSWORD)
@@ -501,11 +533,13 @@ def phone_login(
 
 def phone_set_password(
     session: Session, *, phone: str, password: str, user_agent: str = "", ip: str = ""
-) -> None:
-    """Задать пароль по номеру — только учётке в окне ожидания.
+) -> tuple[Member, str]:
+    """Задать пароль по номеру — только учётке в окне ожидания — и войти.
 
-    В сеанс не пускает: экран говорит «Пароль задан, войдите с ним», и вход
-    идёт обычной дорогой — с журналом и счётчиками.
+    Раньше экран говорил «Пароль задан, войдите с ним» и просил тот же пароль
+    в третий раз. Пароль только что набран дважды, окно ожидания проверено —
+    повторный ввод ничего не охраняет. Вход идёт той же `_success`, что и
+    обычный: с событием в журнале и сбросом счётчиков.
     """
     from app.finance import notifications
 
@@ -539,6 +573,9 @@ def phone_set_password(
             subject_user_id=user.id,
             payload={"ip": ip, "user_agent": user_agent[:400]},
         )
+    return _success(
+        session, user, key=f"phone:{clean}", ip=ip, user_agent=user_agent, title="вход по номеру"
+    )
 
 
 #: «Забыл пароль» — не чаще раза в десять минут на номер.
@@ -1046,12 +1083,11 @@ def set_profile(session: Session, member: Member, *, full_name: str | None = Non
         user.full_name = clean
     if phone is not None:
         clean_phone = normalize_phone(phone) if phone.strip() else None
-        if clean_phone and clean_phone != user.phone:
-            taken = session.scalar(
-                sa.select(FinanceUser.id).where(FinanceUser.phone == clean_phone, FinanceUser.id != user.id)
-            )
-            if taken is not None:
-                raise AuthError("Этот номер уже занят")
+        if clean_phone and clean_phone != user.phone and member.workspace_id is not None:
+            try:
+                people._free_phone(session, member.workspace_id, clean_phone, user)
+            except people.PeopleError as exc:
+                raise AuthError(str(exc)) from exc
         if clean_phone is None and not user.email_normalized:
             raise AuthError("Без телефона войти будет нечем")
         changes["phone"] = (user.phone, clean_phone)

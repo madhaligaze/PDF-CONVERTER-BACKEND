@@ -291,8 +291,10 @@ def test_sbros_ubivaet_seansy_i_staryy_parol(app: FastAPI) -> None:
     # Учётка, ждущая пароль, не открывает ни одного маршрута.
     assert person.get(f"{BASE}/operations").status_code == 401
     assert person.get(f"{BASE}/auth/me").json() == {"authenticated": False}
+    # Старый пароль не действует — и ответ не «неверный пароль», а «задайте»:
+    # пароля у учётки нет вовсе, экран уводит к «Придумайте пароль».
     old = client(app).post(f"{BASE}/auth/phone/login", json={"phone": "+77009998877", "password": "secret-123"})
-    assert old.status_code == 401 and old.json()["detail"] == auth.WRONG_PHONE_OR_PASSWORD
+    assert old.status_code == 409 and old.json()["detail"] == auth.NEEDS_PASSWORD
     assert client(app).post(f"{BASE}/auth/phone/start", json={"phone": "+77009998877"}).json()["step"] == "set_password"
 
 
@@ -430,6 +432,30 @@ def test_dogovory_chuzhogo_otdela_i_skrytoe_pole(app: FastAPI) -> None:
     assert card["id"] == scope["employee_id"]
 
 
+def test_zavedyonnyy_dogovor_ostayotsya_v_svoey_oblasti(app: FastAPI) -> None:
+    """Договор из первого поля не пропадает у автора с узкой областью строк."""
+    owner = register(app)
+    yuo = department(owner, "ЮО")
+    own_card = employee(owner, "Ответственный Один", "+77021110001")
+    grant(owner, "employee", own_card["id"], {"contracts": {"level": "edit", "scope": {"rows": "own"}}})
+    dept_card = employee(owner, "Отделов Два", "+77021110002", yuo)
+    grant(owner, "employee", dept_card["id"], {"contracts": {"level": "edit", "scope": {"rows": "department"}}})
+
+    for phone, key, expected in (
+        ("+77021110001", "people", [own_card["id"]]),
+        ("+77021110002", "department", yuo),
+    ):
+        person = activate(app, phone)
+        made = person.post(f"{BASE}/contracts", json={"values": {"number": f"Н-{phone[-2:]}"}})
+        assert made.status_code == 201, made.text
+        contract = made.json()["contract"]
+        assert contract["values"][key] == expected, contract["values"]
+        # Следующая правка того же договора — не «Договор не найден».
+        again = person.patch(f"{BASE}/contracts/{contract['id']}", json={"values": {"note": "первый звонок"}})
+        assert again.status_code == 200, again.text
+        assert [item["id"] for item in person.get(f"{BASE}/contracts").json()["contracts"]] == [contract["id"]]
+
+
 # ── Кто кого сбрасывает ─────────────────────────────────────────────────────
 
 
@@ -519,6 +545,113 @@ def test_chuzhoy_sotrudnik_otvechaet_kak_nesushchestvuyushchiy(app: FastAPI) -> 
     assert second.post(f"{BASE}/people/employees/{card['id']}/reset").status_code == 404
     taken = second.post(f"{BASE}/people/employees", json={"full_name": "Другой", "phone": "+77040000001", "access": True})
     assert taken.status_code == 400 and "другой компании" in taken.json()["detail"]
+
+
+# ── Подключение сотрудника: случай «Асхата» 26.09 ─────────────────────────────
+
+
+def test_nomer_bez_galochki_otkryvaet_vhod_a_ne_propadaet(app: FastAPI) -> None:
+    owner = register(app)
+    made = owner.post(f"{BASE}/people/employees", json={"full_name": "Асхат", "phone": "+7 747 456 86 61"})
+    assert made.status_code == 201, made.text
+    assert made.json()["status"] == "pending" and made.json()["phone"] == "+77474568661"
+    refused = owner.post(
+        f"{BASE}/people/employees", json={"full_name": "Дана", "phone": "+77470000001", "access": False}
+    )
+    assert refused.status_code == 400 and "вместе с доступом" in refused.json()["detail"]
+    assert not any(e["full_name"] == "Дана" for e in owner.get(f"{BASE}/people").json()["employees"])
+
+
+def test_vhod_do_otkrytiya_dostupa_ne_zastrevaet_na_parole(app: FastAPI) -> None:
+    owner = register(app)
+    card = owner.post(f"{BASE}/people/employees", json={"full_name": "Асхат"}).json()
+    person = client(app, "10.0.0.31")
+    # Номер ещё ничей — «пароль», как у любого незнакомого.
+    assert person.post(f"{BASE}/auth/phone/start", json={"phone": "+77474568661"}).json() == {"step": "password"}
+    opened = owner.post(f"{BASE}/people/employees/{card['id']}/account", json={"phone": "+77474568661"})
+    assert opened.status_code == 201, opened.text
+    # Человек так и стоит на шаге «пароль»: ответ ведёт к «Придумайте пароль».
+    stuck = person.post(f"{BASE}/auth/phone/login", json={"phone": "+77474568661", "password": "что-то"})
+    assert stuck.status_code == 409 and stuck.json()["detail"] == auth.NEEDS_PASSWORD
+    # Задал пароль — и уже внутри, без третьего ввода.
+    done = person.post(f"{BASE}/auth/phone/set-password", json={"phone": "+77474568661", "password": "secret-123"})
+    assert done.status_code == 200, done.text
+    assert done.json()["authenticated"] is True and done.json()["role"] == "employee"
+    assert person.get(f"{BASE}/auth/me").json()["authenticated"] is True
+    kinds = [item["kind"] for item in owner.get(f"{BASE}/audit", params={"category": "auth"}).json()["items"]]
+    assert "auth.login" in kinds and "auth.password_set" in kinds
+
+
+def test_pervyy_shag_vhoda_schitaetsya_s_adresa(app: FastAPI) -> None:
+    guest = client(app, "10.0.0.77")
+    for index in range(auth.START_LIMIT):
+        answer = guest.post(f"{BASE}/auth/phone/start", json={"phone": f"+7700{index:07d}"})
+        assert answer.status_code == 200, (index, answer.text)
+    over = guest.post(f"{BASE}/auth/phone/start", json={"phone": "+77009999999"})
+    assert over.status_code == 429
+    # Другой адрес — свой счёт.
+    assert client(app, "10.0.0.78").post(f"{BASE}/auth/phone/start", json={"phone": "+77009999999"}).status_code == 200
+
+
+def test_nomer_zakrytoy_uchyotki_svoboden(app: FastAPI) -> None:
+    owner = register(app)
+    first = employee(owner, "Ошибкин Ошибка", "+77011230001")
+    closed = owner.patch(f"{BASE}/people/employees/{first['id']}", json={"access": False})
+    assert closed.status_code == 200 and closed.json()["status"] == "no_access"
+    second = owner.post(f"{BASE}/people/employees", json={"full_name": "Правильный Человек", "phone": "+77011230001"})
+    assert second.status_code == 201, second.text
+    assert second.json()["phone"] == "+77011230001"
+    # Номер действующего сотрудника — по-прежнему отказ, и правдивый.
+    third = owner.post(f"{BASE}/people/employees", json={"full_name": "Третий", "phone": "+77011230001"})
+    assert third.status_code == 400 and "другого сотрудника компании" in third.json()["detail"]
+
+
+def test_povtornoe_otkrytie_vhoda_zhdyot_novyy_parol(app: FastAPI) -> None:
+    owner = register(app)
+    card = employee(owner, "Возвратов Ерлан", "+77011230002")
+    activate(app, "+77011230002")
+    assert owner.patch(f"{BASE}/people/employees/{card['id']}", json={"access": False}).status_code == 200
+    reopened = owner.post(f"{BASE}/people/employees/{card['id']}/account", json={"phone": "+77011230002"})
+    assert reopened.status_code == 201, reopened.text
+    row = owner.get(f"{BASE}/people/employees/{card['id']}").json()
+    assert row["status"] == "pending" and row["account"]["pending_until"]
+    old = client(app).post(f"{BASE}/auth/phone/login", json={"phone": "+77011230002", "password": "secret-123"})
+    assert old.status_code == 409
+
+
+def test_tyozka_iz_arhiva_vozvrashchaetsya(app: FastAPI) -> None:
+    owner = register(app)
+    card = employee(owner, "Асхат", "+77011230003")
+    assert owner.delete(f"{BASE}/people/employees/{card['id']}").status_code == 200
+    again = owner.post(f"{BASE}/people/employees", json={"full_name": "асхат", "job_title": "поддержка"})
+    assert again.status_code == 201, again.text
+    assert again.json()["id"] == card["id"] and again.json()["archived"] is False
+    assert again.json()["job_title"] == "поддержка"
+    assert again.json()["full_name"] == "асхат"
+
+
+def test_otdel_s_lyudmi_ne_uhodit_v_arhiv(app: FastAPI) -> None:
+    owner = register(app)
+    yuo = department(owner, "ЮО")
+    employee(owner, "Юристова Айгерим", "+77011230004", yuo)
+    refused = owner.patch(f"{BASE}/people/departments/{yuo}", json={"archived": True})
+    assert refused.status_code == 400 and "сотрудников: 1" in refused.json()["detail"]
+    empty = department(owner, "ПУСТ")
+    assert owner.patch(f"{BASE}/people/departments/{empty}", json={"archived": True}).status_code == 200
+
+
+def test_prava_chuzhim_klyuchom_otkaz_a_ne_tishina(app: FastAPI) -> None:
+    owner = register(app)
+    card = employee(owner, "Правов Пётр", "+77011230005")
+    wrong = owner.put(f"{BASE}/access/employee/{card['id']}", json={"contracts": {"level": "view"}})
+    assert wrong.status_code == 422
+
+
+def test_registraciya_bez_imeni_otkaz(app: FastAPI) -> None:
+    response = client(app).post(
+        f"{BASE}/auth/register", json={"email": "a@bbc.kz", "password": PASSWORD, "company": "BBC", "full_name": " "}
+    )
+    assert response.status_code == 400 and "имя" in response.json()["detail"]
 
 
 # ── Журнал действий ─────────────────────────────────────────────────────────
