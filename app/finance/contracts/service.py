@@ -39,11 +39,14 @@ from app.finance import history
 from app.finance.accounts_model import FinanceUser
 from app.finance.contracts import views as views_module
 from app.finance.contracts.fields import (
+    COMPUTED_FIELDS,
+    DERIVED_FIELDS,
     ENTITY,
     FIELD_BY_KEY,
     LIVE_FIELDS,
     MODE_FIELDS,
     SNAPSHOT_FIELDS,
+    SUMMARY_FIELDS,
     SYSTEM_KEYS,
     SYSTEM_LISTS,
     bump,
@@ -184,7 +187,7 @@ def _pick_closed(
             f"{title}: под «{text}» подходит несколько — {shown}{more}. Выберите из списка", "ambiguous"
         )
     if any(any(key(name) == needle for name in names(item) if name) for item in archived):
-        raise NotInList(f"{title}: «{text}» в архиве — выберите действующее значение", "archived")
+        raise NotInList(f"{title}: «{text}» в корзине — выберите действующее значение", "archived")
     raise NotInList(missing)
 
 
@@ -278,6 +281,9 @@ class Resolved:
     ambiguous: list[Counterparty] = field(default_factory=list)
 
 
+_UNSET: Any = object()
+
+
 class Registry:
     """Справочники реестра одной компании, собранные один раз на запрос."""
 
@@ -331,6 +337,55 @@ class Registry:
         self._employees: dict[uuid.UUID, Employee] | None = None
         self._employee_by_name: dict[str, Employee] | None = None
         self._employee_cache: dict[uuid.UUID, Employee] = {}
+        self._summary: Any = _UNSET
+        self._aliases: dict[uuid.UUID, list[str]] | None = None
+        self._summary_matches: dict[uuid.UUID, Any] = {}
+
+    # — сводка оплат —
+
+    @property
+    def summary(self) -> Any:
+        """Прочитанная сводка компании (`summary.peek`) или `None`.
+
+        Без похода в Google: сборка реестра не ждёт сеть. Сводку читает
+        `/contracts/summary`, а реестр берёт то, что уже прочитано.
+        """
+        if self._summary is _UNSET:
+            from app.finance.contracts import summary as summary_module
+
+            self._summary = summary_module.peek(self.workspace.id)
+        return self._summary
+
+    def aliases(self, party_id: uuid.UUID | None) -> list[str]:
+        """Подтверждённые написания стороны — ключами `party_key`."""
+        if party_id is None:
+            return []
+        if self._aliases is None:
+            self._aliases = {}
+            for normalized, owner in self.session.execute(
+                sa.select(CounterpartyName.normalized, CounterpartyName.counterparty_id).where(
+                    CounterpartyName.workspace_id == self.workspace.id
+                )
+            ):
+                self._aliases.setdefault(owner, []).append(normalized)
+        return self._aliases.get(party_id, [])
+
+    def summary_of(self, contract: Contract) -> Any:
+        """Что сводка знает о договоре (`summary.Match`) или `None` — сводки нет."""
+        index = self.summary
+        if index is None:
+            return None
+        hit = self._summary_matches.get(contract.id)
+        if hit is None:
+            ours, theirs = contract.executor_id, contract.customer_id
+            if not self.is_own(ours) and self.is_own(theirs):
+                ours, theirs = theirs, ours
+            party = self.parties_for([theirs]).get(theirs) if theirs else None
+            names = ([party.name] if party is not None else []) + self.aliases(theirs)
+            entity = self.own.get(ours) if ours else None
+            hit = index.match(contract.number, names, entity.code if entity is not None else "")
+            self._summary_matches[contract.id] = hit
+        return hit
 
     # — стороны —
 
@@ -853,6 +908,16 @@ def people_of(session: Session, contract_ids: Sequence[uuid.UUID]) -> dict[uuid.
     return out
 
 
+def age_months(signed_at: date | None, on: date | None = None) -> int | None:
+    """Полных «месяцев» от даты договора — как `ROUNDDOWN((TODAY()-дата)/30)`
+    книги «Разовые»: по тридцать дней, а не календарных. Так считали отборы
+    «до 2 мес» / «6+ мес», и один договор не должен стоять в разных листах
+    книги и приложения."""
+    if signed_at is None:
+        return None
+    return max(0, ((on or today()) - signed_at).days // 30)
+
+
 def value_of(contract: Contract, key: str, people: Sequence[uuid.UUID] = ()) -> Any:
     """Значение поля договора в том виде, в каком его отдаёт API."""
     if key in COLUMN_OF:
@@ -865,9 +930,12 @@ def value_of(contract: Contract, key: str, people: Sequence[uuid.UUID] = ()) -> 
         return _plain(getattr(contract, key))
     if key in ("paid_snapshot", "remaining_snapshot"):
         return (contract.file_snapshot or {}).get(key.replace("_snapshot", ""))
-    if key in LIVE_FIELDS:
-        # Считаются из журнала (`payments.py`) и приходят своим запросом.
+    if key in LIVE_FIELDS or key in SUMMARY_FIELDS:
+        # Считаются из журнала (`payments.py`) или сводки (`summary.py`) и
+        # приходят своим запросом.
         return None
+    if key == "age_months":
+        return age_months(contract.signed_at)
     if key in SYSTEM_KEYS:
         return getattr(contract, key, None)
     return (contract.attrs or {}).get(key)
@@ -888,6 +956,14 @@ def facts_of(contract: Contract, registry: Registry, people: Sequence[uuid.UUID]
     facts["intra_group"] = own_executor and own_customer
     facts["phase"] = registry.meaning(contract.status_id).get("phase")
     facts["economic"] = registry.meaning(contract.economic_role_id).get("system")
+    facts["age_months"] = age_months(contract.signed_at)
+    # «Оплачено/Остаток (сводка)» — для листов вроде «Остатки»; нет сводки
+    # или договор в ней не нашёлся — фактов нет, и условие «> 0» не проходит.
+    match = registry.summary_of(contract)
+    if match is not None and match.state == "found":
+        facts["summary_paid"] = match.paid
+        if contract.amount is not None:
+            facts["summary_remaining"] = contract.amount - match.paid
     # Подписи рядом с идентификаторами: «предмет содержит „аренд“» сравнивает
     # текст значения, а не его id (views._check, условие `contains`).
     for key in LIST_KEYS:
@@ -1048,7 +1124,7 @@ def issues_of(
     for item in registry.fields:
         if not item.required or item.hidden or item.key in _OWN_EMPTY_ISSUES or item.key in unread:
             continue
-        if item.key in SNAPSHOT_FIELDS or item.key in LIVE_FIELDS:
+        if item.key in SNAPSHOT_FIELDS or item.key in COMPUTED_FIELDS:
             continue
         if item.key == "people" and people is None:
             continue
@@ -1339,6 +1415,9 @@ def list_all(
         "people": people,
         "seq": seq_now,
         "schema_rev": schema_now,
+        # По какой сводке посчитаны листы вроде «Остатки»: клиент сверяет с
+        # `/contracts/summary` и перечитывает реестр, если сводка обновилась.
+        "summary_rev": registry.summary.rev if registry.summary is not None else "",
     }
 
 
@@ -1431,11 +1510,20 @@ def _who(access: Access) -> Access:
     return access if access.rows == "own" else replace(access, employee_id=None)
 
 
+def _summary_rev(workspace_id: uuid.UUID) -> str:
+    from app.finance.contracts import summary as summary_module
+
+    index = summary_module.peek(workspace_id)
+    return index.rev if index is not None else ""
+
+
 def list_all_bytes(session: Session, workspace: Workspace, access: Access) -> bytes:
     """Весь реестр готовым JSON — одна сборка на одинаковые запросы."""
     seq_now = current(session, workspace.id, "contracts")
     schema_now = current(session, workspace.id, "schema")
-    key = (workspace.id, seq_now, schema_now, _who(access))
+    # Сводка и сегодняшний день — тоже часть ответа: «Остатки» зависят от
+    # оплат в книге, «до 2 мес» — от даты. Номер изменений их не двигает.
+    key = (workspace.id, seq_now, schema_now, _who(access), _summary_rev(workspace.id), today())
     return _list_builds.get(
         key, lambda: _dump(list_all(session, workspace, access, seq_now=seq_now, schema_now=schema_now))
     )
@@ -1449,7 +1537,7 @@ def changes_bytes(session: Session, workspace: Workspace, access: Access, since:
         return _dump(
             {"contracts": [], "removed": [], "parties": {}, "people": {}, "seq": seq_now, "schema_rev": schema_now}
         )
-    key = (workspace.id, since, seq_now, schema_now, _who(access))
+    key = (workspace.id, since, seq_now, schema_now, _who(access), _summary_rev(workspace.id), today())
     return _change_builds.get(
         key, lambda: _dump(changes(session, workspace, access, since, seq_now=seq_now, schema_now=schema_now))
     )
@@ -1619,6 +1707,10 @@ def _set_field(
         raise FinanceError(f"«{title}» — как было в файле, только чтение")
     if key in LIVE_FIELDS:
         raise FinanceError(f"«{title}» считается по выписке — только чтение")
+    if key in SUMMARY_FIELDS:
+        raise FinanceError(f"«{title}» берётся из книги-сводки — только чтение")
+    if key in DERIVED_FIELDS:
+        raise FinanceError(f"«{title}» считается от даты договора — только чтение")
     if key in ("executor", "customer") and fill == "own" and not registry.is_own(
         getattr(contract, COLUMN_OF[_OTHER_SIDE[key]])
     ):
@@ -2155,7 +2247,7 @@ def remove(
     session: Session, workspace: Workspace, access: Access, actor: Actor, contract_id: uuid.UUID
 ) -> None:
     if not access.edit:
-        raise PermissionError("Убирать договоры вам не открыто")
+        raise PermissionError("Удалять договоры вам не открыто")
     registry = Registry(session, workspace)
     contract = get_contract(session, workspace, contract_id, for_update=True)
     people_now = people_of(session, [contract.id]).get(contract.id, [])
@@ -2169,7 +2261,7 @@ def remove(
         kind="contract.delete",
         entity="contract",
         entity_id=contract.id,
-        title=f"договор убран {contract.number or ''}".strip(),
+        title=f"договор удалён в корзину {contract.number or ''}".strip(),
         before={"deleted_at": None},
         after={"deleted_at": _plain(contract.deleted_at)},
         actor=actor.email,

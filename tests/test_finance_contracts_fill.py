@@ -171,7 +171,7 @@ def test_otvetstvennyy_po_korotkomu_imeni_bez_dvoynika(space):
         count = session.scalar(sa.select(sa.func.count()).select_from(Employee).where(Employee.workspace_id == space))
         with pytest.raises(service.NotInList, match="нет среди сотрудников"):
             _patch(session, space, contract, people="Асхат")
-        with pytest.raises(service.NotInList, match="в архиве"):
+        with pytest.raises(service.NotInList, match="в корзине"):
             _patch(session, space, contract, people="Ушедший Сотрудник")
         assert session.scalar(sa.select(sa.func.count()).select_from(Employee).where(Employee.workspace_id == space)) == count
 

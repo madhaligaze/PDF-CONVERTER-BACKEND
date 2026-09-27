@@ -1023,7 +1023,7 @@ _DICTIONARY_TITLES = {
 
 @router.delete("/dictionaries/{kind}/{item_id}")
 def archive_entry(kind: str, item_id: UUID, member: Member = Depends(require_access("dictionaries", "edit"))) -> dict[str, bool]:
-    """Убрать запись справочника из списков (архив, не удаление)."""
+    """Удалить запись справочника — в корзину (`finance/trash.py`), не из базы."""
     _guard()
     models = {
         "accounts": Account,
@@ -1043,7 +1043,7 @@ def archive_entry(kind: str, item_id: UUID, member: Member = Depends(require_acc
         item = session.get(models[kind], item_id)
         history.write(
             session, workspace, kind="dictionary.archive", entity=kind, entity_id=item_id,
-            title=f"{_DICTIONARY_TITLES[kind]} «{getattr(item, 'name', '')}» убран в архив",
+            title=f"{_DICTIONARY_TITLES[kind]} «{getattr(item, 'name', '')}» удалён в корзину",
         )
         return {"ok": True}
 

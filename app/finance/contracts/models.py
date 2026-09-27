@@ -289,6 +289,11 @@ class EntityView(FinanceBase):
     key: Mapped[str] = mapped_column(sa.Text)
     title: Mapped[str] = mapped_column(sa.Text)
     main: Mapped[bool] = mapped_column(sa.Boolean, server_default=sa.text("false"))
+    #: Книга, в которой лист: `""` — реестр (карточки и «Таблица»), `oneoff` —
+    #: «Разовые». Договоры одни и те же, книги — разные наборы листов: у
+    #: финансистов разовые услуги жили отдельной книгой со своими отборами
+    #: («до 2 мес», «Остатки»), и в общий реестр эти листы не просятся.
+    book: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("''"))
     blocks: Mapped[list] = mapped_column(JSONB, server_default=sa.text("'[]'"))
     sort: Mapped[list] = mapped_column(JSONB, server_default=sa.text("'[]'"))
     #: Оформление шапки исходного файла — для выгрузки .xlsx.
@@ -518,6 +523,34 @@ class ContractPayment(FinanceBase):
     )
 
 
+class SummarySource(FinanceBase):
+    """Книга Google, из которой берётся «Оплачено (сводка)» договоров.
+
+    У BBC это «Осн.Общая сводка BBC 2026», лист «Сводка все ЮР лица»: туда
+    сходятся книги всех юрлиц, и «Сумма Факт Поступ.» там — факт оплаты. Книга
+    юротдела «Разовые» брала «Оплачено» оттуда формулой (`VLOOKUP` по «Заказчик
+    + № договора + код фирмы»); здесь — тем же ключом, но по названиям колонок
+    и без угадывания (`summary.py`). Одна книга на компанию; нет записи — нет
+    колонки «по сводке».
+    """
+
+    __tablename__ = "contract_summary_sources"
+
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid, sa.ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True
+    )
+    spreadsheet_id: Mapped[str] = mapped_column(sa.Text)
+    worksheet: Mapped[str] = mapped_column(sa.Text)
+    #: Название книги на момент подключения — для подписи «откуда цифры».
+    title: Mapped[str] = mapped_column(sa.Text, server_default=sa.text("''"))
+    updated_by: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("users.id", ondelete="SET NULL")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now()
+    )
+
+
 class Counter(FinanceBase):
     """Счётчик компании: номер изменения реестра (`seq`).
 
@@ -562,4 +595,5 @@ __all__ = [
     "GroupEntity",
     "ListValue",
     "STATUS_PHASES",
+    "SummarySource",
 ]

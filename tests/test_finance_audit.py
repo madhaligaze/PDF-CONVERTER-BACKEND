@@ -49,6 +49,8 @@ ALLOWED: dict[tuple[str, str], str] = {
     ("POST", "/recurrences/materialize"): (
         "пустое продление ничего не меняет и не пишет; с новыми ожиданиями пишет recurrence.materialize"
     ),
+    ("PUT", "/looks/{key}"): "личный вид листа — настройка экрана одной учётки, не данные компании",
+    ("DELETE", "/looks/{key}"): "сброс личного вида листа — настройка экрана одной учётки, не данные компании",
 }
 
 
@@ -76,9 +78,11 @@ def app(finance_db) -> FastAPI:
     from app.api.routes.finance import router as finance_router
     from app.api.routes.finance_contracts import router as contracts_router
     from app.api.routes.finance_people import router as people_router
+    from app.api.routes.finance_looks import router as looks_router
+    from app.api.routes.finance_trash import router as trash_router
 
     application = FastAPI()
-    for router in (finance_router, contracts_router, people_router):
+    for router in (finance_router, contracts_router, people_router, trash_router, looks_router):
         application.include_router(router, prefix="/api/v1")
     return application
 
@@ -163,7 +167,7 @@ def _section(batch: dict, key: str) -> dict:
     return next(section for section in batch["report"]["sections"] if section["key"] == key)
 
 
-def test_kazhdyy_izmenyayushchiy_marshrut_pishet_sobytie(app: FastAPI) -> None:
+def test_kazhdyy_izmenyayushchiy_marshrut_pishet_sobytie(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
     from fastapi.routing import APIRoute
 
     from test_finance_contracts_import import _registry_file
@@ -353,6 +357,13 @@ def test_kazhdyy_izmenyayushchiy_marshrut_pishet_sobytie(app: FastAPI) -> None:
     walk.call(owner, "POST", "/contracts/{contract_id}/amendments/confirm", contract_id=with_text,
               json={"piece": pieces[0]})
     walk.call(owner, "DELETE", "/contracts/{contract_id}", contract_id=twin)
+    # Корзина: удалённый договор вернуть, снова удалить и стереть насовсем.
+    listed = owner.get(f"{BASE}/trash")
+    assert listed.status_code == 200, listed.text
+    assert any(item["id"] == twin for item in listed.json()["items"])
+    walk.call(owner, "POST", "/trash/{kind}/{item_id}/restore", kind="contract", item_id=twin)
+    owner.delete(f"{BASE}/contracts/{twin}")
+    walk.call(owner, "DELETE", "/trash/{kind}/{item_id}", kind="contract", item_id=twin)
 
     # ── настройка реестра ───────────────────────────────────────────────
     field = walk.call(owner, "POST", "/contracts/setup/fields", json={"title": "Ссылка на Битрикс", "type": "url"}).json()["key"]
@@ -374,6 +385,22 @@ def test_kazhdyy_izmenyayushchiy_marshrut_pishet_sobytie(app: FastAPI) -> None:
     view = walk.call(owner, "POST", "/contracts/setup/views",
                      json={"title": "Юристы", "blocks": [{"filter": rule_filter}]}).json()["id"]
     walk.call(owner, "PATCH", "/contracts/setup/views/{view_id}", view_id=view, json={"title": "Юристы ЮО"})
+
+    # ── сводка оплат: книга Google подменена — сеть в тесте не нужна ────
+    from app.finance.contracts import summary as summary_module
+
+    monkeypatch.setattr(
+        summary_module,
+        "_read",
+        lambda spreadsheet_id, tab: summary_module.build_index(
+            [["Заказчик (Название Фирмы)", "№ Договора", "Сумма Факт Поступ."], ["ТОО Альфа", "№ 1", "1000"]],
+            title="Сводка",
+            worksheet=tab,
+        ),
+    )
+    walk.call(owner, "POST", "/contracts/setup/summary",
+              json={"link": "https://docs.google.com/spreadsheets/d/abc123/edit", "worksheet": "Сводка"})
+    walk.call(owner, "DELETE", "/contracts/setup/summary")
 
     # ── загрузка реестра ────────────────────────────────────────────────
     upload = walk.call(owner, "POST", "/contracts/imports",

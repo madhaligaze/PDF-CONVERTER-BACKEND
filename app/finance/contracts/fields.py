@@ -94,6 +94,14 @@ SYSTEM_FIELDS: tuple[FieldDef, ...] = (
     # «как было в файле», а не сюда.
     FieldDef("paid", "money", "Оплачено по выписке", readonly=True),
     FieldDef("remaining", "money", "Остаток по выписке", readonly=True),
+    # Из книги-сводки компании (`summary.py`): «Сумма Факт Поступ.» строк
+    # договора. В договоре не хранятся, приходят своим запросом. Написаний
+    # шапки нет по той же причине, что у «по выписке».
+    FieldDef("summary_paid", "money", "Оплачено (сводка)", readonly=True),
+    FieldDef("summary_remaining", "money", "Остаток (сводка)", readonly=True),
+    # Полных месяцев от даты договора — «Срок, мес» книги «Разовые»
+    # (`ROUNDDOWN((TODAY()-дата)/30)`). Считается при чтении.
+    FieldDef("age_months", "number", "Срок, мес", readonly=True),
     FieldDef("amendments_text", "text", "№ Доп. соглашения / дата",
              ("№ дополнительное соглашение/дата", "№ дополнительное соглашение",
               "дополнительное соглашение", "доп соглашения", "доп. соглашения")),
@@ -125,6 +133,15 @@ SNAPSHOT_FIELDS = ("paid_snapshot", "remaining_snapshot")
 #: Поля, которые считаются из журнала операций, — только чтение, в договоре не
 #: хранятся. Видны тому, кому открыт журнал: сумма оплат — это деньги компании.
 LIVE_FIELDS = ("paid", "remaining")
+#: Поля из книги-сводки (`summary.py`) — только чтение, в договоре не хранятся.
+SUMMARY_FIELDS = ("summary_paid", "summary_remaining")
+#: Поля, которые выводятся из самого договора при чтении, — только чтение.
+DERIVED_FIELDS = ("age_months",)
+#: Всё, что только читается и не хранится: правка, загрузка и значение по
+#: умолчанию их не трогают.
+COMPUTED_FIELDS = LIVE_FIELDS + SUMMARY_FIELDS + DERIVED_FIELDS
+#: Книги листов: `""` — реестр (карточки и «Таблица»), `oneoff` — «Разовые».
+BOOKS = ("", "oneoff")
 CHOICES = {
     "billing": (("month", "В месяц"), ("total", "Вся сумма"), ("terms", "Условие")),
     "end_kind": (("terminated", "Расторжение"), ("fulfilled", "Исполнение"), ("unknown", "Не ясен")),
@@ -472,6 +489,9 @@ def _seed(session: Session, workspace: Workspace, existing: dict[str, EntityFiel
             _seed_value(session, workspace.id, "type", value, meaning, index)
         for index, (value, system) in enumerate(SEED_ECONOMIC_ROLES):
             _seed_value(session, workspace.id, "economic_role", value, {"system": system}, index)
+    if not _has_book(session, workspace.id, "oneoff"):
+        session.flush()
+        _seed_oneoff(session, workspace)
     if not _has_main_view(session, workspace.id):
         session.add(
             EntityView(
@@ -486,6 +506,120 @@ def _seed(session: Session, workspace: Workspace, existing: dict[str, EntityFiel
         )
     session.flush()
     bump(session, workspace.id, "schema")
+
+
+def _has_book(session: Session, workspace_id: uuid.UUID, book: str) -> bool:
+    """Есть ли в книге хоть один лист — и убранный тоже: удалённое не засевается снова."""
+    return (
+        session.scalar(
+            sa.select(sa.func.count())
+            .select_from(EntityView)
+            .where(EntityView.workspace_id == workspace_id, EntityView.book == book)
+        )
+        or 0
+    ) > 0
+
+
+#: Колонки листов «Разовых» — как в книге юротдела BBC «Разовые» (27.09.2026):
+#: «Оплачено» — из сводки, «Остаток» — сумма минус оплачено.
+_ONEOFF_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("row_number", "№"),
+    ("status", "Статус"),
+    ("planned_end_at", "План дата завершения"),
+    ("people", "Ответ. лицо"),
+    ("executor", "Исполнитель"),
+    ("customer", "Заказчик"),
+    ("number", "№ договора"),
+    ("signed_at", "Дата договора"),
+    ("department", "Отдел"),
+    ("type", "Вид услуги"),
+    ("subject", "Предмет исполнения"),
+    ("amount", "Сумма договора"),
+    ("summary_paid", "Оплачено"),
+    ("summary_remaining", "Остаток"),
+    ("end_date", "Факт дата завершения"),
+    ("note", "Примечания"),
+)
+_CLOSED = ["fulfilled", "terminated", "failed"]
+
+
+def _oneoff_columns(with_age: bool) -> list[dict[str, Any]]:
+    columns = [{"key": key, "label": label, "width": None} for key, label in _ONEOFF_COLUMNS]
+    if with_age:
+        columns.append({"key": "age_months", "label": "Срок, мес", "width": None})
+    return columns
+
+
+def _seed_oneoff(session: Session, workspace: Workspace) -> None:
+    """Книга «Разовые»: те же договоры вида «Разовая услуга», свои листы.
+
+    Повторяет книгу юротдела BBC: весь список, отборы незавершённых по сроку
+    от даты договора («до 2 мес» … «6+ мес», как `техн 2` = месяцы по 30
+    дней) и «Остатки» — работа идёт / завершена, а оплачено не всё. Засев
+    общий: вид «Разовая услуга» засевается каждой компании. Нет его (удалили,
+    переименовали) — книга остаётся пустой, листы заводят в настройке.
+    """
+    value = session.scalar(
+        sa.select(ListValue).where(
+            ListValue.workspace_id == workspace.id,
+            ListValue.field_key == "type",
+            ListValue.normalized == norm("Разовая услуга"),
+            ListValue.archived_at.is_(None),
+        )
+    )
+    if value is None:
+        return
+    oneoff = {"field": "type", "op": "in", "value": [str(value.id)]}
+    open_ = {"field": "phase", "op": "not_in", "value": _CLOSED}
+    defaults = {"type": str(value.id), "own_side": "executor"}
+
+    def block(title: str, *conditions: dict[str, Any], with_age: bool = True) -> dict[str, Any]:
+        return {
+            "title": title,
+            "filter": {"any": [{"all": [oneoff, *conditions]}]},
+            "roles": {},
+            "columns": _oneoff_columns(with_age),
+            "defaults": dict(defaults),
+        }
+
+    def age(op: str, months: int) -> dict[str, Any]:
+        return {"field": "age_months", "op": op, "value": months}
+
+    remaining = {"field": "summary_remaining", "op": "gt", "value": 0}
+    sheets: list[tuple[str, str, list[dict[str, Any]]]] = [
+        ("oneoff", "Разовые", [block("", with_age=False)]),
+        ("oneoff_2m", "до 2 мес", [block("", open_, age("lt", 2))]),
+        ("oneoff_3m", "2–3 мес", [block("", open_, age("gte", 2), age("lt", 3))]),
+        ("oneoff_6m", "3–6 мес", [block("", open_, age("gte", 3), age("lt", 6))]),
+        ("oneoff_6p", "6+ мес", [block("", open_, age("gte", 6))]),
+        (
+            "oneoff_rest",
+            "Остатки",
+            [
+                block("Работа идёт — есть остаток", open_, remaining),
+                block("Работа завершена — есть остаток", {"field": "phase", "op": "in", "value": ["fulfilled"]}, remaining),
+            ],
+        ),
+    ]
+    taken = set(
+        session.scalars(sa.select(EntityView.key).where(EntityView.workspace_id == workspace.id))
+    )
+    for index, (key, title, blocks) in enumerate(sheets):
+        if key in taken:
+            key = slug_for(title, taken)
+        taken.add(key)
+        session.add(
+            EntityView(
+                workspace_id=workspace.id,
+                entity=ENTITY,
+                key=key,
+                title=title,
+                main=False,
+                book="oneoff",
+                blocks=blocks,
+                position=(index + 1) * POSITION_STEP,
+            )
+        )
 
 
 def with_live_columns(columns: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -643,7 +777,11 @@ __all__ = [
     "FILL_OPTIONS",
     "FieldDef",
     "FieldView",
+    "BOOKS",
+    "COMPUTED_FIELDS",
+    "DERIVED_FIELDS",
     "LIVE_FIELDS",
+    "SUMMARY_FIELDS",
     "MODE_FIELDS",
     "SNAPSHOT_FIELDS",
     "SUBJECT_HINTS",

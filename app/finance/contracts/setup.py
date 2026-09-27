@@ -13,8 +13,10 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.books.layout import norm
+from app.finance.contracts import summary as summary_module
 from app.finance.contracts import views as views_module
 from app.finance.contracts.fields import (
+    BOOKS,
     CHOICES,
     ENTITY,
     FIELD_BY_KEY,
@@ -134,6 +136,10 @@ def schema(session: Session, workspace: Workspace, access: Access) -> dict[str, 
             if item.archived_at is None
         ],
         "views": [view_out(view) for view in registry.views],
+        "books": list(BOOKS),
+        # Откуда «Оплачено (сводка)»: книга, лист, когда прочитана. Без
+        # похода в Google — схему перечитывают на каждую настройку.
+        "summary": summary_module.status(session, workspace.id),
         "own_entities": own,
         "mode_fields": list(MODE_FIELDS),
         "virtual_fields": views_module.VIRTUAL_FIELDS,
@@ -151,6 +157,7 @@ def view_out(view: EntityView) -> dict[str, Any]:
         "key": view.key,
         "title": view.title,
         "main": view.main,
+        "book": view.book or "",
         "position": view.position,
         "blocks": view.blocks or [],
         "sort": view.sort or [],
@@ -224,15 +231,11 @@ def update_entity(session: Session, workspace: Workspace, party_id: uuid.UUID, d
     if "archived" in data:
         from datetime import datetime, timezone
 
-        if data["archived"]:
-            # Юрлицо с договорами в архив не уходит: оно перестало бы быть
-            # «нашим» для правил листов, и его договоры молча уехали бы из
-            # «Исполнитель ГК» и получили бы замечание «ни одна сторона не наша».
-            used = _contracts_with_party(session, workspace.id, party_id)
-            if used:
-                raise FinanceError(
-                    f"У юрлица {used} {_contracts_word(used)} — в архив уходит только юрлицо без договоров"
-                )
+        # Юрлицо с договорами тоже удаляется — в корзину (27.09.2026: ошибочно
+        # заведённое «ИП WE make» с одним договором не удалялось никак). Что
+        # его договоры перестанут считаться «нашими» (уйдут из «Исполнитель
+        # ГК», получат «ни одна сторона не наша»), говорит вопрос «Удалить?»
+        # до нажатия, а из корзины юрлицо возвращается вместе с этим.
         entity.archived_at = datetime.now(timezone.utc) if data["archived"] else None
     if "accounts" in data:
         wanted = {uuid.UUID(str(item)) for item in data["accounts"] or []}
@@ -719,12 +722,16 @@ def upsert_view(
         key = str(data.get("key") or "").strip() or slug_for(title, taken)
         if key in taken:
             key = slug_for(key, taken)
+        book = str(data.get("book") or "")
+        if book not in BOOKS:
+            raise FinanceError("Такой книги листов нет")
         view = EntityView(
             workspace_id=workspace.id,
             entity=ENTITY,
             key=key,
             title=title,
             main=False,
+            book=book,
             blocks=_clean_blocks(data.get("blocks") or [{"title": "", "filter": {"any": []}}], registry),
             style=data.get("style") or {},
             position=(max((v.position for v in registry.views), default=0) + POSITION_STEP),
@@ -744,7 +751,7 @@ def upsert_view(
             view.position = int(data["position"])
         if "archived" in data:
             if view.main and data["archived"]:
-                raise FinanceError("Главный лист не убирается")
+                raise FinanceError("Главный лист не удаляется")
             from datetime import datetime, timezone
 
             view.archived_at = datetime.now(timezone.utc) if data["archived"] else None

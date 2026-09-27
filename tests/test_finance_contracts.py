@@ -323,14 +323,17 @@ def test_ne_otkryty_polya_ne_otdayutsya_i_ne_pravyatsya(space):
             service.patch(session, workspace, FULL, OWNER, contract.id, {"paid_snapshot": "1"}, known_seq=None)
 
 
-def test_arhiv_ne_uvodit_ispolzuemoe(space):
-    """Архив не отнимает смысл у договоров, которые на нём стоят.
+def test_udalenie_ne_uvodit_ispolzuemoe_molcha(space):
+    """Удаление (в корзину) не отнимает смысл у договоров молча.
 
-    Юрлицо с договорами, если бы ушло в архив, перестало бы быть «нашим» —
-    его договоры молча выпали бы из «Исполнитель ГК». Статус, стоящий в
-    договорах, в архиве превратил бы их подпись в идентификатор. «Выручка» —
-    системный смысл: без неё продажи выпали бы из порога НДС.
+    Юрлицо с договорами удаляется (27.09.2026: ошибочное «ИП WE make» с одним
+    договором не удалялось никак): договор остаётся, юрлицо перестаёт быть
+    «нашим», и это видно замечанием, а из корзины оно возвращается. Статус,
+    стоящий в договорах, не удаляется — подпись стала бы идентификатором.
+    «Выручка» — системный смысл: без неё продажи выпали бы из порога НДС.
     """
+    from app.finance import trash
+
     with finance_session() as session:
         workspace = _ws(session, space)
         contract = _make(session, space, executor="BBC", customer="ТОО «Бета»", status="Действующий")
@@ -338,8 +341,14 @@ def test_arhiv_ne_uvodit_ispolzuemoe(space):
         bbc = next(item for item in schema["own_entities"] if item["code"] == "BBC")
         bbca = next(item for item in schema["own_entities"] if item["code"] == "BBCA")
 
-        with pytest.raises(FinanceError, match="без договоров"):
-            setup.update_entity(session, workspace, uuid.UUID(bbc["id"]), {"archived": True})
+        setup.update_entity(session, workspace, uuid.UUID(bbc["id"]), {"archived": True})
+        registry = service.Registry(session, workspace)
+        assert not registry.is_own(uuid.UUID(bbc["id"]))
+        codes = {issue["code"] for issue in service.one(session, workspace, FULL, contract)["contract"]["issues"]}
+        assert "no_own_party" in codes
+        trash.restore(session, workspace, "entity", uuid.UUID(bbc["id"]))
+        assert service.Registry(session, workspace).is_own(uuid.UUID(bbc["id"]))
+
         setup.update_entity(session, workspace, uuid.UUID(bbca["id"]), {"archived": True})
         after = setup.schema(session, workspace, FULL)
         assert {item["code"] for item in after["own_entities"]} == {"BBC"}

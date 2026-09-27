@@ -208,18 +208,21 @@ def _quote_tab(title: str) -> str:
     return "'" + title.replace("'", "''") + "'"
 
 
-def fetch_tab_values(spreadsheet_id: str, tab_title: str) -> list[list[str]]:
+def fetch_tab_values(spreadsheet_id: str, tab_title: str, *, fresh: bool = False) -> list[list[str]]:
     """Значения вкладки строками — как их видит человек.
 
     Запрашиваются **форматированные** значения: «18.09.2026» и «95 323,00», а не
     46 271 и 95323. Разбор в «Финансах» читает человеческий текст — он для того и
     написан, чтобы понимать выписки. Сырые значения пришлось бы переводить
     обратно через эпоху дат, и на этом переводе теряется день.
+
+    `fresh` — мимо кэша: у сводки оплат свой срок (`contracts/summary.py`), и
+    десятиминутный кэш мастера переноса держал бы её оплаты дольше него.
     """
     key = (spreadsheet_id, tab_title)
     with _lock:
         hit = _values_cache.get(key)
-        if hit and _fresh(hit[0]):
+        if hit and _fresh(hit[0]) and not fresh:
             return hit[1]
 
     meta = spreadsheet_meta(spreadsheet_id)

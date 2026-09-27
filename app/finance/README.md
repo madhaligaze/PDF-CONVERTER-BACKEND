@@ -9,7 +9,8 @@
 ## Снять модуль
 
 1. `DROP SCHEMA finance CASCADE` (или `alembic downgrade` до ревизии 0011).
-2. Удалить `backend/app/finance/`, `backend/app/api/routes/finance.py`,
+2. Удалить `backend/app/finance/`, `backend/app/api/routes/finance*.py`
+   (в том числе `finance_trash.py` и `finance_looks.py`),
    `backend/tests/test_finance_*.py`.
 3. Убрать из `app/api/router.py` и `app/migrations/metadata.py` по одной
    строке про finance, из `app/bbc/scope.py` — право `"finance"`.
@@ -41,6 +42,9 @@
 | `history.py` / `audit.py` | журнал действий: запись с автором, сеансом и адресом из контекста запроса; лента с фильтрами, просмотры, очистка |
 | `notifications.py` | «Ждут решения»: просьбы о сбросе, пять неверных паролей, «пароль задан» |
 | `cli.py` | команды сервера: сброс пароля владельца |
+| `trash.py` | корзина: всё удалённое (договоры, операции, юрлица, поля, значения, листы, отделы, сотрудники, справочники) — восстановить или удалить насовсем; используемое насовсем не стирается |
+| `contracts/summary.py` | «Оплачено (сводка)»: книга-сводка компании в Google, колонки по названиям, договор по номеру и клиенту без угадывания |
+| `models.SheetLook` + `../api/routes/finance_looks.py` | личный вид листов (ширины, цвета, перенос) — у каждой учётки свой; собирает фронт (`src/components/univer/look.ts`) |
 | `../api/routes/finance*.py` | HTTP-маршруты и права — **единственное место**, где модуль встречается с учётками продукта |
 
 ## Права

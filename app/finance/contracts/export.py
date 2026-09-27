@@ -25,6 +25,7 @@ from app.finance.contracts.service import (
     Access,
     Actor,
     Registry,
+    age_months,
     facts_of,
     people_of,
     visible_to,
@@ -67,6 +68,15 @@ def _text(registry: Registry, contract: Contract, key: str, people: Sequence[uui
             return float(Decimal(str(raw))) if raw not in (None, "") else None
         except ArithmeticError:
             return raw
+    if key in ("summary_paid", "summary_remaining"):
+        match = registry.summary_of(contract)
+        if match is None or match.state != "found":
+            return None
+        if key == "summary_paid":
+            return float(match.paid)
+        return float(contract.amount - match.paid) if contract.amount is not None else None
+    if key == "age_months":
+        return age_months(contract.signed_at)
     if key in ("signed_at", "planned_end_at", "end_date"):
         return getattr(contract, key)
     if key in ("billing", "end_kind"):
@@ -128,8 +138,9 @@ def build(session: Session, workspace: Workspace, access: Access, actor: Actor, 
     facts = {item.id: facts_of(item, registry, people.get(item.id, [])) for item in visible}
     hidden = set(access.hidden)
 
+    # Без выбора — листы реестра; «Разовые» выгружаются своей кнопкой.
     views: list[EntityView] = [
-        view for view in registry.views if not view_keys or view.key in view_keys
+        view for view in registry.views if (view.key in view_keys if view_keys else not view.book)
     ]
     book = Workbook(write_only=True)
     bold = Font(bold=True)

@@ -34,6 +34,7 @@ from app.finance.config import finance_settings
 from app.finance.contracts import amendments as amendments_module
 from app.finance.contracts import export as export_module
 from app.finance.contracts import importer, payments, service, setup
+from app.finance.contracts import summary as summary_module
 from app.finance.contracts.views import FilterError
 from app.finance.db import finance_session
 from app.finance.service import FinanceError
@@ -136,6 +137,19 @@ def list_payments(member: Member = Depends(contract_member)) -> dict[str, Any]:
         workspace = _workspace(session, member)
         try:
             return payments.summaries(session, workspace, access)
+        except Exception as exc:  # noqa: BLE001
+            return _raise(exc)
+
+
+@router.get("/summary")
+def list_summary(force: bool = Query(False), member: Member = Depends(contract_member)) -> dict[str, Any]:
+    """«Оплачено/Остаток (сводка)» видимых договоров — из книги-сводки компании.
+    `force` — «Обновить»: перечитать книгу, не дожидаясь срока кэша."""
+    access = _access(member)
+    with finance_session() as session:
+        workspace = _workspace(session, member)
+        try:
+            return summary_module.contracts_out(session, workspace, access, force=force)
         except Exception as exc:  # noqa: BLE001
             return _raise(exc)
 
@@ -390,6 +404,7 @@ class EntityIn(BaseModel):
 
 class ViewIn(BaseModel):
     title: str | None = None
+    book: str | None = None
     blocks: list[dict[str, Any]] | None = None
     style: dict[str, Any] | None = None
     position: int | None = None
@@ -511,6 +526,38 @@ def add_view(body: ViewIn, member: Member = Depends(contract_editor)) -> dict[st
 @router.patch("/setup/views/{view_id}")
 def update_view(view_id: UUID, body: ViewIn, member: Member = Depends(contract_editor)) -> dict[str, Any]:
     return _setup_call(member, lambda s, w, a: setup.view_out(setup.upsert_view(s, w, _data(body), view_id)), "лист изменён", "view_update")
+
+
+class SummaryIn(BaseModel):
+    link: str
+    worksheet: str
+
+
+@router.post("/setup/summary")
+def connect_summary(body: SummaryIn, member: Member = Depends(contract_editor)) -> dict[str, Any]:
+    """Подключить книгу-сводку: читается сразу, сохраняется, только если читается."""
+
+    def action(session, workspace, access):
+        try:
+            source, index = summary_module.connect(
+                session, workspace.id, link=body.link, worksheet=body.worksheet, user_id=member.user_id
+            )
+        except summary_module.SummaryError as exc:
+            raise FinanceError(str(exc)) from exc
+        setup._schema_changed(session, workspace)
+        return {"title": source.title, "worksheet": source.worksheet, "rows": index.rows, "drift": index.drift}
+
+    return _setup_call(member, action, "подключена сводка оплат", "summary_connect")
+
+
+@router.delete("/setup/summary")
+def disconnect_summary(member: Member = Depends(contract_editor)) -> dict[str, Any]:
+    def action(session, workspace, access):
+        summary_module.disconnect(session, workspace.id)
+        setup._schema_changed(session, workspace)
+        return {"ok": True}
+
+    return _setup_call(member, action, "сводка оплат отключена", "summary_disconnect")
 
 
 @router.post("/setup/views/preview")

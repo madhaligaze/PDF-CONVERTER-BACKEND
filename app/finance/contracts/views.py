@@ -27,6 +27,7 @@
 """
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
 from app.books.layout import norm
@@ -39,7 +40,9 @@ VIRTUAL_FIELDS = {
     "phase": "Фаза статуса",
     "economic": "Системный смысл",
 }
-OPS = ("in", "not_in", "eq", "neq", "empty", "not_empty", "contains", "is")
+#: `lt`/`lte`/`gt`/`gte` — числа: «Срок, мес < 2», «Остаток (сводка) > 0».
+NUMBER_OPS = ("lt", "lte", "gt", "gte")
+OPS = ("in", "not_in", "eq", "neq", "empty", "not_empty", "contains", "is", *NUMBER_OPS)
 
 
 class FilterError(ValueError):
@@ -64,6 +67,8 @@ def validate(rule: Any) -> dict[str, Any]:
             op = condition.get("op", "in")
             if op not in OPS:
                 raise FilterError(f"Правило листа: неизвестное условие «{op}»")
+            if op in NUMBER_OPS and _number(condition.get("value")) is None:
+                raise FilterError("Правило листа: в сравнении нужно число")
             clean.append({"field": str(condition["field"]), "op": op, "value": condition.get("value")})
         groups.append({"all": clean})
     return {"any": groups}
@@ -88,8 +93,33 @@ def _fact_values(facts: dict[str, Any], field: str) -> list[str]:
     return [str(value)]
 
 
+def _number(value: Any) -> Decimal | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        value = value[0] if len(value) == 1 else None
+        if value is None:
+            return None
+    try:
+        return Decimal(str(value).replace(" ", "").replace(",", "."))
+    except (InvalidOperation, ValueError):
+        return None
+
+
 def _check(condition: dict[str, Any], facts: dict[str, Any]) -> bool:
     field, op, value = condition["field"], condition["op"], condition.get("value")
+    if op in NUMBER_OPS:
+        # Пустое не больше и не меньше ничего: договор без даты не стоит ни в
+        # «до 2 мес», ни в «6+ мес», а без суммы из сводки — не в «Остатках».
+        have_number, want = _number(facts.get(field)), _number(value)
+        if have_number is None or want is None:
+            return False
+        return {
+            "lt": have_number < want,
+            "lte": have_number <= want,
+            "gt": have_number > want,
+            "gte": have_number >= want,
+        }[op]
     have = _fact_values(facts, field)
     if op == "empty":
         return not have
@@ -165,5 +195,5 @@ def fields_used(rule: dict[str, Any] | None) -> set[str]:
 
 
 __all__ = [
-    "FilterError", "OPS", "VIRTUAL_FIELDS", "fields_used", "is_empty", "matches", "membership", "place", "validate",
+    "FilterError", "NUMBER_OPS", "OPS", "VIRTUAL_FIELDS", "fields_used", "is_empty", "matches", "membership", "place", "validate",
 ]

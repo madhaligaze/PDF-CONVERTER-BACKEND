@@ -507,7 +507,7 @@ def _clean_department(session: Session, workspace_id: uuid.UUID, raw: Any) -> uu
         raise PeopleError("Отдел указан неверно") from exc
     department = get_department(session, workspace_id, department_id)
     if department.archived_at is not None:
-        raise PeopleError("Этот отдел в архиве")
+        raise PeopleError("Этот отдел в корзине — сначала восстановите его")
     return department.id
 
 
@@ -615,7 +615,7 @@ def create_account(
     if role == "admin" and member.role != "owner":
         raise Forbidden("Администратора назначает владелец компании")
     if employee.archived_at is not None:
-        raise PeopleError("Сотрудник в архиве — сначала верните его")
+        raise PeopleError("Сотрудник в корзине — сначала восстановите его в личном кабинете")
     existing = _membership(session, workspace.id, employee.user_id)
     if existing is not None:
         raise PeopleError("У сотрудника уже есть доступ")
@@ -755,7 +755,7 @@ def _remove_access(
 
 
 def archive_employee(session: Session, workspace: Workspace, member: auth.Member, employee_id: uuid.UUID) -> Employee:
-    """Убрать сотрудника: в архив, с доступом. Удалить нельзя — он в договорах."""
+    """Удалить сотрудника — в корзину, с доступом. Из базы не стирается: он в договорах."""
     employee = get_employee(session, workspace.id, employee_id)
     target = _membership(session, workspace.id, employee.user_id)
     _check_manage(member, target)
@@ -764,7 +764,7 @@ def archive_employee(session: Session, workspace: Workspace, member: auth.Member
     employee.archived_at = _now()
     session.flush()
     _schema_changed(session, workspace.id)
-    _event(session, workspace, "people.archive", f"сотрудник убран в архив: {short_name(employee.full_name)}",
+    _event(session, workspace, "people.archive", f"сотрудник удалён в корзину: {short_name(employee.full_name)}",
            employee=employee)
     return employee
 

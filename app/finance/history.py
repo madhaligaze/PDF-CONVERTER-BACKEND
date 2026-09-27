@@ -137,7 +137,7 @@ TITLES = {
     "account.create": "счёт заведён",
     "autotag.apply": "авторазметка статей",
     "dictionary.create": "запись справочника заведена",
-    "dictionary.archive": "запись справочника убрана в архив",
+    "dictionary.archive": "запись справочника удалена в корзину",
     "category.nature": "природа статьи изменена",
     "plan.set": "план поставлен",
     "rule.create": "правило заведено",

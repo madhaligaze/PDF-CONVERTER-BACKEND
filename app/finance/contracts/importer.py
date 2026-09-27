@@ -44,7 +44,7 @@ from app.finance import history
 from app.finance.contracts import setup
 from app.finance.contracts.fields import (
     ENTITY,
-    LIVE_FIELDS,
+    COMPUTED_FIELDS,
     SNAPSHOT_FIELDS,
     SYSTEM_KEYS,
     bump,
@@ -211,8 +211,9 @@ class FieldNames:
 def field_names(fields: Sequence[EntityField]) -> list[FieldNames]:
     out = []
     for item in fields:
-        if item.key in LIVE_FIELDS:
-            # Считаются из журнала — в файле такой колонки быть не может.
+        if item.key in COMPUTED_FIELDS:
+            # Считаются из журнала, сводки или самого договора — в файле
+            # такой колонки быть не может.
             continue
         names = {norm(name) for name in (item.names or [])} | {norm(item.title)}
         names.discard("")
@@ -2022,7 +2023,12 @@ def _build_views(
         if sheet == current.main_sheet and main_view is not None:
             setup.upsert_view(session, workspace, {"title": sheet, "blocks": view_blocks, "style": style}, main_view.id)
         else:
-            existing = next((view for view in registry.views if norm(view.title) == norm(sheet) and not view.main), None)
+            # Только листы реестра: «Разовые» — своя книга, и одноимённая
+            # вкладка файла не должна переписать её отбор.
+            existing = next(
+                (view for view in registry.views if norm(view.title) == norm(sheet) and not view.main and not view.book),
+                None,
+            )
             if existing is not None:
                 setup.upsert_view(session, workspace, {"blocks": view_blocks, "style": style}, existing.id)
             else:

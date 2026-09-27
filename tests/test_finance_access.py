@@ -57,9 +57,11 @@ def app(finance_db) -> FastAPI:
     from app.api.routes.finance import router as finance_router
     from app.api.routes.finance_contracts import router as contracts_router
     from app.api.routes.finance_people import router as people_router
+    from app.api.routes.finance_looks import router as looks_router
+    from app.api.routes.finance_trash import router as trash_router
 
     application = FastAPI()
-    for router in (finance_router, contracts_router, people_router):
+    for router in (finance_router, contracts_router, people_router, trash_router, looks_router):
         application.include_router(router, prefix="/api/v1")
     return application
 
@@ -144,6 +146,12 @@ READONLY_POSTS = {
     ("POST", "/contracts/{contract_id}/amendments/parse"),
     ("POST", "/contracts/setup/views/preview"),
 }
+#: Меняет только свой экран, а не данные компании: личный вид листа (ширины,
+#: цвета) настраивает и тот, кому лист открыт только на чтение.
+PERSONAL_WRITES = {
+    ("PUT", "/looks/{key}"),
+    ("DELETE", "/looks/{key}"),
+}
 
 
 def _declarations(dependant) -> list[tuple[str, object]]:
@@ -191,7 +199,7 @@ def test_kazhdyy_marshrut_finansov_obyavlyaet_razdel(app: FastAPI) -> None:
                     _resources, level = value
                     if method == "GET" and level != "view":
                         problems.append(f"{method} {path}: чтение требует «{level}»")
-                    if method != "GET" and level != "edit" and key not in READONLY_POSTS:
+                    if method != "GET" and level != "edit" and key not in READONLY_POSTS | PERSONAL_WRITES:
                         problems.append(f"{method} {path}: изменение объявлено с «{level}», нужно «edit»")
     assert not problems, "\n".join(problems)
     assert seen_self == SELF, f"в SELF лишнее: {sorted(SELF - seen_self)}"

@@ -5,6 +5,8 @@ from app.api.routes.books import router as books_router  # «Книги» (уд�
 from app.api.routes.finance import router as finance_router  # «Финансы» (удаляемый модуль)
 from app.api.routes.finance_contracts import router as finance_contracts_router  # реестр договоров «Финансов»
 from app.api.routes.finance_people import router as finance_people_router  # доступ «Финансов»: люди, права, журнал
+from app.api.routes.finance_looks import router as finance_looks_router  # личный вид листов «Финансов»
+from app.api.routes.finance_trash import router as finance_trash_router  # корзина «Финансов»
 from app.bbc.routes import router as bbc_router  # BBC Dashboard (removable module)
 from app.api.routes.health import router as health_router
 from app.api.routes.scanned import router as scanned_router
@@ -28,3 +30,5 @@ api_router.include_router(books_router)
 api_router.include_router(finance_router)
 api_router.include_router(finance_contracts_router)
 api_router.include_router(finance_people_router)
+api_router.include_router(finance_trash_router)
+api_router.include_router(finance_looks_router)

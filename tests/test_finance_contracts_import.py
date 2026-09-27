@@ -199,7 +199,8 @@ def test_zavedenie_nichego_ne_teryaet(finance_db):
         assert float(first["file_snapshot"]["paid"]) == 250000
         assert first["values"]["folder_url"].startswith("https://bitrix/")
 
-        views = {view.title: view for view in registry.views}
+        # Листы реестра; «Разовые» — своя книга, её засевает сам реестр.
+        views = {view.title: view for view in registry.views if not view.book}
         assert set(views) == {"Сводная", "Заказчик ГК", "Прочие договоры"}
         rent_members = [
             item for item in listing["contracts"]

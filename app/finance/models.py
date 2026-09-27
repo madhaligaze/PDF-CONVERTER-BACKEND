@@ -895,7 +895,37 @@ class Integration(FinanceBase):
     )
 
 
+class SheetLook(FinanceBase):
+    """Личный вид листа: ширины, перенос, цвета, скрытые колонки — у каждого свои.
+
+    Оформление в листах журнала и реестра было закрыто целиком: лист пишет в
+    базу только значения, и жирный или заливка пропадали при следующей
+    перерисовке строки. Вид не меняет ни одного значения и хранится отдельно
+    от данных, за учёткой: правка админа не видна сотруднику и наоборот.
+
+    `look` — адреса по смыслу, не по номерам (`src/components/univer/look.ts`):
+    колонка — ключ поля, строка — id договора или операции. Вставленная строка
+    или переставленная колонка вид не сдвигают.
+    """
+
+    __tablename__ = "sheet_looks"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid, sa.ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid, sa.ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True
+    )
+    #: Какой лист: «journal», «registry:<ключ листа>», «oneoff:<ключ листа>».
+    key: Mapped[str] = mapped_column(sa.Text, primary_key=True)
+    look: Mapped[dict] = mapped_column(JSONB, server_default=sa.text("'{}'"))
+    updated_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now()
+    )
+
+
 __all__ = [
+    "SheetLook",
     "Recurrence",
     "RECURRENCE_PERIODS",
     "OperationCategory",
